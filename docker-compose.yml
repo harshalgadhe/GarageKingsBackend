@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gk-postgres-dev
+    environment:
+      POSTGRES_USER: gk_admin
+      POSTGRES_PASSWORD: gk_password_dev_2026
+      POSTGRES_DB: garagekings_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - gk_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gk_admin -d garagekings_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gk-network
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: gk-pgadmin-dev
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@garagekings.in
+      PGADMIN_DEFAULT_PASSWORD: admin_password_2026
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - gk-network
+
+volumes:
+  gk_pgdata:
+
+networks:
+  gk-network:
+    driver: bridge
