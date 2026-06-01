@@ -4,6 +4,7 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { databaseConfig } from './config/database.config.js';
 import { ReceiptsModule } from './modules/receipts/receipts.module.js';
+import { ApiModule } from './modules/api/api.module.js';
 import { JwtStrategy } from './auth/jwt.strategy.js';
 
 @Module({
@@ -19,7 +20,8 @@ import { JwtStrategy } from './auth/jwt.strategy.js';
     }]),
 
     // 3. Domain Modules
-    ReceiptsModule
+    ReceiptsModule,
+    ApiModule
   ],
   providers: [
     JwtStrategy,
