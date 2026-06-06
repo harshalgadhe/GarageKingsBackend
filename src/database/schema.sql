@@ -54,6 +54,7 @@ CREATE TABLE products (
     rarity_level VARCHAR(100) DEFAULT 'Standard Edition',
     base_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_base_price CHECK (base_price >= 0),
     description TEXT,
+    tags VARCHAR(50)[] DEFAULT '{}'::VARCHAR[],
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

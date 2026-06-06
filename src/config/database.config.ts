@@ -14,7 +14,7 @@ export const databaseConfig = (): TypeOrmModuleOptions => ({
   ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
   extra: {
     // CRITICAL: Serverless connection pool mitigations
-    max: 1, // Enforce exactly 1 active socket per Lambda execution container
+    max: (process.env.IS_OFFLINE || process.env.LAMBDA_TASK_ROOT) ? 1 : 10, // Enforce 1 active socket in Lambda containers, support 10 in standard monolithic daemon mode
     min: 0, // Allow connection pool to completely drain when idle
     idleTimeoutMillis: 1000, // Instantly close idle connections
     connectionTimeoutMillis: 1500, // Timeout queries quickly to free up connection pools

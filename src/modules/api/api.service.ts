@@ -21,7 +21,8 @@ export class ApiService implements OnModuleInit {
     return this.dataSource.query(`
       SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
              p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             pi.thumbnail_url as image, COALESCE(i.quantity_available, 10) as quantity
+             pi.thumbnail_url as image, COALESCE(i.quantity_available, 10) as quantity,
+             p.tags
       FROM products p
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
       LEFT JOIN inventory i ON i.product_id = p.id
@@ -32,8 +33,8 @@ export class ApiService implements OnModuleInit {
   async addProduct(car: any) {
     const sku = car.sku || `SKU-${Date.now()}`;
     const prodRes = await this.dataSource.query(`
-      INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING id;
     `, [
       sku,
@@ -43,7 +44,8 @@ export class ApiService implements OnModuleInit {
       car.scale || '1:64',
       car.lane || 'Standard Edition',
       Number(car.price || 0),
-      car.description || ''
+      car.description || '',
+      car.tags || []
     ]);
 
     const productId = prodRes[0].id;
@@ -67,8 +69,8 @@ export class ApiService implements OnModuleInit {
   async updateProduct(id: string, car: any) {
     await this.dataSource.query(`
       UPDATE products 
-      SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, updated_at = NOW()
-      WHERE id = $8;
+      SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8, updated_at = NOW()
+      WHERE id = $9;
     `, [
       car.brand || 'MINI GT',
       car.name || 'Unknown Casting',
@@ -77,6 +79,7 @@ export class ApiService implements OnModuleInit {
       car.lane || 'Standard Edition',
       Number(car.price || 0),
       car.description || '',
+      car.tags || [],
       id
     ]);
 
@@ -131,17 +134,19 @@ export class ApiService implements OnModuleInit {
   // ── AUCTION Management ─────────────────────────────────────────────
   async getAuctions() {
     const rows = await this.dataSource.query(`
-      SELECT id, title, brand, car_brand as "carBrand", scale, condition_grade as grade, 
-             description, image, currency, starting_bid as "startingPrice", 
-             reserve_price as "minBidIncrement", start_time as "startDate", end_time as "endDate", status
-      FROM auction_events
-      ORDER BY created_at DESC;
+      SELECT ae.id, ae.title, ae.starting_bid as "startingPrice", 
+             ae.reserve_price as "minBidIncrement", ae.start_time as "startDate", ae.end_time as "endDate", ae.status,
+             p.brand, p.scale, p.description, pi.thumbnail_url as image
+      FROM auction_events ae
+      LEFT JOIN products p ON p.id = ae.product_id
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
+      ORDER BY ae.created_at DESC;
     `);
     
     return rows.map(r => ({
       ...r,
-      endDate: new Date(r.endDate).toISOString().split('T')[0],
-      endTime: new Date(r.endDate).toTimeString().split(' ')[0].slice(0, 5)
+      endDate: r.endDate ? new Date(r.endDate).toISOString().split('T')[0] : '',
+      endTime: r.endDate ? new Date(r.endDate).toTimeString().split(' ')[0].slice(0, 5) : '20:00'
     }));
   }
 
@@ -149,19 +154,33 @@ export class ApiService implements OnModuleInit {
     const start = new Date().toISOString();
     const end = new Date(`${auction.endDate}T${auction.endTime || '20:00'}:00+05:30`).toISOString();
     
-    // Create a dummy product linkage or map to master
+    // Create linked product catalog record
     const dummyProduct = await this.dataSource.query(`
-      INSERT INTO products (sku, brand, model_name, base_price)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (sku) DO UPDATE SET base_price = $4
+      INSERT INTO products (sku, brand, model_name, base_price, description)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING id;
-    `, [`AUC-SKU-${Date.now()}`, auction.brand || 'MINI GT', auction.title, Number(auction.startingPrice)]);
+    `, [
+      `AUC-SKU-${Date.now()}`,
+      auction.brand || 'MINI GT',
+      auction.title,
+      Number(auction.startingPrice || 0),
+      auction.description || ''
+    ]);
+
+    const productId = dummyProduct[0].id;
+
+    if (auction.image) {
+      await this.dataSource.query(`
+        INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
+        VALUES ($1, $2, $3, $4, true);
+      `, [productId, auction.image, auction.image, auction.image]);
+    }
 
     await this.dataSource.query(`
       INSERT INTO auction_events (product_id, title, start_time, end_time, starting_bid, reserve_price, status)
       VALUES ($1, $2, $3, $4, $5, $6, 'Active');
     `, [
-      dummyProduct[0].id,
+      productId,
       auction.title,
       start,
       end,
@@ -174,6 +193,7 @@ export class ApiService implements OnModuleInit {
 
   async updateAuction(id: string, auction: any) {
     const end = new Date(`${auction.endDate}T${auction.endTime || '20:00'}:00+05:30`).toISOString();
+    
     await this.dataSource.query(`
       UPDATE auction_events 
       SET title = $1, end_time = $2, starting_bid = $3, reserve_price = $4, updated_at = NOW()
@@ -185,6 +205,26 @@ export class ApiService implements OnModuleInit {
       Number(auction.minBidIncrement),
       id
     ]);
+
+    // Update details in linked product record
+    const aeRow = await this.dataSource.query(`SELECT product_id FROM auction_events WHERE id = $1;`, [id]);
+    if (aeRow && aeRow.length > 0) {
+      const productId = aeRow[0].product_id;
+      await this.dataSource.query(`
+        UPDATE products
+        SET brand = $1, description = $2, updated_at = NOW()
+        WHERE id = $3;
+      `, [auction.brand || 'MINI GT', auction.description || '', productId]);
+
+      if (auction.image) {
+        await this.dataSource.query(`DELETE FROM product_images WHERE product_id = $1;`, [productId]);
+        await this.dataSource.query(`
+          INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
+          VALUES ($1, $2, $3, $4, true);
+        `, [productId, auction.image, auction.image, auction.image]);
+      }
+    }
+
     return { success: true };
   }
 
@@ -279,7 +319,7 @@ export class ApiService implements OnModuleInit {
 
   async getCustomerOrders(email: string) {
     return this.dataSource.query(`
-      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress", o.created_at as "createdAt",
+      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress", o.tracking_number as "trackingNumber", o.created_at as "createdAt",
              p.model_name as "productName", p.brand as "productBrand", oi.price_at_purchase as "priceAtPurchase", oi.qty
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
@@ -288,6 +328,42 @@ export class ApiService implements OnModuleInit {
       WHERE u.email = $1
       ORDER BY o.created_at DESC;
     `, [email]);
+  }
+
+  async getAdminOrders() {
+    return this.dataSource.query(`
+      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress", o.tracking_number as "trackingNumber", o.created_at as "createdAt",
+             u.email as "customerEmail",
+             p.model_name as "productName", p.brand as "productBrand", oi.price_at_purchase as "priceAtPurchase", oi.qty
+      FROM orders o
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN products p ON p.id = oi.product_id
+      JOIN users u ON u.id = o.user_id
+      ORDER BY o.created_at DESC;
+    `);
+  }
+
+  async updateOrderStatus(id: string, status?: string, trackingNumber?: string) {
+    if (status && trackingNumber !== undefined) {
+      await this.dataSource.query(`
+        UPDATE orders 
+        SET status = $1, tracking_number = $2, updated_at = NOW()
+        WHERE id = $3;
+      `, [status, trackingNumber, id]);
+    } else if (status) {
+      await this.dataSource.query(`
+        UPDATE orders 
+        SET status = $1, updated_at = NOW()
+        WHERE id = $2;
+      `, [status, id]);
+    } else if (trackingNumber !== undefined) {
+      await this.dataSource.query(`
+        UPDATE orders 
+        SET tracking_number = $1, updated_at = NOW()
+        WHERE id = $2;
+      `, [trackingNumber, id]);
+    }
+    return { success: true };
   }
 
   async getOrCreateUser(cognitoSub: string, email: string) {
