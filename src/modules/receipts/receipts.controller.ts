@@ -1,4 +1,4 @@
-import { Controller, Post, Body, UseGuards, Request } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Param, Body, UseGuards, Request } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ReceiptsService, CreateReceiptDto } from './receipts.service.js';
 
@@ -16,9 +16,19 @@ export class ReceiptsController {
     @Body() dto: CreateReceiptDto,
     @Request() req: any
   ) {
-    // Audit execution user if authenticated
-    const adminUserId = req.user?.userId || null;
     return this.receiptsService.generateBillingReceipt(dto);
+  }
+
+  @Get()
+  @UseGuards(AuthGuard('jwt'))
+  async getReceipts(@Request() req: any) {
+    return this.receiptsService.getReceipts();
+  }
+
+  @Delete(':id')
+  @UseGuards(AuthGuard('jwt'))
+  async deleteReceipt(@Param('id') id: string, @Request() req: any) {
+    return this.receiptsService.deleteReceipt(id);
   }
 }
 export default ReceiptsController;

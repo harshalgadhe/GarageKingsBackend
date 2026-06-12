@@ -54,6 +54,9 @@ export class ApiController {
 
     try {
       let cleanEmail = '';
+      let googleName = '';
+      let googleGivenName = '';
+
       if (idToken.includes('@')) {
         // Developer sandbox bypass mode
         console.log(`[GoogleLogin] Sandbox bypass mode detected for email: ${idToken}`);
@@ -78,6 +81,8 @@ export class ApiController {
         }
         
         cleanEmail = payload.email.trim();
+        googleName = payload.name || '';
+        googleGivenName = payload.given_name || '';
       }
       
       // 2. Generate a secure, user-specific Cognito password
@@ -91,13 +96,21 @@ export class ApiController {
       // 3. Create user in Cognito if they do not exist
       try {
         console.log(`[GoogleLogin] Admin creating user if new: ${cleanEmail}`);
+        const userAttributes: any[] = [
+          { Name: 'email', Value: cleanEmail },
+          { Name: 'email_verified', Value: 'true' }
+        ];
+        if (googleName) {
+          userAttributes.push({ Name: 'name', Value: googleName });
+        }
+        if (googleGivenName) {
+          userAttributes.push({ Name: 'given_name', Value: googleGivenName });
+        }
+
         await cognitoClient.send(new AdminCreateUserCommand({
           UserPoolId: userPoolId,
           Username: cleanEmail,
-          UserAttributes: [
-            { Name: 'email', Value: cleanEmail },
-            { Name: 'email_verified', Value: 'true' }
-          ],
+          UserAttributes: userAttributes,
           MessageAction: 'SUPPRESS'
         }));
         console.log(`[GoogleLogin] Admin successfully created user: ${cleanEmail}`);

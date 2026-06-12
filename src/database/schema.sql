@@ -137,6 +137,21 @@ CREATE TABLE receipt_items (
 );
 CREATE INDEX idx_receipt_items_parent ON receipt_items(receipt_id);
 
+-- 9.5 Receipt Generation Jobs Table (Queue tracks for PDF generator worker)
+CREATE TABLE receipt_generation_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    receipt_id UUID NOT NULL REFERENCES receipts(id) ON DELETE CASCADE,
+    status VARCHAR(50) DEFAULT 'Pending',
+    retry_count INT DEFAULT 0,
+    max_retries INT DEFAULT 3,
+    pdf_s3_url VARCHAR(512),
+    error_log TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_receipt_jobs_parent ON receipt_generation_jobs(receipt_id);
+CREATE INDEX idx_receipt_jobs_status ON receipt_generation_jobs(status);
+
 -- 10. Orders Table (E-commerce Purchases)
 CREATE TABLE orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -315,6 +330,17 @@ CREATE TABLE admin_audit_logs (
     timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX idx_audit_admin ON admin_audit_logs(admin_id, timestamp DESC);
+
+-- 25. General Audit Logs Table
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    action VARCHAR(255) NOT NULL,
+    entity VARCHAR(100) NOT NULL,
+    entity_id VARCHAR(100) NOT NULL,
+    before_state JSONB,
+    after_state JSONB,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Helper mapping table for firestore migrations
 CREATE TABLE id_mappings (

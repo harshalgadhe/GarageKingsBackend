@@ -9,19 +9,16 @@ dotenv.config();
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor() {
-    const userPoolId = process.env.COGNITO_USER_POOL_ID;
+    const userPoolId = process.env.COGNITO_USER_POOL_ID || 'ap-south-1_YaTasZ9v0';
     const awsRegion = process.env.COGNITO_AWS_REGION || 'ap-south-1';
-    
-    if (!userPoolId) {
-      console.warn("⚠️ Warning: COGNITO_USER_POOL_ID environment variable is missing.");
-    }
+    const clientId = process.env.COGNITO_CLIENT_ID || '6f55rbspec5p04tdd83l7c2uc0';
 
     const jwksUri = `https://cognito-idp.${awsRegion}.amazonaws.com/${userPoolId}/.well-known/jwks.json`;
 
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      audience: process.env.COGNITO_CLIENT_ID,
+      audience: clientId,
       issuer: `https://cognito-idp.${awsRegion}.amazonaws.com/${userPoolId}`,
       algorithms: ['RS256'],
       secretOrKeyProvider: passportJwtSecret({

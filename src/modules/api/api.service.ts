@@ -254,18 +254,28 @@ export class ApiService implements OnModuleInit {
   // ── CRM Customers ──────────────────────────────────────────────────
   async getCustomers() {
     return this.dataSource.query(`
-      SELECT id, full_name as "fullName", phone, instagram, address, created_at as "createdAt"
+      SELECT id, full_name, full_name as "fullName", phone, instagram, address, created_at, created_at as "createdAt"
       FROM customers
       ORDER BY created_at DESC;
     `);
   }
 
   async addCustomer(customer: any) {
+    const fullName = customer.fullName || customer.full_name || 'Unknown Customer';
+    const phone = customer.phone ? customer.phone.trim() : '';
+    const instagram = customer.instagram || customer.insta || '';
+    const address = customer.address || customer.addr || '';
+
     const res = await this.dataSource.query(`
-      INSERT INTO customers (full_name, phone, instagram, address)
-      VALUES ($1, $2, $3, $4)
+      INSERT INTO customers (full_name, phone, instagram, address, updated_at)
+      VALUES ($1, $2, $3, $4, NOW())
+      ON CONFLICT (phone) DO UPDATE 
+      SET full_name = EXCLUDED.full_name,
+          instagram = CASE WHEN EXCLUDED.instagram <> '' THEN EXCLUDED.instagram ELSE customers.instagram END,
+          address = CASE WHEN EXCLUDED.address <> '' THEN EXCLUDED.address ELSE customers.address END,
+          updated_at = NOW()
       RETURNING id;
-    `, [customer.fullName, customer.phone, customer.instagram || '', customer.address || '']);
+    `, [fullName, phone, instagram, address]);
     return { id: res[0].id };
   }
 
