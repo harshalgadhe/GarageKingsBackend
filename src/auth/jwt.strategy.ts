@@ -16,7 +16,16 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     const jwksUri = `https://cognito-idp.${awsRegion}.amazonaws.com/${userPoolId}/.well-known/jwks.json`;
 
     super({
-      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      jwtFromRequest: ExtractJwt.fromExtractors([
+        ExtractJwt.fromAuthHeaderAsBearerToken(),
+        (req: any) => {
+          const customHeader = req.headers['x-authorization'] || req.headers['x-auth-token'];
+          if (customHeader) {
+            return customHeader.replace(/^bearer\s+/i, '');
+          }
+          return null;
+        }
+      ]),
       ignoreExpiration: false,
       audience: clientId,
       issuer: `https://cognito-idp.${awsRegion}.amazonaws.com/${userPoolId}`,

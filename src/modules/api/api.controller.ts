@@ -1,8 +1,9 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, UseGuards, Request, UnauthorizedException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, UseGuards, Request, UnauthorizedException, UseInterceptors, UploadedFile } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
 import crypto from 'crypto';
+import { FileInterceptor } from '@nestjs/platform-express';
 
 const cognitoClient = new CognitoIdentityProviderClient({
   region: process.env.COGNITO_AWS_REGION || 'ap-south-1'
@@ -291,6 +292,28 @@ export class ApiController {
   ) {
     this.checkAdmin(req);
     return this.apiService.updateOrderStatus(id, dto.status, dto.trackingNumber);
+  }
+
+  @Post('images/upload')
+  @UseGuards(AuthGuard('jwt'))
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadImage(
+    @UploadedFile() file: any,
+    @Body('folder') folder: string = 'general',
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    if (!file) {
+      throw new Error('No image file provided for S3 archival upload.');
+    }
+
+    const fileExtension = file.originalname?.split('.').pop() || 'webp';
+    const randomName = crypto.randomUUID();
+    const fileName = `${randomName}.${fileExtension}`;
+    const mimetype = file.mimetype || 'image/webp';
+
+    const url = await this.apiService.uploadImage(file.buffer, fileName, mimetype, folder);
+    return { success: true, url };
   }
 }
 export default ApiController;

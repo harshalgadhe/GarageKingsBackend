@@ -1,5 +1,6 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 
 @Injectable()
 export class ApiService implements OnModuleInit {
@@ -374,6 +375,23 @@ export class ApiService implements OnModuleInit {
       `, [trackingNumber, id]);
     }
     return { success: true };
+  }
+
+  async uploadImage(fileBuffer: Buffer, fileName: string, mimetype: string, folder: string) {
+    const bucketName = process.env.S3_ASSETS_BUCKET || 'gk-production-public-assets-2026';
+    const s3Client = new S3Client({
+      region: process.env.AWS_REGION || 'ap-south-1'
+    });
+    const key = `${folder}/${fileName}`;
+
+    await s3Client.send(new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: fileBuffer,
+      ContentType: mimetype
+    }));
+
+    return `https://d2ibhhn5bex55q.cloudfront.net/${key}`;
   }
 
   async getOrCreateUser(cognitoSub: string, email: string) {

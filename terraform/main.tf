@@ -216,12 +216,19 @@ resource "aws_lambda_function" "api_monolith" {
   handler       = "dist/main.handler"
   runtime       = "nodejs20.x"
   architectures = ["arm64"] # Graviton2: 20% cheaper & faster
-  timeout       = 15
+  timeout       = 30
   memory_size   = 1024
 
   # Package dummy (Overwritten by CI/CD git pushes)
   filename         = "${path.module}/dummy_payload.zip"
   source_code_hash = filebase64sha256("${path.module}/dummy_payload.zip")
+
+  lifecycle {
+    ignore_changes = [
+      filename,
+      source_code_hash,
+    ]
+  }
 
   environment {
     variables = {
@@ -230,13 +237,14 @@ resource "aws_lambda_function" "api_monolith" {
       COGNITO_USER_POOL_ID  = aws_cognito_user_pool.user_pool.id
       COGNITO_CLIENT_ID     = aws_cognito_user_pool_client.client.id
       S3_ASSETS_BUCKET      = aws_s3_bucket.assets_bucket.id
+      DATABASE_SSL          = "true"
     }
   }
 }
 
 resource "aws_lambda_function_url" "api_furl" {
   function_name      = aws_lambda_function.api_monolith.function_name
-  authorization_type = "NONE" # Guarded at NestJS passport layer
+  authorization_type = "AWS_IAM"
 
   cors {
     allow_origins     = ["*"]
@@ -245,6 +253,14 @@ resource "aws_lambda_function_url" "api_furl" {
     expose_headers    = ["keep-alive", "date"]
     max_age           = 86400
   }
+}
+
+resource "aws_cloudfront_origin_access_control" "lambda_oac" {
+  name                              = "gk-${var.environment}-lambda-oac"
+  description                       = "OAC for GarageKings Lambda Function URL"
+  origin_access_control_origin_type = "lambda"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
 }
 
 # 6. Amazon CloudFront CDN Distribution
@@ -256,8 +272,9 @@ resource "aws_cloudfront_distribution" "cdn" {
 
   # API Monolith Function URL Origin
   origin {
-    domain_name = split("/", replace(aws_lambda_function_url.api_furl.function_url, "https://", ""))[0]
-    origin_id   = "Lambda-FURL"
+    domain_name              = split("/", replace(aws_lambda_function_url.api_furl.function_url, "https://", ""))[0]
+    origin_id                = "Lambda-FURL"
+    origin_access_control_id = aws_cloudfront_origin_access_control.lambda_oac.id
     custom_origin_config {
       http_port              = 80
       https_port             = 443
@@ -296,7 +313,7 @@ resource "aws_cloudfront_distribution" "cdn" {
 
     forwarded_values {
       query_string = true
-      headers      = ["Authorization", "Host", "Origin"]
+      headers      = ["Authorization", "Origin"]
       cookies { forward = "all" }
     }
 
@@ -325,4 +342,30 @@ resource "aws_cloudfront_distribution" "cdn" {
 output "cloudfront_domain" {
   value       = aws_cloudfront_distribution.cdn.domain_name
   description = "Production global domain endpoint"
+}
+
+# Permission to allow CloudFront OAC to invoke Lambda Function URL
+resource "aws_lambda_permission" "allow_cloudfront_furl" {
+  statement_id  = "AllowCloudFrontServicePrincipalFURL"
+  action        = "lambda:InvokeFunctionUrl"
+  function_name = aws_lambda_function.api_monolith.function_name
+  principal     = "cloudfront.amazonaws.com"
+  source_arn    = aws_cloudfront_distribution.cdn.arn
+}
+
+# Public read policy for S3 assets bucket
+resource "aws_s3_bucket_policy" "assets_bucket_policy" {
+  bucket = aws_s3_bucket.assets_bucket.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "PublicReadGetObject"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.assets_bucket.arn}/*"
+      }
+    ]
+  })
 }
