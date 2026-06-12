@@ -353,6 +353,15 @@ resource "aws_lambda_permission" "allow_cloudfront_furl" {
   source_arn    = aws_cloudfront_distribution.cdn.arn
 }
 
+# Permission to allow CloudFront OAC to invoke Lambda Function (via backend Invoke calls)
+resource "aws_lambda_permission" "allow_cloudfront_furl_invoke" {
+  statement_id  = "AllowCloudFrontServicePrincipalFURLInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_monolith.function_name
+  principal     = "cloudfront.amazonaws.com"
+  source_arn    = aws_cloudfront_distribution.cdn.arn
+}
+
 # Public read policy for S3 assets bucket
 resource "aws_s3_bucket_policy" "assets_bucket_policy" {
   bucket = aws_s3_bucket.assets_bucket.id
