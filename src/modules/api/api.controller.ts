@@ -308,6 +308,11 @@ export class ApiController {
     return this.apiService.reserveProduct(dto, req.ip);
   }
 
+  @Post('products/reserve-cart')
+  async reserveProductsCart(@Body() dto: any, @Request() req: any) {
+    return this.apiService.reserveProductsCart(dto, req.ip);
+  }
+
   // ── SETTINGS REST ENDPOINTS ─────────────────────────────────────────
   @Get('settings')
   async getSettings() {

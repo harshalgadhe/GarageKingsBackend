@@ -588,6 +588,157 @@ export class ApiService implements OnModuleInit {
     }
   }
 
+  async reserveProductsCart(dto: any, ipAddress: string) {
+    const { items, email, name, instagram, phone, address, idempotencyKey } = dto;
+
+    if (!idempotencyKey) {
+      throw new Error("Idempotency key is required to reserve stock safely.");
+    }
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      throw new Error("Cart items are required to checkout.");
+    }
+
+    // 1. Enforce Idempotency Lock Check
+    const cachedRes = localCache.get(`idem_${idempotencyKey}`);
+    if (cachedRes) return cachedRes;
+
+    const dbIdem = await this.dataSource.query("SELECT * FROM orders WHERE id IN (SELECT order_id FROM reservations WHERE idempotency_key LIKE $1) LIMIT 1", [`${idempotencyKey}%`]);
+    if (dbIdem.length > 0) {
+      const resVal = await this.dataSource.query("SELECT expires_at FROM reservations WHERE order_id = $1 LIMIT 1", [dbIdem[0].id]);
+      return {
+        success: true,
+        orderId: dbIdem[0].id,
+        expiresAt: resVal.length > 0 ? resVal[0].expires_at : new Date()
+      };
+    }
+
+    // 2. Reservation abuse validation: max 3 active locks per customer (email or IP)
+    const activeCount = await this.dataSource.query(`
+      SELECT COUNT(*) FROM reservations 
+      WHERE (customer_id IN (SELECT id FROM users WHERE email = $1) OR idempotency_key LIKE $2)
+      AND status = 'Active' AND expires_at > NOW();
+    `, [email.trim().toLowerCase(), `%${ipAddress}%`]);
+
+    if (Number(activeCount[0].count) >= 3) {
+      throw new Error("Reservation limit exceeded. Maximum of 3 active stock locks are allowed simultaneously.");
+    }
+
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // Get/create customer record
+      const custRes = await queryRunner.query(`
+        INSERT INTO customers (full_name, phone, instagram, address, email, city)
+        VALUES ($1, $2, $3, $4, $5, 'Unknown')
+        ON CONFLICT (phone) DO UPDATE 
+        SET full_name = EXCLUDED.full_name, instagram = EXCLUDED.instagram, address = EXCLUDED.address
+        RETURNING id;
+      `, [name, phone, instagram, address, email.trim().toLowerCase()]);
+      const customerId = custRes[0].id;
+
+      // Insert user shell mapping for login tracking
+      const userRes = await queryRunner.query(`
+        INSERT INTO users (email, cognito_sub)
+        VALUES ($1, $2)
+        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+        RETURNING id;
+      `, [email.trim().toLowerCase(), `guest_${customerId}`]);
+      const userId = userRes[0].id;
+
+      // Compute total price of the aggregated cart
+      let totalPrice = 0;
+      for (const item of items) {
+        totalPrice += Number(item.price || 0);
+      }
+
+      // Create parent Reserved order record
+      const orderRes = await queryRunner.query(`
+        INSERT INTO orders (user_id, total_price, shipping_address, status, created_at, updated_at)
+        VALUES ($1, $2, $3, 'Reserved', NOW(), NOW())
+        RETURNING id;
+      `, [userId, totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`]);
+      const orderId = orderRes[0].id;
+
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+      // Process each item in the cart
+      for (const item of items) {
+        const { productId, price } = item;
+
+        // Row-level lock target product
+        const prodRows = await queryRunner.query(`
+          SELECT id, model_name as name, total_stock, locked_stock, sold_stock 
+          FROM products 
+          WHERE id = $1 AND deleted_at IS NULL 
+          FOR UPDATE;
+        `, [productId]);
+
+        if (prodRows.length === 0) {
+          throw new Error("Target die-cast grail does not exist or has been archived.");
+        }
+
+        const p = prodRows[0];
+        const available = Number(p.total_stock) - Number(p.locked_stock) - Number(p.sold_stock);
+
+        if (available <= 0) {
+          throw new Error(`Casting "${p.name}" is sold out.`);
+        }
+
+        // Increment locked_stock
+        await queryRunner.query(`
+          UPDATE products 
+          SET locked_stock = locked_stock + 1, updated_at = NOW() 
+          WHERE id = $1;
+        `, [productId]);
+
+        // Insert reservation record
+        await queryRunner.query(`
+          INSERT INTO reservations (product_id, customer_id, quantity, expires_at, status, idempotency_key, order_id)
+          VALUES ($1, $2, 1, $3, 'Active', $4, $5)
+          RETURNING id;
+        `, [productId, userId, expiresAt, `${idempotencyKey}_${productId}`, orderId]);
+
+        // Create order item
+        await queryRunner.query(`
+          INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
+          VALUES ($1, $2, 1, $3);
+        `, [orderId, productId, Number(price || 0)]);
+      }
+
+      await queryRunner.commitTransaction();
+      localCache.del('products_list_true');
+      localCache.del('products_list_false');
+
+      const responseObj = {
+        success: true,
+        orderId,
+        expiresAt
+      };
+
+      // Set idempotency cache
+      localCache.set(`idem_${idempotencyKey}`, responseObj, 3600);
+
+      await this.writeAuditLog(
+        'CART_RESERVED',
+        'orders',
+        orderId,
+        email,
+        ipAddress,
+        null,
+        responseObj
+      );
+
+      return responseObj;
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   // ── UPI SCREENSHOT UPLOAD SECURE STRATEGY ──────────────────────────
   async saveScreenshotReceipt(orderId: string, fileBuffer: Buffer, fileExtension: string, ipAddress: string) {
     const fileName = `${crypto.randomUUID()}.${fileExtension}`;
@@ -749,11 +900,9 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
-      // Find linked reservation
+      // Find linked reservations
       const resRows = await queryRunner.query("SELECT * FROM reservations WHERE order_id = $1", [orderId]);
-      if (resRows.length > 0) {
-        const r = resRows[0];
-        
+      for (const r of resRows) {
         // Decrement locked_stock and increment sold_stock
         await queryRunner.query(`
           UPDATE products 
