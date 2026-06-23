@@ -7,7 +7,10 @@ let server: any;
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
-  app.enableCors();
+  app.enableCors({
+    origin: true,
+    credentials: true,
+  });
   await app.init();
   const expressApp = app.getHttpAdapter().getInstance();
   return serverlessExpress({ app: expressApp });
@@ -22,7 +25,10 @@ export const handler: Handler = async (event: any, context: Context, callback: C
 if (process.env.NODE_ENV !== 'production' && !process.env.AWS_EXECUTION_ENV) {
   const startLocal = async () => {
     const app = await NestFactory.create(AppModule);
-    app.enableCors();
+    app.enableCors({
+      origin: true,
+      credentials: true,
+    });
     const port = process.env.PORT || 5001;
     await app.listen(port);
     console.log(`GarageKings NestJS server running locally on http://localhost:${port}`);

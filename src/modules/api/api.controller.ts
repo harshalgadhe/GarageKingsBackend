@@ -1,9 +1,11 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, UseGuards, Request, UnauthorizedException, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, UseGuards, Request, Res, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
 import crypto from 'crypto';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { Response as ExpressResponse } from 'express';
+import { signJwt, verifyJwt, validateFileSignature, parseCookies } from './api.helpers.js';
 
 const cognitoClient = new CognitoIdentityProviderClient({
   region: process.env.COGNITO_AWS_REGION || 'ap-south-1'
@@ -13,6 +15,127 @@ const cognitoClient = new CognitoIdentityProviderClient({
 export class ApiController {
   constructor(private readonly apiService: ApiService) {}
 
+  // Helper validation ensuring the caller is Owner or Admin
+  private checkAdmin(req: any) {
+    const role = req.user?.role;
+    if (role !== 'Owner' && role !== 'Admin') {
+      throw new UnauthorizedException('Administrative privileges required.');
+    }
+  }
+
+  // ── FIRST STARTUP SETUP STATUS ──────────────────────────────────────
+  @Get('setup/status')
+  async getSetupStatus() {
+    return this.apiService.getSetupStatus();
+  }
+
+  @Post('setup/owner')
+  async setupOwner(@Body() dto: any) {
+    return this.apiService.setupOwner(dto);
+  }
+
+  // ── LOCAL AUTH COOKIE-BASED SESSION ENDPOINTS ───────────────────────
+  @Post('auth/login')
+  async login(@Body() dto: any, @Res({ passthrough: true }) res: ExpressResponse) {
+    const { email, password } = dto;
+    if (!email || !password) {
+      throw new BadRequestException('Email and password are required.');
+    }
+    const user = await this.apiService.validateUserCredentials(email, password);
+    if (!user) {
+      throw new UnauthorizedException('Invalid credentials.');
+    }
+
+    const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 15 * 60); // 15 mins
+    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 7 * 24 * 60 * 60); // 7 days
+
+    await this.apiService.updateRefreshToken(user.id, refreshToken);
+
+    res.cookie('gk_access_token', accessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 15 * 60 * 1000
+    });
+
+    res.cookie('gk_refresh_token', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    return { success: true, user: { id: user.id, email: user.email, role: user.role } };
+  }
+
+  @Post('auth/logout')
+  async logout(@Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
+    const accessToken = req.headers.cookie ? parseCookies(req.headers.cookie)['gk_access_token'] : null;
+    if (accessToken) {
+      const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+      const payload = verifyJwt(accessToken, secret);
+      if (payload && payload.userId) {
+        await this.apiService.updateRefreshToken(payload.userId, null);
+      }
+    }
+    res.clearCookie('gk_access_token');
+    res.clearCookie('gk_refresh_token');
+    return { success: true };
+  }
+
+  @Post('auth/refresh')
+  async refresh(@Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
+    const refreshToken = req.headers.cookie ? parseCookies(req.headers.cookie)['gk_refresh_token'] : null;
+    if (!refreshToken) {
+      throw new UnauthorizedException('No refresh token provided.');
+    }
+
+    const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+    const payload = verifyJwt(refreshToken, secret);
+    if (!payload || !payload.userId) {
+      throw new UnauthorizedException('Invalid or expired refresh token.');
+    }
+
+    const isValid = await this.apiService.verifyRefreshToken(payload.userId, refreshToken);
+    if (!isValid) {
+      throw new UnauthorizedException('Refresh token is revoked.');
+    }
+
+    const user = await this.apiService.getUserById(payload.userId);
+    if (!user) {
+      throw new UnauthorizedException('User no longer exists.');
+    }
+
+    const newAccessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 15 * 60);
+    const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 7 * 24 * 60 * 60);
+
+    await this.apiService.updateRefreshToken(user.id, newRefreshToken);
+
+    res.cookie('gk_access_token', newAccessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 15 * 60 * 1000
+    });
+
+    res.cookie('gk_refresh_token', newRefreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    return { success: true };
+  }
+
+  @Get('auth/me')
+  @UseGuards(AuthGuard('jwt'))
+  async getMe(@Request() req: any) {
+    return { user: req.user };
+  }
+
+  // ── LEGACY COGNITO BYPASSES ─────────────────────────────────────────
   @Post('auth/auto-confirm')
   async autoConfirmUser(@Body() dto: { email: string }) {
     const { email } = dto;
@@ -129,6 +252,11 @@ export class ApiController {
       }));
 
       console.log(`[GoogleLogin] Federated Google account sync completed successfully for ${cleanEmail}`);
+      
+      // 5. Sync the Google user in local PostgreSQL database
+      console.log(`[GoogleLogin] Syncing user to local PostgreSQL: ${cleanEmail}`);
+      await this.apiService.syncGoogleUser(cleanEmail, securePassword);
+
       return { 
         success: true, 
         message: 'Google federated login synced successfully',
@@ -141,101 +269,56 @@ export class ApiController {
     }
   }
 
-  // Helper validation ensuring the caller belongs to the Cognito 'admin' group
-  private checkAdmin(req: any) {
-    const roles = req.user?.roles || [];
-    if (!roles.includes('admin')) {
-      throw new UnauthorizedException('Administrative privileges required to modify vault metadata.');
-    }
-  }
-
   // ── PRODUCTS REST ENDPOINTS ─────────────────────────────────────────
   @Get('products')
   async getProducts() {
-    return this.apiService.getProducts();
+    return this.apiService.getProducts(false);
+  }
+
+  @Get('admin/products')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminProducts(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getProducts(true);
   }
 
   @Post('products')
   @UseGuards(AuthGuard('jwt'))
   async addProduct(@Body() car: any, @Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.addProduct(car);
+    return this.apiService.addProduct(car, req.user.email, req.ip);
   }
 
   @Patch('products/:id')
   @UseGuards(AuthGuard('jwt'))
   async updateProduct(@Param('id') id: string, @Body() car: any, @Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.updateProduct(id, car);
+    return this.apiService.updateProduct(id, car, req.user.email, req.ip);
   }
 
   @Delete('products/:id')
   @UseGuards(AuthGuard('jwt'))
   async deleteProduct(@Param('id') id: string, @Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.deleteProduct(id);
+    return this.apiService.softDeleteProduct(id, req.user.email, req.ip);
   }
 
-  @Post('products/reorder')
-  @UseGuards(AuthGuard('jwt'))
-  async reorderProducts(@Body() dto: any, @Request() req: any) {
-    this.checkAdmin(req);
-    return { success: true };
+  @Post('products/reserve')
+  async reserveProduct(@Body() dto: any, @Request() req: any) {
+    return this.apiService.reserveProduct(dto, req.ip);
   }
 
   // ── SETTINGS REST ENDPOINTS ─────────────────────────────────────────
   @Get('settings')
   async getSettings() {
-    return this.apiService.getSettings();
+    return this.apiService.getGlobalSettings();
   }
 
   @Post('settings')
   @UseGuards(AuthGuard('jwt'))
   async updateSettings(@Body() settings: any, @Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.updateSettings(settings);
-  }
-
-  // ── AUCTIONS REST ENDPOINTS ─────────────────────────────────────────
-  @Get('auctions')
-  async getAuctions() {
-    return this.apiService.getAuctions();
-  }
-
-  @Post('auctions')
-  @UseGuards(AuthGuard('jwt'))
-  async addAuction(@Body() auction: any, @Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.addAuction(auction);
-  }
-
-  @Patch('auctions/:id')
-  @UseGuards(AuthGuard('jwt'))
-  async updateAuction(@Param('id') id: string, @Body() auction: any, @Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.updateAuction(id, auction);
-  }
-
-  @Delete('auctions/:id')
-  @UseGuards(AuthGuard('jwt'))
-  async deleteAuction(@Param('id') id: string, @Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.deleteAuction(id);
-  }
-
-  // ── AUCTION BIDS REST ENDPOINTS ──────────────────────────────────────
-  @Get('auctions/:id/bids')
-  async getAuctionBids(@Param('id') id: string) {
-    return this.apiService.getAuctionBids(id);
-  }
-
-  @Post('auctions/:id/bids')
-  @UseGuards(AuthGuard('jwt'))
-  async addAuctionBid(@Param('id') id: string, @Body() dto: any, @Request() req: any) {
-    const cognitoSub = req.user?.userId;
-    const email = req.user?.email || 'anonymous@collector.com';
-    const userId = await this.apiService.getOrCreateUser(cognitoSub, email);
-    return this.apiService.addAuctionBid(id, userId, Number(dto.amount));
+    return this.apiService.updateGlobalSettings(settings, req.user.email, req.ip);
   }
 
   // ── CRM CUSTOMERS REST ENDPOINTS ─────────────────────────────────────
@@ -246,36 +329,7 @@ export class ApiController {
     return this.apiService.getCustomers();
   }
 
-  @Post('customers')
-  @UseGuards(AuthGuard('jwt'))
-  async addCustomer(@Body() customer: any, @Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.addCustomer(customer);
-  }
-
-  // ── CUSTOMERS E-COMMERCE ORDERS ────────────────────────────────────
-  @Post('orders')
-  @UseGuards(AuthGuard('jwt'))
-  async placeOrder(@Body() dto: any, @Request() req: any) {
-    const cognitoSub = req.user?.userId;
-    const email = req.user?.email;
-    if (!email) {
-      throw new UnauthorizedException('Acquisition placement requires verified Cognito email address.');
-    }
-    const userId = await this.apiService.getOrCreateUser(cognitoSub, email);
-    return this.apiService.placeOrder(userId, dto);
-  }
-
-  @Get('orders')
-  @UseGuards(AuthGuard('jwt'))
-  async getCustomerOrders(@Request() req: any) {
-    const email = req.user?.email;
-    if (!email) {
-      throw new UnauthorizedException('Collector profile queries require active authenticated session.');
-    }
-    return this.apiService.getCustomerOrders(email);
-  }
-
+  // ── ADMIN ORDERS PIPELINE ──────────────────────────────────────────
   @Get('admin/orders')
   @UseGuards(AuthGuard('jwt'))
   async getAdminOrders(@Request() req: any) {
@@ -287,13 +341,48 @@ export class ApiController {
   @UseGuards(AuthGuard('jwt'))
   async updateOrderStatus(
     @Param('id') id: string,
-    @Body() dto: { status?: string; trackingNumber?: string },
+    @Body() dto: { status?: string; courierPartner?: string; trackingNumber?: string; shippingCost?: number; packagingCost?: number; dispatchDate?: string; deliveryDate?: string },
     @Request() req: any
   ) {
     this.checkAdmin(req);
-    return this.apiService.updateOrderStatus(id, dto.status, dto.trackingNumber);
+    if (dto.status === 'Confirmed') {
+      return this.apiService.adminConfirmOrder(id, req.user.email, req.ip);
+    }
+    return this.apiService.adminUpdateOrderStatus(id, dto, req.user.email, req.ip);
   }
 
+  // ── SECURE RECEIPTS & SCREENSHOTS STREAMING ───────────────────────
+  @Post('orders/:id/screenshot')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadScreenshot(
+    @Param('id') orderId: string,
+    @UploadedFile() file: any,
+    @Request() req: any
+  ) {
+    if (!file) {
+      throw new BadRequestException('No screenshot file provided.');
+    }
+    const signature = validateFileSignature(file.buffer);
+    if (!signature.isValid) {
+      throw new BadRequestException('Invalid file signature. Only JPG, PNG, and WebP images are allowed.');
+    }
+    const extension = signature.mime.split('/').pop() || 'webp';
+    return this.apiService.saveScreenshotReceipt(orderId, file.buffer, extension, req.ip);
+  }
+
+  @Get('admin/orders/:id/screenshot')
+  @UseGuards(AuthGuard('jwt'))
+  async getScreenshot(@Param('id') orderId: string, @Request() req: any, @Res() res: ExpressResponse) {
+    this.checkAdmin(req);
+    const result = await this.apiService.getPrivateScreenshotStream(orderId);
+    if (!result) {
+      throw new NotFoundException('Screenshot not found for this order.');
+    }
+    res.setHeader('Content-Type', 'image/jpeg'); // Standard default, browser handles webp/png inline mostly
+    result.stream.pipe(res);
+  }
+
+  // ── PUBLIC IMAGE UPLOADS AND STREAMING ────────────────────────────
   @Post('images/upload')
   @UseGuards(AuthGuard('jwt'))
   @UseInterceptors(FileInterceptor('file'))
@@ -304,16 +393,117 @@ export class ApiController {
   ) {
     this.checkAdmin(req);
     if (!file) {
-      throw new Error('No image file provided for S3 archival upload.');
+      throw new BadRequestException('No file provided.');
     }
-
-    const fileExtension = file.originalname?.split('.').pop() || 'webp';
-    const randomName = crypto.randomUUID();
-    const fileName = `${randomName}.${fileExtension}`;
-    const mimetype = file.mimetype || 'image/webp';
-
-    const url = await this.apiService.uploadImage(file.buffer, fileName, mimetype, folder);
+    const signature = validateFileSignature(file.buffer);
+    if (!signature.isValid) {
+      throw new BadRequestException('Invalid file type.');
+    }
+    const extension = signature.mime.split('/').pop() || 'webp';
+    const filename = `${crypto.randomUUID()}.${extension}`;
+    const url = await this.apiService.uploadImage(file.buffer, filename, signature.mime, folder);
     return { success: true, url };
+  }
+
+  @Get('images/:filename')
+  async getPublicImage(@Param('filename') filename: string, @Res() res: ExpressResponse) {
+    const result = await this.apiService.getPublicImageStream(filename);
+    if (!result) {
+      throw new NotFoundException('Image not found.');
+    }
+    res.setHeader('Content-Type', 'image/webp');
+    result.stream.pipe(res);
+  }
+
+  // ── EXPENSES MODULE ───────────────────────────────────────────────
+  @Get('admin/expenses')
+  @UseGuards(AuthGuard('jwt'))
+  async getExpenses(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getExpenses();
+  }
+
+  @Post('admin/expenses')
+  @UseGuards(AuthGuard('jwt'))
+  async addExpense(@Body() exp: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.addExpense(exp, req.user.email, req.ip);
+  }
+
+  @Delete('admin/expenses/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async deleteExpense(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.softDeleteExpense(id, req.user.email, req.ip);
+  }
+
+  // ── FOUNDER SPLITS & FINANCE LEDGER ───────────────────────────────
+  @Get('admin/splits')
+  @UseGuards(AuthGuard('jwt'))
+  async getSplits(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getSplits();
+  }
+
+  @Post('admin/splits/settle')
+  @UseGuards(AuthGuard('jwt'))
+  async addSettlement(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    const { from, to, amount, notes, date } = dto;
+    return this.apiService.addSettlement(from, to, Number(amount), notes, date);
+  }
+
+  @Get('admin/dashboard/kpis')
+  @UseGuards(AuthGuard('jwt'))
+  async getDashboardKpis(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getFinanceMetrics();
+  }
+
+  // ── ANALYTICS METRICS ──────────────────────────────────────────────
+  @Get('admin/analytics')
+  @UseGuards(AuthGuard('jwt'))
+  async getAnalytics(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getAnalyticsMetrics();
+  }
+
+  // ── AUDIT LOGS ────────────────────────────────────────────────────
+  @Get('admin/audit-logs')
+  @UseGuards(AuthGuard('jwt'))
+  async getAuditLogs(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getAuditLogs();
+  }
+
+  // ── ALERTS AND SYSTEM NOTIFICATIONS ───────────────────────────────
+  @Get('admin/notifications')
+  @UseGuards(AuthGuard('jwt'))
+  async getNotifications(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getSystemNotifications();
+  }
+
+  @Post('admin/notifications/read')
+  @UseGuards(AuthGuard('jwt'))
+  async markNotificationsRead(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.markNotificationsRead();
+  }
+
+  // ── CMS HOMEPAGE SECTIONS VISIBILITY ──────────────────────────────
+  @Get('admin/homepage-cms')
+  @UseGuards(AuthGuard('jwt'))
+  async getHomepageCms(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getHomepageCMS();
+  }
+
+  @Patch('admin/homepage-cms/section')
+  @UseGuards(AuthGuard('jwt'))
+  async updateHomepageSectionVisibility(@Body() dto: { sectionName: string; isVisible: boolean }, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.updateHomepageSectionVisibility(dto.sectionName, dto.isVisible);
   }
 }
 export default ApiController;
