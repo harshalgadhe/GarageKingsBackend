@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, UseGuards, Request, Res, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
@@ -186,21 +186,38 @@ export class ApiController {
         console.log(`[GoogleLogin] Sandbox bypass mode detected for email: ${idToken}`);
         cleanEmail = idToken.trim();
       } else {
-        // 1. Verify Google ID Token via tokeninfo endpoint
-        const googleRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`);
+        // 1. Verify Google Token via tokeninfo endpoint (supports both ID Token and Access Token)
+        // A JWT (Google ID Token) always contains exactly 3 parts separated by dots.
+        // A Google Access Token (typically starting with 'ya29.') has only 1 dot (2 parts).
+        const isJwt = idToken.split('.').length === 3;
+        const verifyUrl = isJwt
+          ? `https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`
+          : `https://oauth2.googleapis.com/tokeninfo?access_token=${idToken}`;
+        
+        const googleRes = await fetch(verifyUrl);
         if (!googleRes.ok) {
-          throw new UnauthorizedException('Google OAuth ID Token signature verification failed.');
+          const errText = await googleRes.text();
+          console.error(`[GoogleLogin] Tokeninfo check failed. Status: ${googleRes.status}, Body: ${errText}, URL: ${verifyUrl}`);
+          throw new UnauthorizedException('Google OAuth Token signature verification failed.');
         }
         
         const payload: any = await googleRes.json();
         
         // Verify audience matches our Google Client ID
-        const expectedClientId = '984738691172-khs7a7lp6ccgk56e089b4gbfs8k48bsa.apps.googleusercontent.com';
-        if (payload.aud !== expectedClientId) {
+        const envClientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
+        const allowedClientIds = [
+          '984738691172-khs7a7lp6ccgk56e089b4gbfs8k48bsa.apps.googleusercontent.com',
+          '231477217878-0g2nq0e6fmvqt802gdu8esm1uucfmjvv.apps.googleusercontent.com'
+        ];
+        const clientAud = payload.aud || payload.azp;
+        
+        const isMatched = (envClientId && clientAud === envClientId) || allowedClientIds.includes(clientAud);
+        if (!isMatched) {
+          console.error(`[GoogleLogin] Audience mismatch. Expected: ${envClientId} or one of ${allowedClientIds.join(', ')}, Got: ${clientAud}`);
           throw new UnauthorizedException('Google OAuth client identification mismatch.');
         }
         
-        if (payload.email_verified !== 'true' && payload.email_verified !== true) {
+        if (payload.email_verified !== undefined && payload.email_verified !== 'true' && payload.email_verified !== true) {
           throw new UnauthorizedException('Google email address must be verified.');
         }
         
@@ -271,8 +288,35 @@ export class ApiController {
 
   // ── PRODUCTS REST ENDPOINTS ─────────────────────────────────────────
   @Get('products')
-  async getProducts() {
-    return this.apiService.getProducts(false);
+  async getProducts(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('brand') brand?: string,
+    @Query('scale') scale?: string,
+    @Query('tag') tag?: string,
+    @Query('search') search?: string,
+    @Query('inStock') inStock?: string,
+    @Query('preBooking') preBooking?: string
+  ) {
+    return this.apiService.getPaginatedProducts({
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      brand,
+      scale,
+      tag,
+      search,
+      inStock: inStock === 'true',
+      preBooking: preBooking === 'true'
+    });
+  }
+
+  @Get('products/:id')
+  async getProduct(@Param('id') id: string) {
+    const product = await this.apiService.getProduct(id);
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+    return product;
   }
 
   @Get('admin/products')
@@ -305,12 +349,46 @@ export class ApiController {
 
   @Post('products/reserve')
   async reserveProduct(@Body() dto: any, @Request() req: any) {
-    return this.apiService.reserveProduct(dto, req.ip);
+    // Attempt to extract authenticated user ID from JWT cookie/header (optional — guest checkout also allowed)
+    let authenticatedUserId: string | undefined;
+    try {
+      const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+      let token: string | null = null;
+      if (req.headers.cookie) {
+        const cookies = parseCookies(req.headers.cookie);
+        token = cookies['gk_access_token'] || null;
+      }
+      if (!token && req.headers.authorization?.startsWith('Bearer ')) {
+        token = req.headers.authorization.slice(7);
+      }
+      if (token) {
+        const payload: any = verifyJwt(token, secret);
+        if (payload?.userId) authenticatedUserId = payload.userId;
+      }
+    } catch { /* ignore — guest checkout proceeds without auth */ }
+    return this.apiService.reserveProduct(dto, req.ip, authenticatedUserId);
   }
 
   @Post('products/reserve-cart')
   async reserveProductsCart(@Body() dto: any, @Request() req: any) {
-    return this.apiService.reserveProductsCart(dto, req.ip);
+    // Attempt to extract authenticated user ID from JWT cookie/header (optional — guest checkout also allowed)
+    let authenticatedUserId: string | undefined;
+    try {
+      const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+      let token: string | null = null;
+      if (req.headers.cookie) {
+        const cookies = parseCookies(req.headers.cookie);
+        token = cookies['gk_access_token'] || null;
+      }
+      if (!token && req.headers.authorization?.startsWith('Bearer ')) {
+        token = req.headers.authorization.slice(7);
+      }
+      if (token) {
+        const payload: any = verifyJwt(token, secret);
+        if (payload?.userId) authenticatedUserId = payload.userId;
+      }
+    } catch { /* ignore — guest checkout proceeds without auth */ }
+    return this.apiService.reserveProductsCart(dto, req.ip, authenticatedUserId);
   }
 
   // ── SETTINGS REST ENDPOINTS ─────────────────────────────────────────
@@ -332,6 +410,25 @@ export class ApiController {
   async getCustomers(@Request() req: any) {
     this.checkAdmin(req);
     return this.apiService.getCustomers();
+  }
+
+  // ── CUSTOMER PROFILE & ORDERS REST ENDPOINTS ─────────────────────────
+  @Get('orders/my')
+  @UseGuards(AuthGuard('jwt'))
+  async getMyOrders(@Request() req: any) {
+    return this.apiService.getCustomerOrders(req.user.email);
+  }
+
+  @Get('profile/my')
+  @UseGuards(AuthGuard('jwt'))
+  async getMyProfile(@Request() req: any) {
+    return this.apiService.getCustomerProfile(req.user.email);
+  }
+
+  @Post('profile/my')
+  @UseGuards(AuthGuard('jwt'))
+  async updateMyProfile(@Body() dto: any, @Request() req: any) {
+    return this.apiService.updateCustomerProfile(req.user.email, dto);
   }
 
   // ── ADMIN ORDERS PIPELINE ──────────────────────────────────────────
@@ -385,6 +482,35 @@ export class ApiController {
     }
     res.setHeader('Content-Type', 'image/jpeg'); // Standard default, browser handles webp/png inline mostly
     result.stream.pipe(res);
+  }
+
+  // ── PRE-ORDER: COLLECT REMAINING PAYMENT ──────────────────────────
+  @Post('admin/orders/:id/collect-remaining')
+  @UseGuards(AuthGuard('jwt'))
+  @UseInterceptors(FileInterceptor('file'))
+  async collectRemainingPayment(
+    @Param('id') orderId: string,
+    @UploadedFile() file: any,
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    if (!file) {
+      throw new BadRequestException('No payment screenshot provided.');
+    }
+    const signature = validateFileSignature(file.buffer);
+    if (!signature.isValid) {
+      throw new BadRequestException('Invalid file signature. Only JPG, PNG, and WebP images are allowed.');
+    }
+    const extension = signature.mime.split('/').pop() || 'webp';
+    return this.apiService.collectRemainingPayment(orderId, file.buffer, extension, req.user.email, req.ip);
+  }
+
+  // ── FORMAL RECEIPT GENERATION ─────────────────────────────────────
+  @Get('admin/orders/:id/receipt')
+  @UseGuards(AuthGuard('jwt'))
+  async getOrderReceipt(@Param('id') orderId: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.generateReceiptForOrder(orderId);
   }
 
   // ── PUBLIC IMAGE UPLOADS AND STREAMING ────────────────────────────
@@ -484,9 +610,11 @@ export class ApiController {
   // ── ALERTS AND SYSTEM NOTIFICATIONS ───────────────────────────────
   @Get('admin/notifications')
   @UseGuards(AuthGuard('jwt'))
-  async getNotifications(@Request() req: any) {
+  async getNotifications(@Request() req: any, @Query('limit') limit?: string, @Query('offset') offset?: string) {
     this.checkAdmin(req);
-    return this.apiService.getSystemNotifications();
+    const limitNum = limit ? parseInt(limit, 10) : 10;
+    const offsetNum = offset ? parseInt(offset, 10) : 0;
+    return this.apiService.getSystemNotifications(limitNum, offsetNum);
   }
 
   @Post('admin/notifications/read')
@@ -494,6 +622,13 @@ export class ApiController {
   async markNotificationsRead(@Request() req: any) {
     this.checkAdmin(req);
     return this.apiService.markNotificationsRead();
+  }
+
+  @Delete('admin/notifications/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async deleteNotification(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.deleteSystemNotification(id);
   }
 
   // ── CMS HOMEPAGE SECTIONS VISIBILITY ──────────────────────────────
@@ -509,6 +644,19 @@ export class ApiController {
   async updateHomepageSectionVisibility(@Body() dto: { sectionName: string; isVisible: boolean }, @Request() req: any) {
     this.checkAdmin(req);
     return this.apiService.updateHomepageSectionVisibility(dto.sectionName, dto.isVisible);
+  }
+
+  // ── TELEMETRY & ERROR LOGGING ───────────────────────────────────────
+  @Post('telemetry/log')
+  async logTelemetry(@Body() dto: { source: string; level?: string; message: string; stack?: string; url?: string; userAgent?: string; userEmail?: string }) {
+    return this.apiService.logError(dto.source, dto.level || 'error', dto.message, dto.stack, dto.url, dto.userAgent, dto.userEmail);
+  }
+
+  @Get('admin/telemetry/logs')
+  @UseGuards(AuthGuard('jwt'))
+  async getTelemetryLogs(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getTelemetryLogs();
   }
 }
 export default ApiController;
