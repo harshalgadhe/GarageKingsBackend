@@ -973,10 +973,26 @@ export class ApiService implements OnModuleInit {
   // ── UPI SCREENSHOT UPLOAD SECURE STRATEGY ──────────────────────────
   async saveScreenshotReceipt(orderId: string, fileBuffer: Buffer, fileExtension: string, ipAddress: string) {
     const fileName = `${crypto.randomUUID()}.${fileExtension}`;
-    const filePath = path.join(privateUploadDir, fileName);
     
-    // Save to private server storage directory securely
-    fs.writeFileSync(filePath, fileBuffer);
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        await s3.send(new PutObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `uploads/${fileName}`,
+          Body: fileBuffer,
+          ContentType: `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
+        }));
+        console.log(`[S3] Successfully uploaded screenshot ${fileName} to bucket ${process.env.S3_ASSETS_BUCKET}`);
+      } catch (err: any) {
+        console.error(`[S3] Failed to upload screenshot to S3: ${err.message}`);
+        throw err;
+      }
+    } else {
+      const filePath = path.join(privateUploadDir, fileName);
+      fs.writeFileSync(filePath, fileBuffer);
+    }
 
     // Update order status to Verification Pending and store filename
     await this.dataSource.query(`
@@ -1007,25 +1023,81 @@ export class ApiService implements OnModuleInit {
   }
 
   async getPrivateScreenshotStream(orderId: string) {
-    const rows = await this.dataSource.query("SELECT screenshot_url FROM orders WHERE id = $1", [orderId]);
-    if (rows.length === 0 || !rows[0].screenshot_url) return null;
+    const rows = await this.dataSource.query(
+      "SELECT screenshot_url, advance_screenshot_url FROM orders WHERE id = $1", 
+      [orderId]
+    );
+    if (rows.length === 0) return null;
     
-    const filePath = path.join(privateUploadDir, rows[0].screenshot_url);
-    if (!fs.existsSync(filePath)) return null;
+    const fileName = rows[0].screenshot_url || rows[0].advance_screenshot_url;
+    if (!fileName) return null;
 
-    return {
-      stream: fs.createReadStream(filePath),
-      filename: rows[0].screenshot_url
-    };
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const res = await s3.send(new GetObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `uploads/${fileName}`
+        }));
+        return {
+          stream: res.Body as any,
+          filename: fileName
+        };
+      } catch (err: any) {
+        console.error(`[S3] Failed to download screenshot from S3: ${err.message}`);
+        return null;
+      }
+    } else {
+      const filePath = path.join(privateUploadDir, fileName);
+      if (!fs.existsSync(filePath)) return null;
+
+      return {
+        stream: fs.createReadStream(filePath),
+        filename: fileName
+      };
+    }
   }
 
   async uploadImage(fileBuffer: Buffer, fileName: string, mimetype: string, folder: string) {
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        await s3.send(new PutObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `uploads/${fileName}`,
+          Body: fileBuffer,
+          ContentType: mimetype
+        }));
+        console.log(`[S3] Uploaded public image: ${fileName}`);
+        return `https://${process.env.S3_ASSETS_BUCKET}.s3.amazonaws.com/uploads/${fileName}`;
+      } catch (err: any) {
+        console.error(`[S3] uploadImage failed: ${err.message}`);
+      }
+    }
     const filePath = path.join(privateUploadDir, fileName);
     fs.writeFileSync(filePath, fileBuffer);
     return `/api/v1/images/${fileName}`;
   }
 
   async getPublicImageStream(filename: string) {
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const res = await s3.send(new GetObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `uploads/${filename}`
+        }));
+        return {
+          stream: res.Body as any,
+          filename
+        };
+      } catch (err: any) {
+        console.error(`[S3] getPublicImageStream failed: ${err.message}`);
+      }
+    }
     const filePath = path.join(privateUploadDir, filename);
     if (!fs.existsSync(filePath)) return null;
     return {
@@ -1177,15 +1249,29 @@ export class ApiService implements OnModuleInit {
         `, [Number(item.qty), item.product_id]);
       }
 
-      await queryRunner.query("UPDATE orders SET status = 'Confirmed', updated_at = NOW() WHERE id = $1", [orderId]);
+      // Get booking details to determine correct final status and billing updates
+      const orderDetails = await queryRunner.query("SELECT booking_type, remaining_amount, advance_amount, total_price FROM orders WHERE id = $1", [orderId]);
+      const order = orderDetails[0];
+      const isInitialPreorder = order && order.booking_type === 'pre_order' && Number(order.remaining_amount) > 0;
+      const targetStatus = isInitialPreorder ? 'Pre-Order' : 'Confirmed';
+
+      await queryRunner.query("UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2", [targetStatus, orderId]);
       await queryRunner.query("UPDATE reservations SET status = 'Converted' WHERE order_id = $1", [orderId]);
 
-      // Update billing receipt if exists to reflect fully paid
-      await queryRunner.query(`
-        UPDATE receipts 
-        SET pending_balance = 0.00, advance_paid = total_amount
-        WHERE receipt_number = $1
-      `, [orderId]);
+      if (isInitialPreorder) {
+        await queryRunner.query(`
+          UPDATE receipts 
+          SET pending_balance = $1, advance_paid = $2
+          WHERE receipt_number = $3
+        `, [Number(order.remaining_amount), Number(order.advance_amount), orderId]);
+      } else {
+        // Update billing receipt if exists to reflect fully paid
+        await queryRunner.query(`
+          UPDATE receipts 
+          SET pending_balance = 0.00, advance_paid = total_amount
+          WHERE receipt_number = $1
+        `, [orderId]);
+      }
 
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -1198,7 +1284,7 @@ export class ApiService implements OnModuleInit {
         adminEmail,
         ipAddress,
         oldRes[0],
-        { status: 'Confirmed' }
+        { status: targetStatus }
       );
 
       return { success: true };
@@ -1299,8 +1385,26 @@ export class ApiService implements OnModuleInit {
     if (order.booking_type !== 'pre_order') throw new BadRequestException('This order is not a pre-order.');
 
     const fileName = `remain_${crypto.randomUUID()}.${fileExtension}`;
-    const filePath = path.join(privateUploadDir, fileName);
-    fs.writeFileSync(filePath, fileBuffer);
+    
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        await s3.send(new PutObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `uploads/${fileName}`,
+          Body: fileBuffer,
+          ContentType: `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
+        }));
+        console.log(`[S3] Successfully uploaded remaining screenshot ${fileName} to bucket ${process.env.S3_ASSETS_BUCKET}`);
+      } catch (err: any) {
+        console.error(`[S3] Failed to upload remaining screenshot to S3: ${err.message}`);
+        throw err;
+      }
+    } else {
+      const filePath = path.join(privateUploadDir, fileName);
+      fs.writeFileSync(filePath, fileBuffer);
+    }
 
     await this.dataSource.query(`
       UPDATE orders
@@ -1327,6 +1431,71 @@ export class ApiService implements OnModuleInit {
       ipAddress,
       order,
       { status: 'Verification Pending', remaining_amount: 0 }
+    );
+
+    return { success: true };
+  }
+
+  async customerSubmitRemainingPayment(orderId: string, fileBuffer: Buffer, fileExtension: string, userId: string, ipAddress: string) {
+    const orderRows = await this.dataSource.query(
+      "SELECT id, status, booking_type, remaining_amount, user_id FROM orders WHERE id = $1 AND deleted_at IS NULL",
+      [orderId]
+    );
+    if (orderRows.length === 0) throw new BadRequestException('Order not found.');
+    const order = orderRows[0];
+    if (order.user_id !== userId) {
+      throw new UnauthorizedException('You do not have permission to update this order.');
+    }
+    if (order.booking_type !== 'pre_order') throw new BadRequestException('This order is not a pre-order.');
+    if (order.status !== 'Awaiting Stock') {
+      throw new BadRequestException('Remaining payment has not been requested for this order yet.');
+    }
+
+    const fileName = `remain_${crypto.randomUUID()}.${fileExtension}`;
+    
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        await s3.send(new PutObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `uploads/${fileName}`,
+          Body: fileBuffer,
+          ContentType: `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
+        }));
+        console.log(`[S3] Customer uploaded remaining screenshot ${fileName} to bucket ${process.env.S3_ASSETS_BUCKET}`);
+      } catch (err: any) {
+        console.error(`[S3] Failed to upload remaining screenshot to S3: ${err.message}`);
+        throw err;
+      }
+    } else {
+      const filePath = path.join(privateUploadDir, fileName);
+      fs.writeFileSync(filePath, fileBuffer);
+    }
+
+    await this.dataSource.query(`
+      UPDATE orders
+      SET advance_screenshot_url = $1,
+          status = 'Verification Pending',
+          updated_at = NOW()
+      WHERE id = $2;
+    `, [fileName, orderId]);
+
+    await this.createSystemNotification(
+      'Pre-Order: Remaining Payment Uploaded',
+      `Customer has uploaded remaining payment receipt for Order ${orderId.slice(0, 8)}. Verification required.`,
+      'payment',
+      orderId
+    );
+
+    await this.writeAuditLog(
+      'PREORDER_REMAINING_SUBMITTED',
+      'orders',
+      orderId,
+      'Customer',
+      ipAddress,
+      order,
+      { status: 'Verification Pending', advance_screenshot_url: fileName }
     );
 
     return { success: true };

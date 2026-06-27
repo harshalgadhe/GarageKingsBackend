@@ -472,6 +472,25 @@ export class ApiController {
     return this.apiService.saveScreenshotReceipt(orderId, file.buffer, extension, req.ip);
   }
 
+  @Post('orders/:id/submit-remaining-payment')
+  @UseGuards(AuthGuard('jwt'))
+  @UseInterceptors(FileInterceptor('file'))
+  async submitRemainingPayment(
+    @Param('id') orderId: string,
+    @UploadedFile() file: any,
+    @Request() req: any
+  ) {
+    if (!file) {
+      throw new BadRequestException('No payment screenshot provided.');
+    }
+    const signature = validateFileSignature(file.buffer);
+    if (!signature.isValid) {
+      throw new BadRequestException('Invalid file signature. Only JPG, PNG, and WebP images are allowed.');
+    }
+    const extension = signature.mime.split('/').pop() || 'webp';
+    return this.apiService.customerSubmitRemainingPayment(orderId, file.buffer, extension, req.user.userId, req.ip);
+  }
+
   @Get('admin/orders/:id/screenshot')
   @UseGuards(AuthGuard('jwt'))
   async getScreenshot(@Param('id') orderId: string, @Request() req: any, @Res() res: ExpressResponse) {
