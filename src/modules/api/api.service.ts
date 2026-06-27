@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, UnauthorizedException } from '@nestjs/common';
+import { Injectable, OnModuleInit, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -8,7 +8,10 @@ import { hashPassword, verifyPassword, localCache } from './api.helpers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const privateUploadDir = path.join(__dirname, '..', '..', '..', 'storage', 'uploads');
+const isLambda = !!(process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT || process.env.LAMBDA_RUNTIME_DIR);
+const privateUploadDir = isLambda
+  ? '/tmp/storage/uploads'
+  : path.join(__dirname, '..', '..', '..', 'storage', 'uploads');
 
 @Injectable()
 export class ApiService implements OnModuleInit {
@@ -16,8 +19,12 @@ export class ApiService implements OnModuleInit {
 
   async onModuleInit() {
     // Ensure storage folder for secure private uploads exists
-    if (!fs.existsSync(privateUploadDir)) {
-      fs.mkdirSync(privateUploadDir, { recursive: true });
+    try {
+      if (!fs.existsSync(privateUploadDir)) {
+        fs.mkdirSync(privateUploadDir, { recursive: true });
+      }
+    } catch (err: any) {
+      console.warn(`[onModuleInit] Failed to create privateUploadDir: ${err.message}`);
     }
 
     // Dynamic schema validation & correction fallback (insulates against missed runs)
@@ -28,6 +35,15 @@ export class ApiService implements OnModuleInit {
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Alter order_status enum values if they don't exist
+    for (const val of ['Verification Pending', 'Confirmed', 'Reserved', 'Pre-Order', 'Awaiting Stock']) {
+      try {
+        await this.dataSource.query(`ALTER TYPE order_status ADD VALUE IF NOT EXISTS '${val}'`);
+      } catch (err: any) {
+        console.warn(`[onModuleInit] Did not add enum value '${val}': ${err.message}`);
+      }
+    }
 
     // Ensure all v2 database schema modifications are applied dynamically
     await this.dataSource.query(`
@@ -53,11 +69,18 @@ export class ApiService implements OnModuleInit {
       ALTER TABLE products ADD COLUMN IF NOT EXISTS created_by VARCHAR(255);
       ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_by VARCHAR(255);
       ALTER TABLE products ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS max_qty_per_customer INT DEFAULT NULL;
 
       -- 3. Orders alterations
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS screenshot_url TEXT;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMP WITH TIME ZONE;
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255) UNIQUE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_partner VARCHAR(100);
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_cost NUMERIC(12, 2) DEFAULT 0.00;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS packaging_cost NUMERIC(12, 2) DEFAULT 0.00;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS dispatch_date TIMESTAMP WITH TIME ZONE;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_date TIMESTAMP WITH TIME ZONE;
 
       -- 4. Customers alterations
       ALTER TABLE customers ADD COLUMN IF NOT EXISTS instagram_username VARCHAR(100);
@@ -69,6 +92,34 @@ export class ApiService implements OnModuleInit {
       -- 5. Audit logs alterations
       ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS performed_by VARCHAR(255);
       ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ip_address VARCHAR(50);
+
+      -- 6. Pre-order support columns on orders
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS booking_type VARCHAR(20) DEFAULT 'standard';
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS advance_amount NUMERIC(12, 2) DEFAULT 0.00;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS remaining_amount NUMERIC(12, 2) DEFAULT 0.00;
+      ALTER TABLE orders ADD COLUMN IF NOT EXISTS advance_screenshot_url TEXT;
+
+      -- 7. Pre-booking support columns on products
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS is_prebook BOOLEAN DEFAULT FALSE;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS prebook_deposit_amount NUMERIC(12, 2) DEFAULT NULL;
+    `);
+
+    // Migrate customers unique constraint: drop phone key, ensure email is the unique identifier
+    await this.dataSource.query(`
+      ALTER TABLE customers DROP CONSTRAINT IF EXISTS customers_phone_key;
+      ALTER TABLE customers ALTER COLUMN phone DROP NOT NULL;
+    `);
+    await this.dataSource.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'customers_email_key' AND table_name = 'customers'
+        ) THEN
+          ALTER TABLE customers ADD CONSTRAINT customers_email_key UNIQUE (email);
+        END IF;
+      END
+      $$;
     `);
 
     await this.dataSource.query(`
@@ -118,10 +169,13 @@ export class ApiService implements OnModuleInit {
         title VARCHAR(255) NOT NULL,
         message TEXT NOT NULL,
         type VARCHAR(50) DEFAULT 'info', -- 'low_stock', 'timer_alert', 'payment'
+        order_id UUID DEFAULT NULL,
         is_read BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Ensure order_id column exists on older deployments
+    await this.dataSource.query(`ALTER TABLE system_notifications ADD COLUMN IF NOT EXISTS order_id UUID DEFAULT NULL;`);
 
     await this.dataSource.query(`
       CREATE TABLE IF NOT EXISTS homepage_sections (
@@ -144,6 +198,20 @@ export class ApiService implements OnModuleInit {
       );
     `);
 
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS error_logs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        source VARCHAR(50) NOT NULL,
+        level VARCHAR(20) DEFAULT 'error',
+        message TEXT NOT NULL,
+        stack TEXT,
+        url VARCHAR(512),
+        user_agent VARCHAR(512),
+        user_email VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     // Bootstrap default CMS sections if empty
     const secCount = await this.dataSource.query("SELECT COUNT(*) FROM homepage_sections");
     if (Number(secCount[0].count) === 0) {
@@ -158,13 +226,14 @@ export class ApiService implements OnModuleInit {
     }
 
     // ── 15-SECOND RESERVATION TIMER WORKER ─────────────────────────
-    setInterval(async () => {
-      try {
-        await this.expireActiveReservations();
-      } catch (err) {
-        console.error("[Worker Error] Failed executing reservation cleanup:", err);
-      }
-    }, 15000);
+    // Disabled reservation timer worker: Checkout is now first-come-first-served
+    // setInterval(async () => {
+    //   try {
+    //     await this.expireActiveReservations();
+    //   } catch (err) {
+    //     console.error("[Worker Error] Failed executing reservation cleanup:", err);
+    //   }
+    // }, 15000);
   }
 
   // ── AUDIT LOGGING SYSTEM (IMMUTABLE LOGS) ──────────────────────────
@@ -266,6 +335,8 @@ export class ApiService implements OnModuleInit {
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
              p.supplier, p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
              p.status, p.show_on_homepage as "showOnHomepage", p.created_by as "createdBy", p.updated_by as "updatedBy",
+             p.max_qty_per_customer as "maxQtyPerCustomer",
+             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
              pi.thumbnail_url as image, p.created_at
       FROM products p
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
@@ -283,6 +354,123 @@ export class ApiService implements OnModuleInit {
     return rows;
   }
 
+  async getPaginatedProducts(options: {
+    page?: number;
+    limit?: number;
+    brand?: string;
+    scale?: string;
+    tag?: string;
+    search?: string;
+    inStock?: boolean;
+    preBooking?: boolean;
+  }) {
+    const page = Math.max(1, Number(options.page || 1));
+    const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
+    const offset = (page - 1) * limit;
+
+    let queryStr = `
+      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
+             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
+             p.tags, p.category, p.purchase_price as "purchasePrice", p.selling_price as "sellingPrice",
+             p.total_stock as "totalStock", p.locked_stock as "lockedStock", p.sold_stock as "soldStock",
+             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
+             p.supplier, p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
+             p.status, p.show_on_homepage as "showOnHomepage", p.created_by as "createdBy", p.updated_by as "updatedBy",
+             p.max_qty_per_customer as "maxQtyPerCustomer",
+             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
+             pi.thumbnail_url as image, p.created_at
+      FROM products p
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
+      WHERE p.deleted_at IS NULL AND p.status = 'Published'
+    `;
+
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (options.brand) {
+      queryStr += ` AND LOWER(p.brand) = LOWER($${paramIndex})`;
+      params.push(options.brand);
+      paramIndex++;
+    }
+
+    if (options.scale) {
+      queryStr += ` AND p.scale = $${paramIndex}`;
+      params.push(options.scale);
+      paramIndex++;
+    }
+
+    if (options.tag) {
+      queryStr += ` AND $${paramIndex} = ANY(p.tags)`;
+      params.push(options.tag);
+      paramIndex++;
+    }
+
+    if (options.inStock) {
+      queryStr += ` AND (p.total_stock - p.locked_stock - p.sold_stock) > 0`;
+    }
+
+    if (options.preBooking) {
+      queryStr += ` AND (p.is_prebook = true OR 'Pre-Order' = ANY(p.tags) OR 'Pre Booking' = ANY(p.tags) OR (p.release_date IS NOT NULL AND p.release_date > CURRENT_DATE))`;
+    }
+
+    if (options.search) {
+      queryStr += ` AND (
+        LOWER(p.model_name) LIKE LOWER($${paramIndex}) OR
+        LOWER(p.brand) LIKE LOWER($${paramIndex}) OR
+        LOWER(p.series) LIKE LOWER($${paramIndex})
+      )`;
+      params.push(`%${options.search}%`);
+      paramIndex++;
+    }
+
+    // Clone query for count
+    const countQuery = `SELECT COUNT(*)::int as total FROM (${queryStr}) as sub`;
+    const countRows = await this.dataSource.query(countQuery, params);
+    const total = parseInt(countRows[0]?.total || '0', 10);
+
+    // Add ordering and pagination
+    queryStr += ` ORDER BY p.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(limit, offset);
+
+    const rows = await this.dataSource.query(queryStr, params);
+
+    return {
+      products: rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    };
+  }
+
+  async getProduct(id: string) {
+    const cacheKey = `product_${id}`;
+    const cached = localCache.get(cacheKey);
+    if (cached) return cached;
+
+    const queryStr = `
+      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
+             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
+             p.tags, p.category, p.purchase_price as "purchasePrice", p.selling_price as "sellingPrice",
+             p.total_stock as "totalStock", p.locked_stock as "lockedStock", p.sold_stock as "soldStock",
+             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
+             p.supplier, p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
+             p.status, p.show_on_homepage as "showOnHomepage", p.created_by as "createdBy", p.updated_by as "updatedBy",
+             p.max_qty_per_customer as "maxQtyPerCustomer",
+             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
+             pi.thumbnail_url as image, p.created_at
+      FROM products p
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
+      WHERE p.deleted_at IS NULL AND p.id = $1
+      LIMIT 1;
+    `;
+
+    const rows = await this.dataSource.query(queryStr, [id]);
+    if (rows.length === 0) return null;
+    localCache.set(cacheKey, rows[0], 10); // Cache single item for 10 seconds
+    return rows[0];
+  }
+
   async addProduct(car: any, creatorEmail: string, ipAddress: string) {
     const sku = car.sku || `SKU-${Date.now()}`;
     const queryRunner = this.dataSource.createQueryRunner();
@@ -291,8 +479,8 @@ export class ApiService implements OnModuleInit {
 
     try {
       const prodRes = await queryRunner.query(`
-        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, supplier, arrival_date, release_date, status, show_on_homepage, created_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, supplier, arrival_date, release_date, status, show_on_homepage, created_by, max_qty_per_customer, is_prebook, prebook_deposit_amount)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         RETURNING id;
       `, [
         sku,
@@ -311,9 +499,12 @@ export class ApiService implements OnModuleInit {
         car.supplier || '',
         car.arrivalDate || null,
         car.releaseDate || null,
-        car.status || 'Draft',
+        car.status || 'Published',
         car.showOnHomepage !== false,
-        creatorEmail
+        creatorEmail,
+        car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : null,
+        car.isPrebook === true,
+        car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : null
       ]);
 
       const productId = prodRes[0].id;
@@ -369,8 +560,9 @@ export class ApiService implements OnModuleInit {
         UPDATE products 
         SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
             category = $9, purchase_price = $10, selling_price = $11, total_stock = $12, supplier = $13,
-            arrival_date = $14, release_date = $15, status = $16, show_on_homepage = $17, updated_by = $18, updated_at = NOW()
-        WHERE id = $19;
+            arrival_date = $14, release_date = $15, status = $16, show_on_homepage = $17, updated_by = $18, 
+            max_qty_per_customer = $19, is_prebook = $20, prebook_deposit_amount = $21, updated_at = NOW()
+        WHERE id = $22;
       `, [
         car.brand || 'MINI GT',
         car.name || 'Unknown Casting',
@@ -387,9 +579,12 @@ export class ApiService implements OnModuleInit {
         car.supplier || '',
         car.arrivalDate || null,
         car.releaseDate || null,
-        car.status || 'Draft',
+        car.status || 'Published',
         car.showOnHomepage !== false,
         updaterEmail,
+        car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : null,
+        car.isPrebook === true,
+        car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : null,
         id
       ]);
 
@@ -450,32 +645,26 @@ export class ApiService implements OnModuleInit {
     return { success: true };
   }
 
-  // ── ATOMIC TRANSACTIONAL STOCK LOCKING (RESERVATIONS) ────────────────
-  async reserveProduct(dto: any, ipAddress: string) {
-    const { productId, email, name, instagram, phone, address, idempotencyKey } = dto;
+  // ── ATOMIC TRANSACTIONAL STOCK LOCKING (RESERVATIONS - DIRECT ORDER TRANSITION) ──
+  async reserveProduct(dto: any, ipAddress: string, authenticatedUserId?: string) {
+    const { productId, email, name, instagram, phone, address, idempotencyKey, bookingType, advanceAmount } = dto;
+    const requestedQty = Math.max(1, Math.min(10, parseInt(dto.qty || dto.quantity || '1', 10)));
+    const isPreOrder = bookingType === 'pre_order';
 
     if (!idempotencyKey) {
-      throw new Error("Idempotency key is required to reserve stock safely.");
+      throw new Error("Idempotency key is required to create order safely.");
     }
 
     // 1. Enforce Idempotency Lock Check
     const cachedRes = localCache.get(`idem_${idempotencyKey}`);
     if (cachedRes) return cachedRes;
 
-    const dbIdem = await this.dataSource.query("SELECT * FROM reservations WHERE idempotency_key = $1", [idempotencyKey]);
+    const dbIdem = await this.dataSource.query("SELECT id FROM orders WHERE idempotency_key = $1", [idempotencyKey]);
     if (dbIdem.length > 0) {
-      return dbIdem[0];
-    }
-
-    // 2. Reservation abuse validation: max 3 active locks per customer (email or IP)
-    const activeCount = await this.dataSource.query(`
-      SELECT COUNT(*) FROM reservations 
-      WHERE (customer_id IN (SELECT id FROM users WHERE email = $1) OR idempotency_key LIKE $2)
-      AND status = 'Active' AND expires_at > NOW();
-    `, [email.trim().toLowerCase(), `%${ipAddress}%`]);
-
-    if (Number(activeCount[0].count) >= 3) {
-      throw new Error("Reservation limit exceeded. Maximum of 3 active stock locks are allowed simultaneously.");
+      return {
+        success: true,
+        orderId: dbIdem[0].id
+      };
     }
 
     const queryRunner = this.dataSource.createQueryRunner();
@@ -483,77 +672,95 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
-      // 3. Row-level lock target product to prevent race condition double-buys
+      // 2. Row-level lock target product to prevent race condition double-buys
       const prodRows = await queryRunner.query(`
-        SELECT id, model_name as name, total_stock, locked_stock, sold_stock 
+        SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
         FROM products 
         WHERE id = $1 AND deleted_at IS NULL 
         FOR UPDATE;
       `, [productId]);
 
       if (prodRows.length === 0) {
-        throw new Error("Target die-cast grail does not exist or has been archived.");
+        throw new BadRequestException("Target die-cast grail does not exist or has been archived.");
       }
 
       const p = prodRows[0];
-      const available = Number(p.total_stock) - Number(p.locked_stock) - Number(p.sold_stock);
+      // Accurate available stock = total - locked (pending orders) - sold
+      const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
 
       if (available <= 0) {
-        throw new Error(`Casting "${p.name}" is sold out.`);
+        throw new BadRequestException(`Casting "${p.name}" is sold out.`);
       }
 
-      // 4. Increment locked_stock
-      await queryRunner.query(`
-        UPDATE products 
-        SET locked_stock = locked_stock + 1, updated_at = NOW() 
-        WHERE id = $1;
-      `, [productId]);
+      if (requestedQty > available) {
+        throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${requestedQty}.`);
+      }
 
-      // 5. Get/create customer record
+      // Check customer purchase limit
+      if (p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
+        const existingCountRes = await queryRunner.query(`
+          SELECT COALESCE(SUM(oi.qty), 0) as total
+          FROM order_items oi
+          JOIN orders o ON o.id = oi.order_id
+          JOIN users u ON u.id = o.user_id
+          WHERE oi.product_id = $1 
+            AND u.email = $2 
+            AND o.status NOT IN ('Cancelled', 'Expired');
+        `, [productId, email.trim().toLowerCase()]);
+        const existingCount = Number(existingCountRes[0].total);
+        if (existingCount + requestedQty > p.max_qty_per_customer) {
+          throw new BadRequestException(`Purchase limit exceeded. You have already ordered/reserved ${existingCount} item(s) of this product. Maximum allowed per customer: ${p.max_qty_per_customer}.`);
+        }
+      }
+
+      // 3. Get/create customer record
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
-        ON CONFLICT (phone) DO UPDATE 
-        SET full_name = EXCLUDED.full_name, instagram = EXCLUDED.instagram, address = EXCLUDED.address
+        ON CONFLICT (email) DO UPDATE 
+        SET full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, instagram = EXCLUDED.instagram, address = EXCLUDED.address
         RETURNING id;
       `, [name, phone, instagram, address, email.trim().toLowerCase()]);
       const customerId = custRes[0].id;
 
-      // 6. Insert user shell mapping for login tracking
-      const userRes = await queryRunner.query(`
-        INSERT INTO users (email, cognito_sub)
-        VALUES ($1, $2)
-        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-        RETURNING id;
-      `, [email.trim().toLowerCase(), `guest_${customerId}`]);
-      const userId = userRes[0].id;
+      // 4. Resolve user ID — prefer authenticated user, fall back to email upsert for guest checkout
+      let userId: string;
+      if (authenticatedUserId) {
+        // Authenticated user: use their verified user ID directly, no upsert needed
+        userId = authenticatedUserId;
+      } else {
+        const userRes = await queryRunner.query(`
+          INSERT INTO users (email, cognito_sub)
+          VALUES ($1, $2)
+          ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+          RETURNING id;
+        `, [email.trim().toLowerCase(), `guest_${customerId}`]);
+        userId = userRes[0].id;
+      }
 
-      // 7. Insert reservation record
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-      const resVal = await queryRunner.query(`
-        INSERT INTO reservations (product_id, customer_id, quantity, expires_at, status, idempotency_key)
-        VALUES ($1, $2, 1, $3, 'Active', $4)
-        RETURNING id, expires_at;
-      `, [productId, userId, expiresAt, idempotencyKey]);
-
-      const reservation = resVal[0];
-
-      // 8. Create parent Reserved order record
+      // 5. Create parent Pending order record with idempotency
+      const unitPrice = Number(dto.price || 0);
+      const fullPrice = unitPrice * requestedQty;
+      const advPaid = isPreOrder ? Math.min(Number(advanceAmount || 0), fullPrice) : fullPrice;
+      const remaining = isPreOrder ? fullPrice - advPaid : 0;
+      const orderStatus = isPreOrder ? 'Pre-Order' : 'Pending';
       const orderRes = await queryRunner.query(`
-        INSERT INTO orders (user_id, total_price, shipping_address, status, created_at, updated_at)
-        VALUES ($1, $2, $3, 'Reserved', NOW(), NOW())
+        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8)
         RETURNING id;
-      `, [userId, Number(dto.price || 0), `${address} | Insta: ${instagram} | Phone: ${phone}`]);
+      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, isPreOrder ? 'pre_order' : 'standard', advPaid, remaining, idempotencyKey]);
       const orderId = orderRes[0].id;
 
-      // Link order to reservation
-      await queryRunner.query("UPDATE reservations SET order_id = $1 WHERE id = $2", [orderId, reservation.id]);
-
-      // Create order item
+      // 6. Create order item with actual requested qty
       await queryRunner.query(`
         INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-        VALUES ($1, $2, 1, $3);
-      `, [orderId, productId, Number(dto.price || 0)]);
+        VALUES ($1, $2, $3, $4);
+      `, [orderId, productId, requestedQty, unitPrice]);
+
+      // 7. Lock the stock (increment locked_stock)
+      await queryRunner.query(`
+        UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
+      `, [requestedQty, productId]);
 
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -562,17 +769,18 @@ export class ApiService implements OnModuleInit {
       const responseObj = {
         success: true,
         orderId,
-        reservationId: reservation.id,
-        expiresAt: reservation.expires_at
+        bookingType: isPreOrder ? 'pre_order' : 'standard',
+        advanceAmount: advPaid,
+        remainingAmount: remaining
       };
 
       // Set idempotency cache
       localCache.set(`idem_${idempotencyKey}`, responseObj, 3600); // Lock key cache for 1 hour
 
       await this.writeAuditLog(
-        'PRODUCT_RESERVED',
-        'reservations',
-        reservation.id,
+        'ORDER_CREATED',
+        'orders',
+        orderId,
         email,
         ipAddress,
         null,
@@ -588,39 +796,27 @@ export class ApiService implements OnModuleInit {
     }
   }
 
-  async reserveProductsCart(dto: any, ipAddress: string) {
-    const { items, email, name, instagram, phone, address, idempotencyKey } = dto;
+  async reserveProductsCart(dto: any, ipAddress: string, authenticatedUserId?: string) {
+    const { items, email, name, instagram, phone, address, idempotencyKey, bookingType, advanceAmount } = dto;
+    const isPreOrder = bookingType === 'pre_order';
 
     if (!idempotencyKey) {
-      throw new Error("Idempotency key is required to reserve stock safely.");
+      throw new BadRequestException("Idempotency key is required to create order safely.");
     }
     if (!items || !Array.isArray(items) || items.length === 0) {
-      throw new Error("Cart items are required to checkout.");
+      throw new BadRequestException("Cart items are required to checkout.");
     }
 
     // 1. Enforce Idempotency Lock Check
     const cachedRes = localCache.get(`idem_${idempotencyKey}`);
     if (cachedRes) return cachedRes;
 
-    const dbIdem = await this.dataSource.query("SELECT * FROM orders WHERE id IN (SELECT order_id FROM reservations WHERE idempotency_key LIKE $1) LIMIT 1", [`${idempotencyKey}%`]);
+    const dbIdem = await this.dataSource.query("SELECT id FROM orders WHERE idempotency_key = $1", [idempotencyKey]);
     if (dbIdem.length > 0) {
-      const resVal = await this.dataSource.query("SELECT expires_at FROM reservations WHERE order_id = $1 LIMIT 1", [dbIdem[0].id]);
       return {
         success: true,
-        orderId: dbIdem[0].id,
-        expiresAt: resVal.length > 0 ? resVal[0].expires_at : new Date()
+        orderId: dbIdem[0].id
       };
-    }
-
-    // 2. Reservation abuse validation: max 3 active locks per customer (email or IP)
-    const activeCount = await this.dataSource.query(`
-      SELECT COUNT(*) FROM reservations 
-      WHERE (customer_id IN (SELECT id FROM users WHERE email = $1) OR idempotency_key LIKE $2)
-      AND status = 'Active' AND expires_at > NOW();
-    `, [email.trim().toLowerCase(), `%${ipAddress}%`]);
-
-    if (Number(activeCount[0].count) >= 3) {
-      throw new Error("Reservation limit exceeded. Maximum of 3 active stock locks are allowed simultaneously.");
     }
 
     const queryRunner = this.dataSource.createQueryRunner();
@@ -628,24 +824,29 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
-      // Get/create customer record
+      // 2. Get/create customer record
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
-        ON CONFLICT (phone) DO UPDATE 
-        SET full_name = EXCLUDED.full_name, instagram = EXCLUDED.instagram, address = EXCLUDED.address
+        ON CONFLICT (email) DO UPDATE 
+        SET full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, instagram = EXCLUDED.instagram, address = EXCLUDED.address
         RETURNING id;
       `, [name, phone, instagram, address, email.trim().toLowerCase()]);
       const customerId = custRes[0].id;
 
-      // Insert user shell mapping for login tracking
-      const userRes = await queryRunner.query(`
-        INSERT INTO users (email, cognito_sub)
-        VALUES ($1, $2)
-        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-        RETURNING id;
-      `, [email.trim().toLowerCase(), `guest_${customerId}`]);
-      const userId = userRes[0].id;
+      // 3. Resolve user ID — prefer authenticated user, fall back to email upsert for guest checkout
+      let userId: string;
+      if (authenticatedUserId) {
+        userId = authenticatedUserId;
+      } else {
+        const userRes = await queryRunner.query(`
+          INSERT INTO users (email, cognito_sub)
+          VALUES ($1, $2)
+          ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+          RETURNING id;
+        `, [email.trim().toLowerCase(), `guest_${customerId}`]);
+        userId = userRes[0].id;
+      }
 
       // Compute total price of the aggregated cart
       let totalPrice = 0;
@@ -653,58 +854,86 @@ export class ApiService implements OnModuleInit {
         totalPrice += Number(item.price || 0);
       }
 
-      // Create parent Reserved order record
+      // 4. Create parent Pending order record with idempotency
+      const advPaid = isPreOrder ? Math.min(Number(advanceAmount || 0), totalPrice) : totalPrice;
+      const remaining = isPreOrder ? totalPrice - advPaid : 0;
+      const orderStatus = isPreOrder ? 'Pre-Order' : 'Pending';
       const orderRes = await queryRunner.query(`
-        INSERT INTO orders (user_id, total_price, shipping_address, status, created_at, updated_at)
-        VALUES ($1, $2, $3, 'Reserved', NOW(), NOW())
+        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8)
         RETURNING id;
-      `, [userId, totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`]);
+      `, [userId, totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, isPreOrder ? 'pre_order' : 'standard', advPaid, remaining, idempotencyKey]);
       const orderId = orderRes[0].id;
 
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
-
-      // Process each item in the cart
+      // Calculate quantities requested for each product in the cart
+      const requestedQuantities: Record<string, number> = {};
       for (const item of items) {
-        const { productId, price } = item;
+        requestedQuantities[item.productId] = (requestedQuantities[item.productId] || 0) + 1;
+      }
+
+      // Build a map of unique products to their price for processing
+      const uniqueProductPrices: Record<string, number> = {};
+      for (const item of items) {
+        if (!(item.productId in uniqueProductPrices)) {
+          uniqueProductPrices[item.productId] = Number(item.price || 0);
+        }
+      }
+
+      // Process each unique product: validate stock, insert order_item, lock stock
+      for (const [productId, qtyNeeded] of Object.entries(requestedQuantities)) {
+        const unitPrice = uniqueProductPrices[productId] || 0;
 
         // Row-level lock target product
         const prodRows = await queryRunner.query(`
-          SELECT id, model_name as name, total_stock, locked_stock, sold_stock 
+          SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
           FROM products 
           WHERE id = $1 AND deleted_at IS NULL 
           FOR UPDATE;
         `, [productId]);
 
         if (prodRows.length === 0) {
-          throw new Error("Target die-cast grail does not exist or has been archived.");
+          throw new BadRequestException("Target die-cast grail does not exist or has been archived.");
         }
 
         const p = prodRows[0];
-        const available = Number(p.total_stock) - Number(p.locked_stock) - Number(p.sold_stock);
+        // Accurate available stock = total - locked (pending orders) - sold
+        const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
 
         if (available <= 0) {
-          throw new Error(`Casting "${p.name}" is sold out.`);
+          throw new BadRequestException(`Casting "${p.name}" is sold out.`);
         }
 
-        // Increment locked_stock
-        await queryRunner.query(`
-          UPDATE products 
-          SET locked_stock = locked_stock + 1, updated_at = NOW() 
-          WHERE id = $1;
-        `, [productId]);
+        if (qtyNeeded > available) {
+          throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${qtyNeeded}.`);
+        }
 
-        // Insert reservation record
-        await queryRunner.query(`
-          INSERT INTO reservations (product_id, customer_id, quantity, expires_at, status, idempotency_key, order_id)
-          VALUES ($1, $2, 1, $3, 'Active', $4, $5)
-          RETURNING id;
-        `, [productId, userId, expiresAt, `${idempotencyKey}_${productId}`, orderId]);
+        // Check customer purchase limit
+        if (p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
+          const existingCountRes = await queryRunner.query(`
+            SELECT COALESCE(SUM(oi.qty), 0) as total
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            JOIN users u ON u.id = o.user_id
+            WHERE oi.product_id = $1 
+              AND u.email = $2 
+              AND o.status NOT IN ('Cancelled', 'Expired');
+          `, [productId, email.trim().toLowerCase()]);
+          const existingCount = Number(existingCountRes[0].total);
+          if (existingCount + qtyNeeded > p.max_qty_per_customer) {
+            throw new BadRequestException(`Purchase limit exceeded for "${p.name}". You are trying to order ${qtyNeeded} item(s), but you have already ordered/reserved ${existingCount}. Maximum allowed per customer: ${p.max_qty_per_customer}.`);
+          }
+        }
 
-        // Create order item
+        // Create order item with correct qty
         await queryRunner.query(`
           INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-          VALUES ($1, $2, 1, $3);
-        `, [orderId, productId, Number(price || 0)]);
+          VALUES ($1, $2, $3, $4);
+        `, [orderId, productId, qtyNeeded, unitPrice]);
+
+        // Lock the stock
+        await queryRunner.query(`
+          UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
+        `, [qtyNeeded, productId]);
       }
 
       await queryRunner.commitTransaction();
@@ -714,14 +943,16 @@ export class ApiService implements OnModuleInit {
       const responseObj = {
         success: true,
         orderId,
-        expiresAt
+        bookingType: isPreOrder ? 'pre_order' : 'standard',
+        advanceAmount: advPaid,
+        remainingAmount: remaining
       };
 
       // Set idempotency cache
       localCache.set(`idem_${idempotencyKey}`, responseObj, 3600);
 
       await this.writeAuditLog(
-        'CART_RESERVED',
+        'ORDER_CREATED_CART',
         'orders',
         orderId,
         email,
@@ -758,7 +989,8 @@ export class ApiService implements OnModuleInit {
     await this.createSystemNotification(
       'Payment Uploaded',
       `Order ${orderId.slice(0, 8)} uploaded a transaction receipt. Pending verification.`,
-      'payment'
+      'payment',
+      orderId
     );
 
     await this.writeAuditLog(
@@ -867,7 +1099,12 @@ export class ApiService implements OnModuleInit {
       SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress", o.tracking_number as "trackingNumber", o.created_at as "createdAt",
              o.screenshot_url as "screenshotUrl", o.courier_partner as "courierPartner", o.shipping_cost as "shippingCost",
              o.packaging_cost as "packagingCost", o.dispatch_date as "dispatchDate", o.delivery_date as "deliveryDate",
+             COALESCE(o.booking_type, 'standard') as "bookingType",
+             COALESCE(o.advance_amount, 0) as "advanceAmount",
+             COALESCE(o.remaining_amount, 0) as "remainingAmount",
+             o.advance_screenshot_url as "advanceScreenshotUrl",
              u.email as "customerEmail", c.instagram as "instagramUsername", c.full_name as "customerName",
+             c.phone as "customerPhone", c.address as "customerAddress",
              p.model_name as "productName", p.brand as "productBrand", oi.price_at_purchase as "priceAtPurchase", oi.qty
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
@@ -880,42 +1117,75 @@ export class ApiService implements OnModuleInit {
 
   async getCustomerOrders(email: string) {
     return this.dataSource.query(`
-      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress", o.tracking_number as "trackingNumber", o.created_at as "createdAt",
-             p.model_name as "productName", p.brand as "productBrand", oi.price_at_purchase as "priceAtPurchase", oi.qty,
+      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress",
+             o.tracking_number as "trackingNumber", o.created_at as "createdAt",
+             o.booking_type as "bookingType", o.advance_amount as "advanceAmount",
+             o.remaining_amount as "remainingAmount", o.reservation_expires_at as "expiresAt",
+             p.model_name as "productName", p.brand as "productBrand",
+             oi.price_at_purchase as "priceAtPurchase", oi.qty,
              o.screenshot_url as "screenshotUrl"
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
       JOIN products p ON p.id = oi.product_id
       JOIN users u ON u.id = o.user_id
-      WHERE u.email = $1
+      WHERE u.email = $1 AND o.deleted_at IS NULL
       ORDER BY o.created_at DESC;
     `, [email.trim().toLowerCase()]);
   }
-
   async adminConfirmOrder(orderId: string, adminEmail: string, ipAddress: string) {
     const oldRes = await this.dataSource.query("SELECT status FROM orders WHERE id = $1", [orderId]);
+    if (oldRes.length === 0) {
+      throw new Error("Order not found.");
+    }
+    if (oldRes[0].status === 'Confirmed') {
+      return { success: true };
+    }
     
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      // Find linked reservations
-      const resRows = await queryRunner.query("SELECT * FROM reservations WHERE order_id = $1", [orderId]);
-      for (const r of resRows) {
-        // Decrement locked_stock and increment sold_stock
+      // Get order items
+      const items = await queryRunner.query("SELECT product_id, qty FROM order_items WHERE order_id = $1", [orderId]);
+      for (const item of items) {
+        // Lock and check product stock
+        const prodRows = await queryRunner.query(`
+          SELECT id, model_name as name, total_stock, sold_stock, locked_stock
+          FROM products 
+          WHERE id = $1 AND deleted_at IS NULL 
+          FOR UPDATE;
+        `, [item.product_id]);
+
+        if (prodRows.length === 0) {
+          throw new Error("Target casting does not exist or has been archived.");
+        }
+
+        const p = prodRows[0];
+        const available = Number(p.total_stock) - Number(p.locked_stock) - Number(p.sold_stock);
+        if (available < Number(item.qty)) {
+          throw new Error(`Cannot approve order. Casting "${p.name}" is sold out. Available: ${available}, requested: ${item.qty}.`);
+        }
+
+        // Increment sold_stock and release locked_stock if legacy active reservation existed
         await queryRunner.query(`
           UPDATE products 
-          SET locked_stock = GREATEST(0, locked_stock - $1),
-              sold_stock = sold_stock + $1,
-              updated_at = NOW()
+          SET sold_stock = sold_stock + $1,
+              locked_stock = GREATEST(0, locked_stock - $1),
+              updated_at = NOW() 
           WHERE id = $2;
-        `, [r.quantity, r.product_id]);
-
-        await queryRunner.query("UPDATE reservations SET status = 'Converted' WHERE id = $1", [r.id]);
+        `, [Number(item.qty), item.product_id]);
       }
 
       await queryRunner.query("UPDATE orders SET status = 'Confirmed', updated_at = NOW() WHERE id = $1", [orderId]);
+      await queryRunner.query("UPDATE reservations SET status = 'Converted' WHERE order_id = $1", [orderId]);
+
+      // Update billing receipt if exists to reflect fully paid
+      await queryRunner.query(`
+        UPDATE receipts 
+        SET pending_balance = 0.00, advance_paid = total_amount
+        WHERE receipt_number = $1
+      `, [orderId]);
 
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -939,7 +1209,6 @@ export class ApiService implements OnModuleInit {
       await queryRunner.release();
     }
   }
-
   async adminUpdateOrderStatus(orderId: string, fields: any, adminEmail: string, ipAddress: string) {
     const oldRes = await this.dataSource.query("SELECT * FROM orders WHERE id = $1", [orderId]);
     const old = oldRes[0];
@@ -965,6 +1234,16 @@ export class ApiService implements OnModuleInit {
         fields.deliveryDate || old.delivery_date,
         orderId
       ]);
+
+      // If status transitioned to Paid, Confirmed, Shipped, or Delivered, mark receipt as paid
+      const targetStatus = fields.status || old.status;
+      if (targetStatus === 'Paid' || targetStatus === 'Confirmed' || targetStatus === 'Shipped' || targetStatus === 'Delivered') {
+        await queryRunner.query(`
+          UPDATE receipts 
+          SET pending_balance = 0.00, advance_paid = total_amount
+          WHERE receipt_number = $1
+        `, [orderId]);
+      }
 
       // If status transitioned to Cancelled, release stock
       if (fields.status === 'Cancelled' && old.status !== 'Cancelled') {
@@ -1007,6 +1286,116 @@ export class ApiService implements OnModuleInit {
     } finally {
       await queryRunner.release();
     }
+  }
+
+  // ── PRE-ORDER: COLLECT REMAINING PAYMENT ──────────────────────────
+  async collectRemainingPayment(orderId: string, fileBuffer: Buffer, fileExtension: string, adminEmail: string, ipAddress: string) {
+    const orderRows = await this.dataSource.query(
+      "SELECT id, status, booking_type, remaining_amount FROM orders WHERE id = $1",
+      [orderId]
+    );
+    if (orderRows.length === 0) throw new BadRequestException('Order not found.');
+    const order = orderRows[0];
+    if (order.booking_type !== 'pre_order') throw new BadRequestException('This order is not a pre-order.');
+
+    const fileName = `remain_${crypto.randomUUID()}.${fileExtension}`;
+    const filePath = path.join(privateUploadDir, fileName);
+    fs.writeFileSync(filePath, fileBuffer);
+
+    await this.dataSource.query(`
+      UPDATE orders
+      SET advance_screenshot_url = $1,
+          remaining_amount = 0,
+          advance_amount = total_price,
+          status = 'Verification Pending',
+          updated_at = NOW()
+      WHERE id = $2;
+    `, [fileName, orderId]);
+
+    await this.createSystemNotification(
+      'Pre-Order: Remaining Payment Received',
+      `Order ${orderId.slice(0, 8)} has submitted the remaining payment. Please verify and confirm.`,
+      'payment',
+      orderId
+    );
+
+    await this.writeAuditLog(
+      'PREORDER_REMAINING_COLLECTED',
+      'orders',
+      orderId,
+      adminEmail,
+      ipAddress,
+      order,
+      { status: 'Verification Pending', remaining_amount: 0 }
+    );
+
+    return { success: true };
+  }
+
+  // ── FORMAL RECEIPT DATA GENERATOR ─────────────────────────────────
+  async generateReceiptForOrder(orderId: string) {
+    const orderRows = await this.dataSource.query(`
+      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress",
+             o.shipping_cost as "shippingCost", o.packaging_cost as "packagingCost",
+             o.created_at as "createdAt", o.booking_type as "bookingType",
+             o.advance_amount as "advanceAmount", o.remaining_amount as "remainingAmount",
+             o.tracking_number as "trackingNumber", o.courier_partner as "courierPartner",
+             u.email as "customerEmail",
+             c.full_name as "customerName", c.phone as "customerPhone",
+             c.instagram as "customerInstagram", c.address as "customerAddress"
+      FROM orders o
+      JOIN users u ON u.id = o.user_id
+      LEFT JOIN customers c ON c.email = u.email
+      WHERE o.id = $1;
+    `, [orderId]);
+
+    if (orderRows.length === 0) throw new BadRequestException('Order not found.');
+    const order = orderRows[0];
+
+    const items = await this.dataSource.query(`
+      SELECT p.model_name as name, p.brand, p.series, p.scale,
+             oi.qty, oi.price_at_purchase as "unitPrice"
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      WHERE oi.order_id = $1;
+    `, [orderId]);
+
+    const receiptNumber = `GK-${new Date().getFullYear()}-${orderId.slice(0, 8).toUpperCase()}`;
+    const subtotal = items.reduce((sum: number, i: any) => sum + Number(i.unitPrice) * Number(i.qty), 0);
+    const shippingCharges = Number(order.shippingCost || 0) + Number(order.packagingCost || 0);
+    const totalAmount = Number(order.totalPrice);
+    const advancePaid = Number(order.advanceAmount || totalAmount);
+    const pendingBalance = Number(order.remainingAmount || 0);
+
+    return {
+      receiptNumber,
+      orderId: order.id,
+      date: order.createdAt,
+      status: order.status,
+      bookingType: order.bookingType || 'standard',
+      customer: {
+        name: order.customerName || 'Guest Customer',
+        email: order.customerEmail || '',
+        phone: order.customerPhone || '',
+        instagram: order.customerInstagram || '',
+        address: order.customerAddress || order.shippingAddress || ''
+      },
+      items: items.map((i: any) => ({
+        name: `${i.brand} ${i.name}`,
+        series: i.series || '',
+        scale: i.scale || '1:64',
+        qty: Number(i.qty),
+        unitPrice: Number(i.unitPrice),
+        lineTotal: Number(i.unitPrice) * Number(i.qty)
+      })),
+      subtotal,
+      shippingCharges,
+      totalAmount,
+      advancePaid,
+      pendingBalance,
+      trackingNumber: order.trackingNumber || null,
+      courierPartner: order.courierPartner || null
+    };
   }
 
   // ── CUSTOMERS CRM MODULE ───────────────────────────────────────────
@@ -1308,21 +1697,59 @@ export class ApiService implements OnModuleInit {
     `);
   }
 
-  // ── GLOBAL NOTIFICATIONS AND ALERTS ────────────────────────────────
-  async getSystemNotifications() {
-    return this.dataSource.query("SELECT * FROM system_notifications ORDER BY created_at DESC LIMIT 50;");
+    async getSystemNotifications(limit: number = 10, offset: number = 0) {
+    return this.dataSource.query(
+      "SELECT * FROM system_notifications ORDER BY created_at DESC LIMIT $1 OFFSET $2;",
+      [limit, offset]
+    );
   }
 
-  async createSystemNotification(title: string, message: string, type: string = 'info') {
+  async createSystemNotification(title: string, message: string, type: string = 'info', orderId: string | null = null) {
     await this.dataSource.query(`
-      INSERT INTO system_notifications (title, message, type)
-      VALUES ($1, $2, $3);
-    `, [title, message, type]);
+      INSERT INTO system_notifications (title, message, type, order_id)
+      VALUES ($1, $2, $3, $4);
+    `, [title, message, type, orderId]);
   }
 
   async markNotificationsRead() {
-    await this.dataSource.query("UPDATE system_notifications SET is_read = true WHERE is_read = false;");
+    await this.dataSource.query("DELETE FROM system_notifications;");
     return { success: true };
+  }
+
+  async deleteSystemNotification(id: string) {
+    await this.dataSource.query("DELETE FROM system_notifications WHERE id = $1;", [id]);
+    return { success: true };
+  }
+
+  async getCustomerProfile(email: string) {
+    const emailClean = email.trim().toLowerCase();
+    const rows = await this.dataSource.query(`
+      SELECT full_name as "fullName", phone, instagram, address, city
+      FROM customers
+      WHERE email = $1 AND deleted_at IS NULL;
+    `, [emailClean]);
+    if (rows.length === 0) {
+      return { fullName: '', phone: '', instagram: '', address: '', city: 'Unknown' };
+    }
+    return rows[0];
+  }
+
+  async updateCustomerProfile(email: string, dto: any) {
+    const emailClean = email.trim().toLowerCase();
+    const { fullName, phone, instagram, address, city } = dto;
+    const cleanPhone = phone ? phone.trim() : `unknown_${crypto.randomUUID()}`;
+    const custRes = await this.dataSource.query(`
+      INSERT INTO customers (full_name, phone, instagram, address, email, city)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (email) DO UPDATE 
+      SET full_name = EXCLUDED.full_name,
+          phone = EXCLUDED.phone,
+          instagram = EXCLUDED.instagram,
+          address = EXCLUDED.address,
+          city = EXCLUDED.city
+      RETURNING full_name as "fullName", phone, instagram, address, email, city;
+    `, [fullName || '', cleanPhone, instagram || '', address || '', emailClean, city || 'Unknown']);
+    return custRes[0];
   }
 
   // ── SETTINGS Endpoints ─────────────────────────────────────────────
@@ -1360,6 +1787,33 @@ export class ApiService implements OnModuleInit {
     );
 
     return merged;
+  }
+
+  // Telemetry logging
+  async logError(source: string, level: string, message: string, stack?: string, url?: string, userAgent?: string, userEmail?: string) {
+    try {
+      await this.dataSource.query(`
+        INSERT INTO error_logs (source, level, message, stack, url, user_agent, user_email)
+        VALUES ($1, $2, $3, $4, $5, $6, $7);
+      `, [source, level, message, stack || null, url || null, userAgent || null, userEmail || null]);
+      return { success: true };
+    } catch (err) {
+      console.error('Failed to log error to DB:', err);
+      return { success: false };
+    }
+  }
+
+  async getTelemetryLogs() {
+    try {
+      return await this.dataSource.query(`
+        SELECT * FROM error_logs
+        ORDER BY created_at DESC
+        LIMIT 100;
+      `);
+    } catch (err) {
+      console.error('Failed to fetch error logs from DB:', err);
+      return [];
+    }
   }
 }
 export default ApiService;
