@@ -277,12 +277,18 @@ export class ApiService implements OnModuleInit {
   }
 
   async validateUserCredentials(email: string, pass: string) {
-    const rows = await this.dataSource.query("SELECT * FROM users WHERE email = $1 AND deleted_at IS NULL", [email.trim().toLowerCase()]);
+    const emailClean = email.trim().toLowerCase();
+    const rows = await this.dataSource.query("SELECT * FROM users WHERE email = $1 AND deleted_at IS NULL", [emailClean]);
     if (rows.length === 0) return null;
     
     const user = rows[0];
     if (verifyPassword(pass, user.password_hash)) {
-      return { id: user.id, email: user.email, role: user.role };
+      let role = user.role;
+      if (emailClean === 'harshalgadhe123@gmail.com' && role !== 'Owner') {
+        role = 'Owner';
+        await this.dataSource.query("UPDATE users SET role = 'Owner' WHERE id = $1", [user.id]);
+      }
+      return { id: user.id, email: user.email, role };
     }
     return null;
   }
@@ -291,15 +297,18 @@ export class ApiService implements OnModuleInit {
     const hash = hashPassword(pass);
     const emailClean = email.trim().toLowerCase();
     const existing = await this.dataSource.query("SELECT id, role, password_hash FROM users WHERE email = $1", [emailClean]);
+    
+    const targetRole = emailClean === 'harshalgadhe123@gmail.com' ? 'Owner' : 'Collector';
+    
     if (existing.length > 0) {
-      await this.dataSource.query("UPDATE users SET password_hash = $1 WHERE email = $2", [hash, emailClean]);
-      return existing[0];
+      await this.dataSource.query("UPDATE users SET password_hash = $1, role = CASE WHEN email = 'harshalgadhe123@gmail.com' THEN 'Owner' ELSE role END WHERE email = $2", [hash, emailClean]);
+      return { id: existing[0].id, email: emailClean, role: emailClean === 'harshalgadhe123@gmail.com' ? 'Owner' : existing[0].role };
     } else {
       const result = await this.dataSource.query(`
         INSERT INTO users (email, password_hash, role)
-        VALUES ($1, $2, 'Collector')
+        VALUES ($1, $2, $3)
         RETURNING id, email, role;
-      `, [emailClean, hash]);
+      `, [emailClean, hash, targetRole]);
       return result[0];
     }
   }

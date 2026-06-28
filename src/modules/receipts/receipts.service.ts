@@ -5,6 +5,7 @@ export interface CreateReceiptItemDto {
   description: string;
   qty: number;
   amount: number;
+  productId?: string;
 }
 
 export interface CreateReceiptDto {
@@ -34,9 +35,10 @@ export class ReceiptsService implements OnModuleInit {
         ADD COLUMN IF NOT EXISTS customer_name VARCHAR(255),
         ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(50),
         ADD COLUMN IF NOT EXISTS customer_instagram VARCHAR(100),
-        ADD COLUMN IF NOT EXISTS customer_address TEXT;
+        ADD COLUMN IF NOT EXISTS customer_address TEXT,
+        ADD COLUMN IF NOT EXISTS order_id UUID REFERENCES orders(id) ON DELETE SET NULL;
       `);
-      console.log('✔ [Receipts] Fallback customer columns checked/added successfully.');
+      console.log('✔ [Receipts] Fallback customer columns and order_id checked/added successfully.');
       
       // Ensure receipt_generation_jobs exists
       await this.dataSource.query(`
@@ -82,33 +84,96 @@ export class ReceiptsService implements OnModuleInit {
       const advance = Number(dto.advancePaid || 0);
       const balance = Math.max(0, finalTotal - advance);
 
-      // 2. Resolve/seed dummy customer if necessary
-      let targetCustomerId = dto.customerId;
-      if (targetCustomerId === 'dummy' || !targetCustomerId) {
-        const dummyRes = await queryRunner.query(`
-          SELECT id FROM customers WHERE phone = '0000000000' LIMIT 1;
-        `);
-        if (dummyRes && dummyRes.length > 0) {
-          targetCustomerId = dummyRes[0].id;
-        } else {
-          const insertDummy = await queryRunner.query(`
-            INSERT INTO customers (full_name, phone, instagram, address)
-            VALUES ('Instagram / Walk-in Customer', '0000000000', 'instagram_buyer', 'Instagram Store')
-            RETURNING id;
-          `);
-          targetCustomerId = insertDummy[0].id;
+      // 2. Resolve/seed Guest Customer and Guest User
+      const phoneVal = (dto.customerPhone || '').trim() || '0000000000';
+      const emailClean = (dto.customerPhone 
+        ? `${dto.customerPhone.trim()}@guest.garagekings.in` 
+        : `guest_${Date.now()}_${Math.floor(Math.random() * 1000)}@guest.garagekings.in`
+      ).toLowerCase();
+
+      const custRes = await queryRunner.query(`
+        INSERT INTO customers (full_name, phone, instagram, address, email, city)
+        VALUES ($1, $2, $3, $4, $5, 'Unknown')
+        ON CONFLICT (phone) DO UPDATE 
+        SET full_name = EXCLUDED.full_name, instagram = EXCLUDED.instagram, address = EXCLUDED.address, email = COALESCE(customers.email, EXCLUDED.email)
+        RETURNING id;
+      `, [dto.customerName || 'Guest Customer', phoneVal, dto.customerInstagram || '', dto.customerAddress || '', emailClean]);
+      const customerId = custRes[0].id;
+
+      const userRes = await queryRunner.query(`
+        INSERT INTO users (email, cognito_sub)
+        VALUES ($1, $2)
+        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+        RETURNING id;
+      `, [emailClean, `guest_${customerId}`]);
+      const userId = userRes[0].id;
+
+      // 3. Create parent Pending/Confirmed order record
+      const orderStatus = dto.formatType === 'pre_order' ? 'Pre-Order' : 'Confirmed';
+      const orderRes = await queryRunner.query(`
+        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        RETURNING id;
+      `, [userId, finalTotal, `${dto.customerAddress || ''} | Insta: ${dto.customerInstagram || ''} | Phone: ${dto.customerPhone || ''}`, orderStatus, dto.formatType || 'standard', advance, balance]);
+      const orderId = orderRes[0].id;
+
+      // 4. Process line items: check stock, insert order_items, decrement inventory
+      for (const item of dto.items) {
+        if (!item.productId) {
+          throw new Error(`Product ID is required for item: ${item.description}`);
         }
+
+        // Insert e-commerce order item
+        await queryRunner.query(`
+          INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
+          VALUES ($1, $2, $3, $4);
+        `, [orderId, item.productId, parseInt(item.qty.toString(), 10), Number(item.amount)]);
+
+        // Row-level lock and verify product stock
+        const prodRows = await queryRunner.query(`
+          SELECT id, model_name as name, total_stock, sold_stock, locked_stock
+          FROM products 
+          WHERE id = $1 AND deleted_at IS NULL 
+          FOR UPDATE;
+        `, [item.productId]);
+
+        if (prodRows.length === 0) {
+          throw new Error(`Casting with product ID "${item.productId}" does not exist or has been de-listed.`);
+        }
+
+        const p = prodRows[0];
+        const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+        if (available < Number(item.qty)) {
+          throw new Error(`Casting "${p.name}" is sold out. Available: ${available}, requested: ${item.qty}.`);
+        }
+
+        // Increment sold_stock in products table
+        await queryRunner.query(`
+          UPDATE products 
+          SET sold_stock = sold_stock + $1,
+              updated_at = NOW() 
+          WHERE id = $2;
+        `, [Number(item.qty), item.productId]);
+
+        // Update quantity_available in inventory table to match sold deduction
+        await queryRunner.query(`
+          UPDATE inventory 
+          SET quantity_available = quantity_available - $1,
+              updated_at = NOW()
+          WHERE product_id = $2;
+        `, [Number(item.qty), item.productId]);
       }
 
-      // 3. Insert receipt row metadata
+      // 5. Insert receipt row metadata linked to order_id
       const receiptInsertQuery = `
-        INSERT INTO receipts (receipt_number, customer_id, format_type, tax_percent, tax_amount, shipping_charges, total_amount, advance_paid, pending_balance, footer_note, customer_name, customer_phone, customer_instagram, customer_address)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        INSERT INTO receipts (receipt_number, customer_id, order_id, format_type, tax_percent, tax_amount, shipping_charges, total_amount, advance_paid, pending_balance, footer_note, customer_name, customer_phone, customer_instagram, customer_address)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING id, created_at;
       `;
       const receiptRes = await queryRunner.query(receiptInsertQuery, [
         dto.receiptNumber.trim(),
-        targetCustomerId,
+        customerId,
+        orderId,
         dto.formatType || 'standard',
         Number(dto.taxPercent || 0),
         taxVal,
@@ -125,7 +190,7 @@ export class ReceiptsService implements OnModuleInit {
 
       const receiptId = receiptRes[0].id;
 
-      // 3. Normalize and insert separate child items
+      // 6. Normalize and insert separate child items
       const itemInsertQuery = `
         INSERT INTO receipt_items (receipt_id, description, qty, amount)
         VALUES ($1, $2, $3, $4);
@@ -137,47 +202,23 @@ export class ReceiptsService implements OnModuleInit {
           parseInt(item.qty.toString(), 10),
           Number(item.amount)
         ]);
-
-        // 4. Row-level Lock & Inventory stock adjustments
-        // CRITICAL Best Practice: Locking rows in index order prevents deadlocks
-        const selectInventoryLock = `
-          SELECT quantity_available, quantity_reserved 
-          FROM inventory 
-          WHERE product_id = (SELECT id FROM products WHERE model_name = $1 LIMIT 1)
-          FOR UPDATE;
-        `;
-        const inventoryRes = await queryRunner.query(selectInventoryLock, [item.description.trim()]);
-        
-        if (inventoryRes.rows && inventoryRes.rows.length > 0) {
-          const inv = inventoryRes.rows[0];
-          if (inv.quantity_available < item.qty) {
-            throw new Error(`Insufficient inventory quantity available for: ${item.description}`);
-          }
-          
-          const updateStockQuery = `
-            UPDATE inventory 
-            SET quantity_available = quantity_available - $1, updated_at = NOW()
-            WHERE product_id = (SELECT id FROM products WHERE model_name = $2 LIMIT 1);
-          `;
-          await queryRunner.query(updateStockQuery, [item.qty, item.description.trim()]);
-        }
       }
 
-      // 5. Initialize active status in receipt_generation_jobs table
+      // 7. Initialize active status in receipt_generation_jobs table
       const jobInsertQuery = `
         INSERT INTO receipt_generation_jobs (receipt_id, status)
         VALUES ($1, 'Pending');
       `;
       await queryRunner.query(jobInsertQuery, [receiptId]);
 
-      // 6. Record security audit trail
+      // 8. Record security audit trail
       const auditLogQuery = `
         INSERT INTO audit_logs (action, entity, entity_id, after_state)
         VALUES ('RECEIPT_GENERATED', 'receipts', $1, $2);
       `;
       await queryRunner.query(auditLogQuery, [
         receiptId,
-        JSON.stringify({ receiptNumber: dto.receiptNumber, totalAmount: finalTotal })
+        JSON.stringify({ receiptNumber: dto.receiptNumber, totalAmount: finalTotal, orderId })
       ]);
 
       // COMMIT TRANSACTION
@@ -189,10 +230,11 @@ export class ReceiptsService implements OnModuleInit {
         receiptNumber: dto.receiptNumber,
         totalAmount: finalTotal,
         pendingBalance: balance,
-        createdAt: receiptRes[0].created_at
+        createdAt: receiptRes[0].created_at,
+        orderId
       };
 
-    } catch (error) {
+    } catch (error: any) {
       // ROLLBACK SQL TRANSACTION ON ERROR TO KEEP DB IMMUTABLE
       await queryRunner.rollbackTransaction();
       console.error('TypeORM QueryRunner Rolled Back:', error);

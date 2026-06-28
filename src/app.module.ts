@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_GUARD, APP_FILTER } from '@nestjs/core';
 import { databaseConfig } from './config/database.config.js';
 import { ReceiptsModule } from './modules/receipts/receipts.module.js';
 import { ApiModule } from './modules/api/api.module.js';
 import { JwtStrategy } from './auth/jwt.strategy.js';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 
 @Module({
   imports: [
@@ -30,6 +31,11 @@ import { JwtStrategy } from './auth/jwt.strategy.js';
     {
       provide: APP_GUARD,
       useClass: ThrottlerGuard
+    },
+    // Bind AllExceptionsFilter globally to handle all uncaught errors
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter
     }
   ]
 })

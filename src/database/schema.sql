@@ -8,7 +8,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Custom Types
 CREATE TYPE inventory_tx_type AS ENUM ('Added', 'Edited', 'Reserved', 'Sold', 'Returned', 'Cancelled', 'Deleted');
-CREATE TYPE order_status AS ENUM ('Pending', 'Paid', 'Shipped', 'Delivered', 'Cancelled');
+CREATE TYPE order_status AS ENUM ('Pending', 'Paid', 'Shipped', 'Delivered', 'Cancelled', 'Confirmed', 'Reserved', 'Verification Pending');
 CREATE TYPE listing_status AS ENUM ('Active', 'Sold', 'Delisted');
 CREATE TYPE offer_status AS ENUM ('Pending', 'Accepted', 'Declined', 'Withdrawn');
 CREATE TYPE auction_status AS ENUM ('Upcoming', 'Active', 'Completed', 'Cancelled');
@@ -160,6 +160,15 @@ CREATE TABLE orders (
     total_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_order_total CHECK (total_price >= 0),
     shipping_address TEXT NOT NULL,
     tracking_number VARCHAR(100),
+    screenshot_url TEXT,
+    reservation_expires_at TIMESTAMP WITH TIME ZONE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    idempotency_key VARCHAR(255) UNIQUE,
+    courier_partner VARCHAR(100),
+    shipping_cost NUMERIC(12, 2) DEFAULT 0.00,
+    packaging_cost NUMERIC(12, 2) DEFAULT 0.00,
+    dispatch_date TIMESTAMP WITH TIME ZONE,
+    delivery_date TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

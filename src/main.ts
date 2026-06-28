@@ -1,7 +1,16 @@
+import * as Sentry from '@sentry/nestjs';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module.js';
 import { configure as serverlessExpress } from '@vendia/serverless-express';
 import { Handler, Context, Callback } from 'aws-lambda';
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    tracesSampleRate: 1.0,
+  });
+  console.log('✔ Sentry initialized on backend.');
+}
 
 let server: any;
 

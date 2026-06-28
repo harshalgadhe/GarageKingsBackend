@@ -13,4 +13,4 @@ lambda-package/
 response*.json
 test-payload.json
 *.tar.gz
-
+storage/
