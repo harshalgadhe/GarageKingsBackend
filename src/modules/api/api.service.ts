@@ -980,7 +980,17 @@ export class ApiService implements OnModuleInit {
   }
 
   // ── UPI SCREENSHOT UPLOAD SECURE STRATEGY ──────────────────────────
-  async saveScreenshotReceipt(orderId: string, fileBuffer: Buffer, fileExtension: string, ipAddress: string) {
+  async saveScreenshotReceipt(orderId: string, fileBuffer: Buffer, fileExtension: string, userId: string, ipAddress: string) {
+    const orderRows = await this.dataSource.query(
+      "SELECT id, user_id, status FROM orders WHERE id = $1 AND deleted_at IS NULL",
+      [orderId]
+    );
+    if (orderRows.length === 0) throw new BadRequestException('Order not found.');
+    const order = orderRows[0];
+    if (order.user_id !== userId) {
+      throw new UnauthorizedException('You do not have permission to upload screenshot for this order.');
+    }
+
     const fileName = `${crypto.randomUUID()}.${fileExtension}`;
     
     if (process.env.S3_ASSETS_BUCKET) {

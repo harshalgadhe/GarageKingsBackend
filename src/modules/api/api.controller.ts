@@ -421,8 +421,8 @@ export class ApiController {
     return this.apiService.adminUpdateOrderStatus(id, dto, req.user.email, req.ip);
   }
 
-  // ── SECURE RECEIPTS & SCREENSHOTS STREAMING ───────────────────────
   @Post('orders/:id/screenshot')
+  @UseGuards(AuthGuard('jwt'))
   @UseInterceptors(FileInterceptor('file'))
   async uploadScreenshot(
     @Param('id') orderId: string,
@@ -437,7 +437,7 @@ export class ApiController {
       throw new BadRequestException('Invalid file signature. Only JPG, PNG, and WebP images are allowed.');
     }
     const extension = signature.mime.split('/').pop() || 'webp';
-    return this.apiService.saveScreenshotReceipt(orderId, file.buffer, extension, req.ip);
+    return this.apiService.saveScreenshotReceipt(orderId, file.buffer, extension, req.user.userId, req.ip);
   }
 
   @Post('orders/:id/submit-remaining-payment')
