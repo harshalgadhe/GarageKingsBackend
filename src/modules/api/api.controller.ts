@@ -347,48 +347,16 @@ export class ApiController {
     return this.apiService.softDeleteProduct(id, req.user.email, req.ip);
   }
 
+  @UseGuards(AuthGuard('jwt'))
   @Post('products/reserve')
   async reserveProduct(@Body() dto: any, @Request() req: any) {
-    // Attempt to extract authenticated user ID from JWT cookie/header (optional — guest checkout also allowed)
-    let authenticatedUserId: string | undefined;
-    try {
-      const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
-      let token: string | null = null;
-      if (req.headers.cookie) {
-        const cookies = parseCookies(req.headers.cookie);
-        token = cookies['gk_access_token'] || null;
-      }
-      if (!token && req.headers.authorization?.startsWith('Bearer ')) {
-        token = req.headers.authorization.slice(7);
-      }
-      if (token) {
-        const payload: any = verifyJwt(token, secret);
-        if (payload?.userId) authenticatedUserId = payload.userId;
-      }
-    } catch { /* ignore — guest checkout proceeds without auth */ }
-    return this.apiService.reserveProduct(dto, req.ip, authenticatedUserId);
+    return this.apiService.reserveProduct(dto, req.ip, req.user.userId);
   }
 
+  @UseGuards(AuthGuard('jwt'))
   @Post('products/reserve-cart')
   async reserveProductsCart(@Body() dto: any, @Request() req: any) {
-    // Attempt to extract authenticated user ID from JWT cookie/header (optional — guest checkout also allowed)
-    let authenticatedUserId: string | undefined;
-    try {
-      const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
-      let token: string | null = null;
-      if (req.headers.cookie) {
-        const cookies = parseCookies(req.headers.cookie);
-        token = cookies['gk_access_token'] || null;
-      }
-      if (!token && req.headers.authorization?.startsWith('Bearer ')) {
-        token = req.headers.authorization.slice(7);
-      }
-      if (token) {
-        const payload: any = verifyJwt(token, secret);
-        if (payload?.userId) authenticatedUserId = payload.userId;
-      }
-    } catch { /* ignore — guest checkout proceeds without auth */ }
-    return this.apiService.reserveProductsCart(dto, req.ip, authenticatedUserId);
+    return this.apiService.reserveProductsCart(dto, req.ip, req.user.userId);
   }
 
   // ── SETTINGS REST ENDPOINTS ─────────────────────────────────────────
