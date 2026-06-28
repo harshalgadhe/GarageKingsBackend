@@ -94,8 +94,8 @@ export class ReceiptsService implements OnModuleInit {
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
-        ON CONFLICT (phone) DO UPDATE 
-        SET full_name = EXCLUDED.full_name, instagram = EXCLUDED.instagram, address = EXCLUDED.address, email = COALESCE(customers.email, EXCLUDED.email)
+        ON CONFLICT (email) DO UPDATE 
+        SET full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, instagram = EXCLUDED.instagram, address = EXCLUDED.address
         RETURNING id;
       `, [dto.customerName || 'Guest Customer', phoneVal, dto.customerInstagram || '', dto.customerAddress || '', emailClean]);
       const customerId = custRes[0].id;
