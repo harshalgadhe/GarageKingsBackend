@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Delete, Param, Body, UseGuards, Request } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Param, Body, UseGuards, Request, Query } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ReceiptsService, CreateReceiptDto } from './receipts.service.js';
 
@@ -21,9 +21,18 @@ export class ReceiptsController {
 
   @Get()
   @UseGuards(AuthGuard('jwt'))
-  async getReceipts(@Request() req: any) {
+  async getReceipts(
+    @Query('page') page: number,
+    @Query('limit') limit: number,
+    @Query('search') search: string,
+    @Request() req: any
+  ) {
+    if (page || limit || search) {
+      return this.receiptsService.getPaginatedReceipts({ page, limit, search });
+    }
     return this.receiptsService.getReceipts();
   }
+
 
   @Delete(':id')
   @UseGuards(AuthGuard('jwt'))

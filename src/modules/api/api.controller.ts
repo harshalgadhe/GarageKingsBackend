@@ -321,10 +321,19 @@ export class ApiController {
 
   @Get('admin/products')
   @UseGuards(AuthGuard('jwt'))
-  async getAdminProducts(@Request() req: any) {
+  async getAdminProducts(
+    @Query('page') page: number,
+    @Query('limit') limit: number,
+    @Query('search') search: string,
+    @Request() req: any
+  ) {
     this.checkAdmin(req);
+    if (page || limit || search) {
+      return this.apiService.getPaginatedProducts({ page, limit, search, adminMode: true });
+    }
     return this.apiService.getProducts(true);
   }
+
 
   @Post('products')
   @UseGuards(AuthGuard('jwt'))
@@ -399,13 +408,22 @@ export class ApiController {
     return this.apiService.updateCustomerProfile(req.user.email, dto);
   }
 
-  // ── ADMIN ORDERS PIPELINE ──────────────────────────────────────────
   @Get('admin/orders')
   @UseGuards(AuthGuard('jwt'))
-  async getAdminOrders(@Request() req: any) {
+  async getAdminOrders(
+    @Query('page') page: number,
+    @Query('limit') limit: number,
+    @Query('search') search: string,
+    @Query('status') status: string,
+    @Request() req: any
+  ) {
     this.checkAdmin(req);
+    if (page || limit || search || status) {
+      return this.apiService.getPaginatedAdminOrders({ page, limit, search, status });
+    }
     return this.apiService.getAdminOrders();
   }
+
 
   @Patch('admin/orders/:id')
   @UseGuards(AuthGuard('jwt'))
@@ -536,10 +554,19 @@ export class ApiController {
   // ── EXPENSES MODULE ───────────────────────────────────────────────
   @Get('admin/expenses')
   @UseGuards(AuthGuard('jwt'))
-  async getExpenses(@Request() req: any) {
+  async getExpenses(
+    @Query('page') page: number,
+    @Query('limit') limit: number,
+    @Query('search') search: string,
+    @Request() req: any
+  ) {
     this.checkAdmin(req);
+    if (page || limit || search) {
+      return this.apiService.getPaginatedExpenses({ page, limit, search });
+    }
     return this.apiService.getExpenses();
   }
+
 
   @Post('admin/expenses')
   @UseGuards(AuthGuard('jwt'))
@@ -632,18 +659,6 @@ export class ApiController {
     this.checkAdmin(req);
     return this.apiService.updateHomepageSectionVisibility(dto.sectionName, dto.isVisible);
   }
-
-  // ── TELEMETRY & ERROR LOGGING ───────────────────────────────────────
-  @Post('telemetry/log')
-  async logTelemetry(@Body() dto: { source: string; level?: string; message: string; stack?: string; url?: string; userAgent?: string; userEmail?: string }) {
-    return this.apiService.logError(dto.source, dto.level || 'error', dto.message, dto.stack, dto.url, dto.userAgent, dto.userEmail);
-  }
-
-  @Get('admin/telemetry/logs')
-  @UseGuards(AuthGuard('jwt'))
-  async getTelemetryLogs(@Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.getTelemetryLogs();
-  }
 }
 export default ApiController;
+

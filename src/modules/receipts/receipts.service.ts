@@ -272,6 +272,67 @@ export class ReceiptsService implements OnModuleInit {
     }
   }
 
+  async getPaginatedReceipts(options: { page?: number; limit?: number; search?: string }) {
+    try {
+      const page = Math.max(1, Number(options.page || 1));
+      const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
+      const offset = (page - 1) * limit;
+
+      let queryStr = `
+        FROM receipts r
+        JOIN customers c ON r.customer_id = c.id
+        WHERE 1=1
+      `;
+
+      const params: any[] = [];
+      let paramIndex = 1;
+
+      if (options.search) {
+        queryStr += ` AND (
+          LOWER(r.receipt_number) LIKE LOWER($${paramIndex}) OR
+          LOWER(c.full_name) LIKE LOWER($${paramIndex}) OR
+          LOWER(c.phone) LIKE LOWER($${paramIndex})
+        )`;
+        params.push(`%${options.search}%`);
+        paramIndex++;
+      }
+
+      const countQuery = `SELECT COUNT(r.id)::int as total ${queryStr}`;
+      const countRes = await this.dataSource.query(countQuery, params);
+      const total = countRes[0]?.total || 0;
+
+      const selectQuery = `
+        SELECT r.*, 
+               COALESCE(r.customer_name, c.full_name) as customer_name, 
+               COALESCE(r.customer_phone, c.phone) as customer_phone, 
+               COALESCE(r.customer_address, c.address) as customer_address,
+               COALESCE(r.customer_instagram, c.instagram) as customer_instagram
+        ${queryStr}
+        ORDER BY r.created_at DESC
+        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+      `;
+      const rows = await this.dataSource.query(selectQuery, [...params, limit, offset]);
+
+      for (const r of rows) {
+        r.items = await this.dataSource.query(`
+          SELECT * FROM receipt_items WHERE receipt_id = $1;
+        `, [r.id]);
+      }
+
+      return {
+        receipts: rows,
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit)
+      };
+    } catch (error: any) {
+      console.error('getPaginatedReceipts failed:', error);
+      throw new InternalServerErrorException(error.message || 'Failed to retrieve receipts.');
+    }
+  }
+
+
   async deleteReceipt(id: string) {
     try {
       await this.dataSource.query(`

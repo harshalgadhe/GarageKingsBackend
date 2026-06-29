@@ -28,7 +28,7 @@ async function executePdfGenerationWorker() {
   try {
     // 1. Fetch oldest Pending or Processing job that has not exceeded max retries
     const fetchJobQuery = `
-      SELECT j.id as job_id, j.receipt_id, j.retry_count, j.max_retries, r.receipt_number, r.total_amount, r.pdf_url
+      SELECT j.id as job_id, j.receipt_id, j.retry_count, j.max_retries, j.correlation_id, r.receipt_number, r.total_amount, r.pdf_url
       FROM receipt_generation_jobs j
       JOIN receipts r ON j.receipt_id = r.id
       WHERE j.status = 'Pending' AND j.retry_count < j.max_retries
@@ -44,7 +44,7 @@ async function executePdfGenerationWorker() {
     }
 
     const job = jobRes.rows[0];
-    const { job_id, receipt_id, retry_count, max_retries, receipt_number, total_amount, pdf_url } = job;
+    const { job_id, receipt_id, retry_count, max_retries, correlation_id, receipt_number, total_amount, pdf_url } = job;
     console.log(`Processing Job ID: ${job_id} | Receipt: ${receipt_number} (Retry: ${retry_count}/${max_retries})`);
 
     // 2. IDEMPOTENCY PROTECTION
@@ -100,12 +100,13 @@ async function executePdfGenerationWorker() {
 
       // Record audit log
       await client.query(
-        `INSERT INTO audit_logs (action, entity, entity_id, after_state)
-         VALUES ('RECEIPT_PDF_GENERATED', 'receipts', $1, $2);`,
-        [receipt_id, JSON.stringify({ pdfUrl: generatedPdfUrl, receiptNumber: receipt_number })]
+        `INSERT INTO audit_logs (action, entity, entity_id, after_state, correlation_id, category)
+         VALUES ('RECEIPT_PDF_GENERATED', 'receipts', $1, $2, $3, 'Invoices');`,
+        [receipt_id, JSON.stringify({ pdfUrl: generatedPdfUrl, receiptNumber: receipt_number }), correlation_id]
       );
 
       await client.query('COMMIT');
+
       console.log(`✔ Job Completed Successfully! Receipt PDF URL: ${generatedPdfUrl}`);
 
     } catch (dbErr) {

@@ -372,6 +372,7 @@ export class ApiService implements OnModuleInit {
     search?: string;
     inStock?: boolean;
     preBooking?: boolean;
+    adminMode?: boolean;
   }) {
     const page = Math.max(1, Number(options.page || 1));
     const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
@@ -390,8 +391,13 @@ export class ApiService implements OnModuleInit {
              pi.thumbnail_url as image, p.created_at
       FROM products p
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
-      WHERE p.deleted_at IS NULL AND p.status = 'Published'
+      WHERE p.deleted_at IS NULL
     `;
+
+    if (!options.adminMode) {
+      queryStr += ` AND p.status = 'Published'`;
+    }
+
 
     const params: any[] = [];
     let paramIndex = 1;
@@ -1206,6 +1212,88 @@ export class ApiService implements OnModuleInit {
     `);
   }
 
+  async getPaginatedAdminOrders(options: { page?: number; limit?: number; search?: string; status?: string }) {
+    const page = Math.max(1, Number(options.page || 1));
+    const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
+    const offset = (page - 1) * limit;
+
+    let queryStr = `
+      FROM orders o
+      JOIN users u ON u.id = o.user_id
+      LEFT JOIN customers c ON c.email = u.email
+      WHERE o.deleted_at IS NULL
+    `;
+
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (options.status && options.status !== 'All') {
+      queryStr += ` AND o.status = $${paramIndex}`;
+      params.push(options.status);
+      paramIndex++;
+    }
+
+    if (options.search) {
+      queryStr += ` AND (
+        LOWER(c.full_name) LIKE LOWER($${paramIndex}) OR
+        LOWER(c.phone) LIKE LOWER($${paramIndex}) OR
+        LOWER(u.email) LIKE LOWER($${paramIndex}) OR
+        CAST(o.id AS TEXT) LIKE $${paramIndex}
+      )`;
+      params.push(`%${options.search}%`);
+      paramIndex++;
+    }
+
+    const countQuery = `SELECT COUNT(DISTINCT o.id)::int as total ${queryStr}`;
+    const countRes = await this.dataSource.query(countQuery, params);
+    const total = countRes[0]?.total || 0;
+
+    const idsQuery = `SELECT o.id ${queryStr} GROUP BY o.id, o.created_at ORDER BY o.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    const idsParams = [...params, limit, offset];
+    const idsRes = await this.dataSource.query(idsQuery, idsParams);
+    
+    if (idsRes.length === 0) {
+      return { orders: [], total, page, limit, totalPages: 0 };
+    }
+
+    const orderIds = idsRes.map(row => row.id);
+
+    const ordersWithItems = await this.dataSource.query(`
+      SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress", o.tracking_number as "trackingNumber", o.created_at as "createdAt",
+             o.screenshot_url as "screenshotUrl", o.courier_partner as "courierPartner", o.shipping_cost as "shippingCost",
+             o.packaging_cost as "packagingCost", o.dispatch_date as "dispatchDate", o.delivery_date as "deliveryDate",
+             COALESCE(o.booking_type, 'standard') as "bookingType",
+             COALESCE(o.advance_amount, 0) as "advanceAmount",
+             COALESCE(o.remaining_amount, 0) as "remainingAmount",
+             o.advance_screenshot_url as "advanceScreenshotUrl",
+             u.email as "customerEmail", c.instagram as "instagramUsername", c.full_name as "customerName",
+             c.phone as "customerPhone", c.address as "customerAddress",
+             p.model_name as "productName", p.brand as "productBrand", oi.price_at_purchase as "priceAtPurchase", oi.qty
+      FROM orders o
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN products p ON p.id = oi.product_id
+      JOIN users u ON u.id = o.user_id
+      LEFT JOIN customers c ON c.email = u.email
+      WHERE o.id = ANY($1)
+      ORDER BY o.created_at DESC;
+    `, [orderIds]);
+
+    const pendingRes = await this.dataSource.query(`
+      SELECT COUNT(id)::int as count FROM orders WHERE status = 'Verification Pending' AND deleted_at IS NULL
+    `);
+    const pendingCount = pendingRes[0]?.count || 0;
+
+    return {
+      orders: ordersWithItems,
+      total,
+      pendingCount,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    };
+  }
+
+
   async getCustomerOrders(email: string) {
     return this.dataSource.query(`
       SELECT o.id, o.status, o.total_price as "totalPrice", o.shipping_address as "shippingAddress",
@@ -1610,6 +1698,51 @@ export class ApiService implements OnModuleInit {
       ORDER BY date DESC;
     `);
   }
+
+  async getPaginatedExpenses(options: { page?: number; limit?: number; search?: string }) {
+    const page = Math.max(1, Number(options.page || 1));
+    const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
+    const offset = (page - 1) * limit;
+
+    let queryStr = `
+      FROM expenses
+      WHERE deleted_at IS NULL
+    `;
+
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (options.search) {
+      queryStr += ` AND (
+        LOWER(title) LIKE LOWER($${paramIndex}) OR
+        LOWER(category) LIKE LOWER($${paramIndex}) OR
+        LOWER(notes) LIKE LOWER($${paramIndex})
+      )`;
+      params.push(`%${options.search}%`);
+      paramIndex++;
+    }
+
+    const countQuery = `SELECT COUNT(id)::int as total ${queryStr}`;
+    const countRes = await this.dataSource.query(countQuery, params);
+    const total = countRes[0]?.total || 0;
+
+    const selectQuery = `
+      SELECT id, title, amount, category, paid_by as "paidBy", date, notes, created_at
+      ${queryStr}
+      ORDER BY date DESC
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    const rows = await this.dataSource.query(selectQuery, [...params, limit, offset]);
+
+    return {
+      expenses: rows,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit)
+    };
+  }
+
 
   async addExpense(exp: any, adminEmail: string, ipAddress: string) {
     const result = await this.dataSource.query(`
