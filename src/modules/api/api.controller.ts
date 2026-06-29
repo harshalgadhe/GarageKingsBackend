@@ -35,6 +35,40 @@ export class ApiController {
   }
 
   // ── LOCAL AUTH COOKIE-BASED SESSION ENDPOINTS ───────────────────────
+  @Post('auth/signup')
+  async signup(@Body() dto: any, @Res({ passthrough: true }) res: ExpressResponse) {
+    const { email, password, fullName } = dto;
+    if (!email || !password) {
+      throw new BadRequestException('Email and password are required.');
+    }
+    const user = await this.apiService.registerUser(email, password, fullName);
+    if (!user) {
+      throw new BadRequestException('User registration failed.');
+    }
+
+    const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 15 * 60); // 15 mins
+    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 7 * 24 * 60 * 60); // 7 days
+
+    await this.apiService.updateRefreshToken(user.id, refreshToken);
+
+    res.cookie('gk_access_token', accessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 15 * 60 * 1000
+    });
+
+    res.cookie('gk_refresh_token', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    return { success: true, user: { id: user.id, email: user.email, role: user.role } };
+  }
+
   @Post('auth/login')
   async login(@Body() dto: any, @Res({ passthrough: true }) res: ExpressResponse) {
     const { email, password } = dto;
@@ -170,7 +204,7 @@ export class ApiController {
   }
 
   @Post('auth/google-login')
-  async googleLogin(@Body() dto: { idToken: string }) {
+  async googleLogin(@Body() dto: { idToken: string }, @Res({ passthrough: true }) res: ExpressResponse) {
     const { idToken } = dto;
     if (!idToken) {
       throw new UnauthorizedException('Google OAuth identity token is required.');
@@ -187,8 +221,6 @@ export class ApiController {
         cleanEmail = idToken.trim();
       } else {
         // 1. Verify Google Token via tokeninfo endpoint (supports both ID Token and Access Token)
-        // A JWT (Google ID Token) always contains exactly 3 parts separated by dots.
-        // A Google Access Token (typically starting with 'ya29.') has only 1 dot (2 parts).
         const isJwt = idToken.split('.').length === 3;
         const verifyUrl = isJwt
           ? `https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`
@@ -226,59 +258,40 @@ export class ApiController {
         googleGivenName = payload.given_name || '';
       }
       
-      // 2. Generate a secure, user-specific Cognito password
+      // 2. Generate a secure, user-specific database password
       const jwtSecret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
       const securePassword = crypto.createHmac('sha256', jwtSecret)
         .update(cleanEmail)
-        .digest('hex') + 'aA1!'; // Append characters to guarantee Cognito password strength policies
+        .digest('hex') + 'aA1!'; 
 
-      const userPoolId = process.env.COGNITO_USER_POOL_ID || 'ap-south-1_YaTasZ9v0';
-
-      // 3. Create user in Cognito if they do not exist
-      try {
-        console.log(`[GoogleLogin] Admin creating user if new: ${cleanEmail}`);
-        const userAttributes: any[] = [
-          { Name: 'email', Value: cleanEmail },
-          { Name: 'email_verified', Value: 'true' }
-        ];
-        if (googleName) {
-          userAttributes.push({ Name: 'name', Value: googleName });
-        }
-        if (googleGivenName) {
-          userAttributes.push({ Name: 'given_name', Value: googleGivenName });
-        }
-
-        await cognitoClient.send(new AdminCreateUserCommand({
-          UserPoolId: userPoolId,
-          Username: cleanEmail,
-          UserAttributes: userAttributes,
-          MessageAction: 'SUPPRESS'
-        }));
-        console.log(`[GoogleLogin] Admin successfully created user: ${cleanEmail}`);
-      } catch (createError: any) {
-        console.log(`[GoogleLogin] User already exists in Cognito or creation skipped: ${createError.message}`);
-      }
-
-      // 4. Update/Sync the password securely
-      console.log(`[GoogleLogin] Syncing password for user: ${cleanEmail}`);
-      await cognitoClient.send(new AdminSetUserPasswordCommand({
-        UserPoolId: userPoolId,
-        Username: cleanEmail,
-        Password: securePassword,
-        Permanent: true
-      }));
-
-      console.log(`[GoogleLogin] Federated Google account sync completed successfully for ${cleanEmail}`);
-      
-      // 5. Sync the Google user in local PostgreSQL database
+      // 3. Sync the Google user in local PostgreSQL database
       console.log(`[GoogleLogin] Syncing user to local PostgreSQL: ${cleanEmail}`);
-      await this.apiService.syncGoogleUser(cleanEmail, securePassword);
+      const user = await this.apiService.syncGoogleUser(cleanEmail, securePassword);
+
+      // 4. Issue local cookie tokens
+      const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 15 * 60); // 15 mins
+      const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 7 * 24 * 60 * 60); // 7 days
+
+      await this.apiService.updateRefreshToken(user.id, refreshToken);
+
+      res.cookie('gk_access_token', accessToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 15 * 60 * 1000
+      });
+
+      res.cookie('gk_refresh_token', refreshToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+      });
 
       return { 
         success: true, 
         message: 'Google federated login synced successfully',
-        email: cleanEmail,
-        temporaryPassword: securePassword
+        user: { id: user.id, email: user.email, role: user.role }
       };
     } catch (error: any) {
       console.error(`[GoogleLogin] Failed to sync Google login:`, error);

@@ -111,10 +111,10 @@ resource "aws_security_group" "db_sg" {
   description = "Access to private PostgreSQL RDS"
   vpc_id      = aws_vpc.gk_vpc.id
 
-  # Ingress allowed from all IP addresses to support Lambda outside VPC & local migrations
+  # Ingress allowed from all IP addresses to support Lambda outside VPC & local migrations (port shifted to non-standard)
   ingress {
-    from_port   = 5432
-    to_port     = 5432
+    from_port   = 25432
+    to_port     = 25432
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -138,8 +138,9 @@ resource "aws_db_instance" "postgres" {
   db_subnet_group_name   = aws_db_subnet_group.db_subnet.name
   vpc_security_group_ids = [aws_security_group.db_sg.id]
   username               = "gk_admin"
-  password               = "gk_secure_prod_2026_password"
+  password               = "GkProdDbSec_981a8dc71f"
   db_name                = "garagekings_prod"
+  port                   = 25432
   skip_final_snapshot    = true
   publicly_accessible    = true # Enabled for Zero-Cost VPC Routing (Lambda outside VPC)
   

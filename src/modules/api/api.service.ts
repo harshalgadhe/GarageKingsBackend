@@ -276,6 +276,22 @@ export class ApiService implements OnModuleInit {
     return result[0];
   }
 
+  async registerUser(email: string, pass: string, fullName?: string) {
+    const emailClean = email.trim().toLowerCase();
+    const existing = await this.dataSource.query("SELECT id FROM users WHERE email = $1", [emailClean]);
+    if (existing.length > 0) {
+      throw new BadRequestException('Email address already registered.');
+    }
+    const hash = hashPassword(pass);
+    const targetRole = emailClean === 'harshalgadhe123@gmail.com' ? 'Owner' : 'Collector';
+    const result = await this.dataSource.query(`
+      INSERT INTO users (email, password_hash, role)
+      VALUES ($1, $2, $3)
+      RETURNING id, email, role;
+    `, [emailClean, hash, targetRole]);
+    return result[0];
+  }
+
   async validateUserCredentials(email: string, pass: string) {
     const emailClean = email.trim().toLowerCase();
     const rows = await this.dataSource.query("SELECT * FROM users WHERE email = $1 AND deleted_at IS NULL", [emailClean]);
