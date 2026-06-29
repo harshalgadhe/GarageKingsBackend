@@ -1,0 +1,45 @@
+name: Deploy Backend to AWS Lambda
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Build, Package, and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Build Application
+        run: npm run build
+
+      - name: Create Lambda Package (Zip)
+        run: node pack-lambda.mjs
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Upload Zip to S3 Staging
+        run: |
+          aws s3 cp lambda-deploy.zip s3://gk-production-public-assets-2026/lambda-deploy.zip --region ap-south-1
+
+      - name: Update Lambda Function Code
+        run: |
+          aws lambda update-function-code --function-name gk-production-api-prod --s3-bucket gk-production-public-assets-2026 --s3-key lambda-deploy.zip --region ap-south-1
