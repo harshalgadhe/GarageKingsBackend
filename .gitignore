@@ -3,7 +3,6 @@ dist/
 gk_payload.zip
 lambda-deploy.zip
 *.zip
-pack-lambda.*
 .env
 .terraform/
 *.tfstate
