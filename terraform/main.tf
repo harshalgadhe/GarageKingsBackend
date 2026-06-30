@@ -246,7 +246,7 @@ resource "aws_lambda_function" "api_monolith" {
 
 resource "aws_lambda_function_url" "api_furl" {
   function_name      = aws_lambda_function.api_monolith.function_name
-  authorization_type = "AWS_IAM"
+  authorization_type = "NONE"
 
   cors {
     allow_origins     = ["*"]
@@ -276,7 +276,6 @@ resource "aws_cloudfront_distribution" "cdn" {
   origin {
     domain_name              = split("/", replace(aws_lambda_function_url.api_furl.function_url, "https://", ""))[0]
     origin_id                = "Lambda-FURL"
-    origin_access_control_id = aws_cloudfront_origin_access_control.lambda_oac.id
     custom_origin_config {
       http_port              = 80
       https_port             = 443
