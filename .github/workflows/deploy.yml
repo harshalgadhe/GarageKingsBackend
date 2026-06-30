@@ -42,4 +42,4 @@ jobs:
 
       - name: Update Lambda Function Code
         run: |
-          aws lambda update-function-code --function-name gk-production-api-monolith --s3-bucket gk-production-public-assets-2026 --s3-key lambda-deploy.zip --region ap-south-1
+          aws lambda update-function-code --function-name gk-production-api-prod --s3-bucket gk-production-public-assets-2026 --s3-key lambda-deploy.zip --region ap-south-1

@@ -212,7 +212,7 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
 
 # Lambda Function URL (Always Free routing!)
 resource "aws_lambda_function" "api_monolith" {
-  function_name = "gk-${var.environment}-api-monolith"
+  function_name = "gk-${var.environment}-api-prod"
   role          = aws_iam_role.lambda_role.arn
   handler       = "dist/main.handler"
   runtime       = "nodejs20.x"
@@ -234,9 +234,10 @@ resource "aws_lambda_function" "api_monolith" {
   environment {
     variables = {
       NODE_ENV              = "production"
-      DATABASE_URL          = "postgresql://gk_admin:gk_secure_prod_2026_password@${aws_db_instance.postgres.endpoint}/garagekings_prod"
+      DATABASE_URL          = "postgresql://gk_admin:GkProdDbSec_981a8dc71f@${aws_db_instance.postgres.endpoint}/garagekings_prod"
       COGNITO_USER_POOL_ID  = aws_cognito_user_pool.user_pool.id
       COGNITO_CLIENT_ID     = aws_cognito_user_pool_client.client.id
+      GOOGLE_CLIENT_ID      = "231477217878-0g2nq0e6fmvqt802gdu8esm1uucfmjvv.apps.googleusercontent.com"
       S3_ASSETS_BUCKET      = aws_s3_bucket.assets_bucket.id
       DATABASE_SSL          = "true"
     }
