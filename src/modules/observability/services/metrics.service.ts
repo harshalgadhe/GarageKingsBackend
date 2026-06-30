@@ -1,9 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
+import { AlertService } from './alert.service.js';
 
 @Injectable()
 export class MetricsService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly alertService: AlertService
+  ) {}
 
   async recordMetric(metric: {
     metricType: string;
@@ -30,6 +34,13 @@ export class MetricsService {
         metric.userId || null,
         metric.metadata ? JSON.stringify(metric.metadata) : null
       ]);
+
+      // Trigger alert checks in background when api_latency metrics are logged
+      if (metric.metricType === 'api_latency') {
+        this.alertService.checkAlerts().catch((err: any) => {
+          console.error('Failed to run alert checks after metric recording:', err.message);
+        });
+      }
     } catch (e: any) {
       console.error('Failed to log performance metric:', e.message);
     }

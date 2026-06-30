@@ -1,10 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import * as crypto from 'crypto';
+import { AlertService } from './alert.service.js';
 
 @Injectable()
 export class TelemetryService {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly alertService: AlertService
+  ) {}
 
   async logError(errorData: {
     errorType: 'Frontend' | 'Backend';
@@ -81,7 +85,9 @@ export class TelemetryService {
       ]);
 
       // Check alert conditions after logging error
-      // (This will be called dynamically via AlertService)
+      this.alertService.checkAlerts().catch((err: any) => {
+        console.error('Failed to run alert checks after error logging:', err.message);
+      });
     } catch (e: any) {
       // Direct console log as fallback to avoid recursion
       console.error('Failed to log telemetry error:', e.message);

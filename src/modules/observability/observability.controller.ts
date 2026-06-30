@@ -109,7 +109,13 @@ export class ObservabilityController {
   @UseGuards(AuthGuard('jwt'))
   async saveSettings(@Body() body: any, @Request() req: any) {
     this.checkAdmin(req);
-    return this.alertService.saveObservabilitySettings(body);
+    const result = await this.alertService.saveObservabilitySettings(body);
+    
+    // Trigger cleanup and alerts check immediately in the background
+    this.alertService.runRetentionCleanup().catch((e: any) => console.error('Failed to run retention cleanup:', e.message));
+    this.alertService.checkAlerts().catch((e: any) => console.error('Failed to check alerts:', e.message));
+    
+    return result;
   }
 }
 export default ObservabilityController;
