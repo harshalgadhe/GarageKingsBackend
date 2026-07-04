@@ -618,22 +618,25 @@ export class ApiService implements OnModuleInit {
       const hasBatches = batchCountRes[0].count > 0;
 
       if (hasBatches) {
-        // Only update static metadata, keeping prices and stock untouched
+        // Update product attributes including prices and metadata
         await queryRunner.query(`
           UPDATE products 
-          SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, description = $6, tags = $7,
-              category = $8, status = $9, show_on_homepage = $10, updated_by = $11, 
-              max_qty_per_customer = $12, is_prebook = $13, prebook_deposit_amount = $14, availability_state = $15, updated_at = NOW()
-          WHERE id = $16;
+          SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
+              category = $9, purchase_price = $10, selling_price = $11, status = $12, show_on_homepage = $13, updated_by = $14, 
+              max_qty_per_customer = $15, is_prebook = $16, prebook_deposit_amount = $17, availability_state = $18, updated_at = NOW()
+          WHERE id = $19;
         `, [
           car.brand || oldData.brand,
           car.name || oldData.model_name,
           car.series !== undefined ? car.series : oldData.series,
           car.scale || oldData.scale,
           car.lane || oldData.rarity_level,
+          Number(car.price || oldData.base_price),
           car.description !== undefined ? car.description : oldData.description,
           car.tags || oldData.tags,
           car.category || oldData.category,
+          Number(car.purchasePrice || oldData.purchase_price),
+          Number(car.price || oldData.selling_price),
           car.status || oldData.status,
           car.showOnHomepage !== false,
           updaterEmail,
@@ -643,6 +646,59 @@ export class ApiService implements OnModuleInit {
           car.availabilityState || oldData.availability_state || 'Available',
           id
         ]);
+        
+        // Handle stock level changes dynamically via ledger/batches
+        const newStock = car.totalStock !== undefined ? Number(car.totalStock) : Number(oldData.total_stock);
+        const diff = newStock - Number(oldData.total_stock);
+        if (diff !== 0) {
+          const latestBatchRes = await queryRunner.query(`
+            SELECT * FROM inventory_batches 
+            WHERE product_id = $1 
+            ORDER BY received_at DESC, id DESC 
+            LIMIT 1;
+          `, [id]);
+          
+          if (latestBatchRes.length > 0) {
+            const batch = latestBatchRes[0];
+            const batchId = batch.id;
+            const type = diff > 0 ? 'ADJUST_ADD' : 'ADJUST_REMOVE';
+            const absDiff = Math.abs(diff);
+            
+            let newAvail = Number(batch.quantity_available);
+            if (type === 'ADJUST_ADD') {
+              newAvail += absDiff;
+            } else {
+              newAvail = Math.max(0, newAvail - absDiff);
+            }
+            
+            await queryRunner.query(`
+              UPDATE inventory_batches
+              SET quantity_available = $1,
+                  status = CASE WHEN $1 = 0 AND quantity_reserved = 0 THEN 'Fully Consumed'::VARCHAR ELSE status END,
+                  updated_at = NOW()
+              WHERE id = $2;
+            `, [newAvail, batchId]);
+            
+            await queryRunner.query(`
+              INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+            `, [id, batchId, type, diff, Number(batch.purchase_price), Number(batch.selling_price), `Product edit stock adjustment from ${oldData.total_stock} to ${newStock}`, updaterEmail]);
+            
+            await queryRunner.query(`
+              UPDATE products
+              SET total_stock = total_stock + $1,
+                  updated_at = NOW()
+              WHERE id = $2;
+            `, [diff, id]);
+
+            await queryRunner.query(`
+              UPDATE inventory
+              SET quantity_available = quantity_available + $1,
+                  updated_at = NOW()
+              WHERE product_id = $2;
+            `, [diff, id]);
+          }
+        }
       } else {
         // No batches exist yet: allow updating everything, and create default batch if totalStock changes
         await queryRunner.query(`
