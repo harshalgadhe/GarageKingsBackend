@@ -108,8 +108,8 @@ CREATE TABLE IF NOT EXISTS product_images (
 );
 CREATE INDEX IF NOT EXISTS idx_product_images_parent ON product_images(product_id);
 
--- 5. Distributors Table
-CREATE TABLE IF NOT EXISTS distributors (
+-- 5. Suppliers Table (formerly Distributors)
+CREATE TABLE IF NOT EXISTS suppliers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) UNIQUE NOT NULL,
     contact_email VARCHAR(255),
@@ -119,21 +119,94 @@ CREATE TABLE IF NOT EXISTS distributors (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- 5.2 Purchase Orders Table
+-- 5.2 Purchase Orders Table (Legacy support)
 CREATE TABLE IF NOT EXISTS purchase_orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     po_number VARCHAR(100) UNIQUE NOT NULL,
-    distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE RESTRICT,
+    supplier_id UUID REFERENCES suppliers(id) ON DELETE RESTRICT,
     status VARCHAR(50) NOT NULL DEFAULT 'Draft',
     notes TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- 5.3 Inventory Batches Table
+-- 5.3 Supplier Purchases Table
+CREATE TABLE IF NOT EXISTS supplier_purchases (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_id UUID NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+    purchase_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    expected_arrival_date DATE,
+    status VARCHAR(50) NOT NULL DEFAULT 'Draft', -- 'Draft', 'Awaiting Advance', 'Booked', 'In Transit', 'Partially Received', 'Fully Received', 'Completed', 'Cancelled'
+    total_value NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.4 Supplier Purchase Items Table
+CREATE TABLE IF NOT EXISTS supplier_purchase_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.5 Supplier Payments Table (Immutable Payment History)
+CREATE TABLE IF NOT EXISTS supplier_payments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+    amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+    payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    cash_account_id UUID NOT NULL REFERENCES cash_accounts(id) ON DELETE RESTRICT,
+    payment_method VARCHAR(50) NOT NULL, -- 'Bank Transfer', 'UPI', 'Cash'
+    reference_number VARCHAR(255),
+    notes TEXT,
+    created_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.6 Supplier Purchase Receipts Table (Immutable Receiving Log)
+CREATE TABLE IF NOT EXISTS supplier_purchase_receipts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE RESTRICT,
+    receipt_number VARCHAR(100) UNIQUE NOT NULL, -- e.g., 'PR-2026-0001'
+    received_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    received_by VARCHAR(255) NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.7 Supplier Purchase Receipt Items Table
+CREATE TABLE IF NOT EXISTS supplier_purchase_receipt_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    purchase_receipt_id UUID NOT NULL REFERENCES supplier_purchase_receipts(id) ON DELETE CASCADE,
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    quantity_received INT NOT NULL CHECK (quantity_received >= 0),
+    quantity_short INT NOT NULL DEFAULT 0 CHECK (quantity_short >= 0),
+    quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
+    quantity_over INT NOT NULL DEFAULT 0 CHECK (quantity_over >= 0),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.8 Supplier Purchase Attachments Table
+CREATE TABLE IF NOT EXISTS supplier_purchase_attachments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_purchase_id UUID REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+    purchase_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE CASCADE,
+    file_name VARCHAR(255) NOT NULL,
+    file_path VARCHAR(512) NOT NULL,
+    uploaded_by VARCHAR(255) NOT NULL,
+    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.9 Inventory Batches Table (Enhanced)
 CREATE TABLE IF NOT EXISTS inventory_batches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-    distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL,
+    supplier_id UUID REFERENCES suppliers(id) ON DELETE SET NULL,
+    supplier_purchase_id UUID REFERENCES supplier_purchases(id) ON DELETE SET NULL,
+    purchase_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE SET NULL,
     purchase_order_id UUID REFERENCES purchase_orders(id) ON DELETE SET NULL,
     sku VARCHAR(100) NOT NULL,
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,

@@ -75,6 +75,10 @@ export function validateFileSignature(buffer: Buffer): { isValid: boolean; mime:
   if (hex.startsWith('52494646') && hex.slice(16, 24) === '57454250') {
     return { isValid: true, mime: 'image/webp' };
   }
+  // PDF check: 25504446 (%PDF)
+  if (hex.startsWith('25504446')) {
+    return { isValid: true, mime: 'application/pdf' };
+  }
   
   return { isValid: false, mime: '' };
 }

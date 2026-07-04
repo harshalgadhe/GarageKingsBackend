@@ -600,14 +600,14 @@ export class ApiController {
   @UseGuards(AuthGuard('jwt'))
   async createDistributor(@Body() body: any, @Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.createDistributor(body, req.user.email, req.ip);
+    return this.apiService.createSupplier(body, req.user.email, req.ip);
   }
 
   @Get('admin/distributors')
   @UseGuards(AuthGuard('jwt'))
   async getDistributors(@Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.getDistributors();
+    return this.apiService.getSuppliers();
   }
 
   @Post('admin/inventory/batches')
@@ -779,6 +779,119 @@ export class ApiController {
   async updateHomepageSectionVisibility(@Body() dto: { sectionName: string; isVisible: boolean }, @Request() req: any) {
     this.checkAdmin(req);
     return this.apiService.updateHomepageSectionVisibility(dto.sectionName, dto.isVisible);
+  }
+
+  // ── SUPPLIERS AND PURCHASES ───────────────────────────────────────
+  @Get('admin/suppliers')
+  @UseGuards(AuthGuard('jwt'))
+  async getSuppliers(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getSuppliers();
+  }
+
+  @Post('admin/suppliers')
+  @UseGuards(AuthGuard('jwt'))
+  async createSupplier(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.createSupplier(dto, req.user.email, req.ip);
+  }
+
+  @Get('admin/supplier-purchases')
+  @UseGuards(AuthGuard('jwt'))
+  async getSupplierPurchases(
+    @Query('page') page: string,
+    @Query('limit') limit: string,
+    @Query('search') search = "",
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    const p = page ? parseInt(page, 10) : 1;
+    const l = limit ? parseInt(limit, 10) : 10;
+    return this.apiService.getSupplierPurchases(p, l, search);
+  }
+
+  @Get('admin/supplier-purchases/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async getSupplierPurchaseDetails(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getSupplierPurchaseDetails(id);
+  }
+
+  @Post('admin/supplier-purchases')
+  @UseGuards(AuthGuard('jwt'))
+  async addSupplierPurchase(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.addSupplierPurchase(dto, req.user.email, req.ip);
+  }
+
+  @Post('admin/supplier-purchases/:id/pay')
+  @UseGuards(AuthGuard('jwt'))
+  async recordSupplierPayment(@Param('id') id: string, @Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.recordSupplierPayment(id, dto, req.user.email, req.ip);
+  }
+
+  @Post('admin/supplier-purchases/:id/receive')
+  @UseGuards(AuthGuard('jwt'))
+  async receiveSupplierShipment(@Param('id') id: string, @Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.receiveSupplierShipment(id, dto, req.user.email, req.ip);
+  }
+
+  @Patch('admin/supplier-purchases/:id/status')
+  @UseGuards(AuthGuard('jwt'))
+  async updateSupplierPurchaseStatus(
+    @Param('id') id: string,
+    @Body() dto: { status: string },
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    return this.apiService.updateSupplierPurchaseStatus(id, dto.status, req.user.email, req.ip);
+  }
+
+  @Get('admin/dashboard/supplier-metrics')
+  @UseGuards(AuthGuard('jwt'))
+  async getSupplierMetrics(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getSupplierMetrics();
+  }
+
+  @Post('admin/supplier-purchases/:id/attachments')
+  @UseGuards(AuthGuard('jwt'))
+  @UseInterceptors(FileInterceptor('file'))
+  async addSupplierAttachment(
+    @Param('id') purchaseId: string,
+    @UploadedFile() file: any,
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    if (!file) {
+      throw new BadRequestException('No attachment file provided.');
+    }
+    const signature = validateFileSignature(file.buffer);
+    if (!signature.isValid) {
+      throw new BadRequestException('Invalid file signature. Only JPG, PNG, WebP, and PDF files are allowed.');
+    }
+    const extension = signature.mime.split('/').pop() || 'pdf';
+    return this.apiService.addSupplierPurchaseAttachment(purchaseId, file.buffer, file.originalname, extension, req.user.email);
+  }
+
+  @Get('admin/supplier-attachments/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async getSupplierAttachment(
+    @Param('id') attachmentId: string,
+    @Request() req: any,
+    @Res() res: ExpressResponse
+  ) {
+    this.checkAdmin(req);
+    const result = await this.apiService.getSupplierAttachmentStream(attachmentId);
+    if (!result) {
+      throw new NotFoundException('Attachment not found.');
+    }
+    const mime = result.filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/jpeg';
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition', `inline; filename="${result.filename}"`);
+    result.stream.pipe(res);
   }
 }
 export default ApiController;

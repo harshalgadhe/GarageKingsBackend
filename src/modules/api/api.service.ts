@@ -199,6 +199,111 @@ export class ApiService implements OnModuleInit {
     `);
 
     await this.dataSource.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'distributors') AND NOT EXISTS (SELECT 1 FROM pg_tables WHERE tablename = 'suppliers') THEN
+          ALTER TABLE distributors RENAME TO suppliers;
+        END IF;
+      END$$;
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS suppliers (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          name VARCHAR(255) UNIQUE NOT NULL,
+          contact_email VARCHAR(255),
+          contact_phone VARCHAR(50),
+          address TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS supplier_purchases (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          supplier_id UUID NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+          purchase_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          expected_arrival_date DATE,
+          status VARCHAR(50) NOT NULL DEFAULT 'Draft',
+          total_value NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+          notes TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS supplier_purchase_items (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+          product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+          quantity INT NOT NULL CHECK (quantity > 0),
+          purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS supplier_payments (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+          amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+          payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          cash_account_id UUID NOT NULL REFERENCES cash_accounts(id) ON DELETE RESTRICT,
+          payment_method VARCHAR(50) NOT NULL,
+          reference_number VARCHAR(255),
+          notes TEXT,
+          created_by VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS supplier_purchase_receipts (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE RESTRICT,
+          receipt_number VARCHAR(100) UNIQUE NOT NULL,
+          received_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          received_by VARCHAR(255) NOT NULL,
+          notes TEXT,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS supplier_purchase_receipt_items (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          purchase_receipt_id UUID NOT NULL REFERENCES supplier_purchase_receipts(id) ON DELETE CASCADE,
+          product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+          quantity_received INT NOT NULL CHECK (quantity_received >= 0),
+          quantity_short INT NOT NULL DEFAULT 0 CHECK (quantity_short >= 0),
+          quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
+          quantity_over INT NOT NULL DEFAULT 0 CHECK (quantity_over >= 0),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS supplier_purchase_attachments (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          supplier_purchase_id UUID REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+          purchase_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE CASCADE,
+          file_name VARCHAR(255) NOT NULL,
+          file_path VARCHAR(512) NOT NULL,
+          uploaded_by VARCHAR(255) NOT NULL,
+          uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.dataSource.query(`
+      -- Alter inventory_batches to add supplier_purchase_id and purchase_receipt_id
+      ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS supplier_id UUID REFERENCES suppliers(id) ON DELETE SET NULL;
+      ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS supplier_purchase_id UUID REFERENCES supplier_purchases(id) ON DELETE SET NULL;
+      ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS purchase_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE SET NULL;
+    `);
+
+    await this.dataSource.query(`
       CREATE TABLE IF NOT EXISTS error_logs (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         source VARCHAR(50) NOT NULL,
@@ -2960,31 +3065,31 @@ export class ApiService implements OnModuleInit {
   }
 
   // ── INVENTORY BATCH & LEDGER SYSTEM SERVICES ──────────────────────
-  async createDistributor(body: any, adminEmail: string, ipAddress: string) {
+  async createSupplier(body: any, adminEmail: string, ipAddress: string) {
     const name = (body.name || '').trim();
-    if (!name) throw new Error('Distributor name is required');
+    if (!name) throw new Error('Supplier name is required');
     
     await this.dataSource.query(`
-      INSERT INTO distributors (name, contact_email, contact_phone, address)
+      INSERT INTO suppliers (name, contact_email, contact_phone, address)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (name) DO NOTHING;
     `, [name, body.contactEmail || null, body.contactPhone || null, body.address || null]);
     
-    const dist = await this.dataSource.query("SELECT * FROM distributors WHERE name = $1;", [name]);
+    const dist = await this.dataSource.query("SELECT * FROM suppliers WHERE name = $1;", [name]);
     
-    await this.writeAuditLog('CREATE_DISTRIBUTOR', 'distributors', dist[0].id, adminEmail, ipAddress, null, dist[0]);
+    await this.writeAuditLog('CREATE_SUPPLIER', 'suppliers', dist[0].id, adminEmail, ipAddress, null, dist[0]);
     return dist[0];
   }
 
-  async getDistributors() {
-    return this.dataSource.query("SELECT * FROM distributors ORDER BY name ASC;");
+  async getSuppliers() {
+    return this.dataSource.query("SELECT * FROM suppliers ORDER BY name ASC;");
   }
 
   async getProductBatches(productId: string) {
     return this.dataSource.query(`
       SELECT b.*, d.name as "distributorName"
       FROM inventory_batches b
-      LEFT JOIN distributors d ON d.id = b.distributor_id
+      LEFT JOIN suppliers d ON d.id = b.supplier_id
       WHERE b.product_id = $1
       ORDER BY b.received_at DESC;
     `, [productId]);
@@ -2993,23 +3098,38 @@ export class ApiService implements OnModuleInit {
   async receiveInventoryBatchTx(
     queryRunner: any,
     productId: string,
-    distributorName: string,
+    distributorName: string, // Can be supplier name or supplier UUID
     purchasePrice: number,
     sellingPrice: number,
     quantity: number,
     creatorEmail: string,
     ipAddress: string,
-    fundedBy?: string
+    fundedBy?: string,
+    supplierPurchaseId?: string,
+    purchaseReceiptId?: string
   ) {
-    // Resolve/seed distributor
-    const distName = (distributorName || 'Default Supplier').trim();
+    // Resolve/seed supplier
     let distId = null;
-    const distRes = await queryRunner.query("SELECT id FROM distributors WHERE name = $1", [distName]);
-    if (distRes.length > 0) {
-      distId = distRes[0].id;
+    let distName = 'Default Supplier';
+
+    const uuidRegex = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+    if (uuidRegex.test(distributorName)) {
+      const distRes = await queryRunner.query("SELECT id, name FROM suppliers WHERE id = $1", [distributorName]);
+      if (distRes.length > 0) {
+        distId = distRes[0].id;
+        distName = distRes[0].name;
+      }
     } else {
-      const newDist = await queryRunner.query("INSERT INTO distributors (name) VALUES ($1) RETURNING id;", [distName]);
-      distId = newDist[0].id;
+      const distNameClean = (distributorName || 'Default Supplier').trim();
+      const distRes = await queryRunner.query("SELECT id FROM suppliers WHERE name = $1", [distNameClean]);
+      if (distRes.length > 0) {
+        distId = distRes[0].id;
+        distName = distNameClean;
+      } else {
+        const newDist = await queryRunner.query("INSERT INTO suppliers (name) VALUES ($1) RETURNING id;", [distNameClean]);
+        distId = newDist[0].id;
+        distName = distNameClean;
+      }
     }
 
     // Get product SKU
@@ -3018,45 +3138,47 @@ export class ApiService implements OnModuleInit {
 
     // Insert batch
     const batchRes = await queryRunner.query(`
-      INSERT INTO inventory_batches (product_id, distributor_id, sku, purchase_price, selling_price, quantity_received, quantity_available)
-      VALUES ($1, $2, $3, $4, $5, $6, $6)
+      INSERT INTO inventory_batches (product_id, supplier_id, supplier_purchase_id, purchase_receipt_id, sku, purchase_price, selling_price, quantity_received, quantity_available)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
       RETURNING id;
-    `, [productId, distId, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity)]);
+    `, [productId, distId, supplierPurchaseId || null, purchaseReceiptId || null, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity)]);
     const batchId = batchRes[0].id;
 
-    // Record Inventory Purchase Cash Ledger entry
-    const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE type = 'Bank' AND is_active = true LIMIT 1;");
-    const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
-    const totalCost = Number(quantity) * Number(purchasePrice);
+    // Record Inventory Purchase Cash Ledger entry (Skip if it's from a Supplier Purchase since payments are tracked separately)
+    if (!supplierPurchaseId) {
+      const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE type = 'Bank' AND is_active = true LIMIT 1;");
+      const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
+      const totalCost = Number(quantity) * Number(purchasePrice);
 
-    if (cashAccountId && totalCost > 0) {
-      await queryRunner.query(`
-        INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
-        VALUES ($1, $2, 'Inventory Purchase', 'Completed', 'Inventory Batch', $3, $4, $5, NOW(), $6);
-      `, [
-        cashAccountId,
-        -totalCost,
-        batchId,
-        `Inventory purchase: ${quantity} units of SKU ${sku}`,
-        `Received from supplier ${distName}`,
-        creatorEmail || 'System'
-      ]);
-
-      const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
-      const fundSrc = (fundedBy || '').trim();
-      if (founders.includes(fundSrc)) {
+      if (cashAccountId && totalCost > 0) {
         await queryRunner.query(`
-          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
-          VALUES ($1, $2, 'Founder Contribution', 'Completed', 'Founder Ledger', 'Contribution', $3, $4, $5, NOW(), $6);
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, 'Inventory Purchase', 'Completed', 'Inventory Batch', $3, $4, $5, NOW(), $6);
         `, [
           cashAccountId,
-          totalCost,
+          -totalCost,
           batchId,
-          `Founder Personal Purchase for batch: ${sku}`,
-          `Founder ${fundSrc} paid personally for this batch`,
-          fundSrc,
+          `Inventory purchase: ${quantity} units of SKU ${sku}`,
+          `Received from supplier ${distName}`,
           creatorEmail || 'System'
         ]);
+
+        const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
+        const fundSrc = (fundedBy || '').trim();
+        if (founders.includes(fundSrc)) {
+          await queryRunner.query(`
+            INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
+            VALUES ($1, $2, 'Founder Contribution', 'Completed', 'Founder Ledger', 'Contribution', $3, $4, $5, NOW(), $6);
+          `, [
+            cashAccountId,
+            totalCost,
+            batchId,
+            `Founder Personal Purchase for batch: ${sku}`,
+            `Founder ${fundSrc} paid personally for this batch`,
+            fundSrc,
+            creatorEmail || 'System'
+          ]);
+        }
       }
     }
 
@@ -3361,6 +3483,589 @@ export class ApiService implements OnModuleInit {
     } catch (err: any) {
       console.error("[Inventory Reconciliation] Error executing check:", err);
       return { success: false, error: err.message };
+    }
+  }
+
+  async getSupplierPurchases(page = 1, limit = 10, search = "") {
+    const offset = (page - 1) * limit;
+    const searchParam = `%${search}%`;
+
+    const countRes = await this.dataSource.query(`
+      SELECT COUNT(*)::int as count 
+      FROM supplier_purchases sp
+      JOIN suppliers s ON s.id = sp.supplier_id
+      WHERE s.name ILIKE $1 OR sp.notes ILIKE $1;
+    `, [searchParam]);
+    const total = countRes[0]?.count || 0;
+
+    const purchases = await this.dataSource.query(`
+      SELECT sp.id, sp.purchase_date as "purchaseDate", sp.expected_arrival_date as "expectedArrivalDate",
+             sp.status, sp.total_value as "totalValue", sp.notes, sp.created_at as "createdAt",
+             s.name as "supplierName",
+             COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0)::float as "advancePaid",
+             (sp.total_value - COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0))::float as "remainingBalance",
+             CASE 
+               WHEN sp.status = 'Cancelled' AND EXISTS (SELECT 1 FROM cash_ledger WHERE type = 'Supplier Refund' AND source_type = 'Order' AND source_id = sp.id::varchar) THEN 'Refunded'::varchar
+               WHEN COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0) >= sp.total_value THEN 'Fully Paid'::varchar
+               WHEN COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0) > 0 THEN 'Partially Paid'::varchar
+               ELSE 'Unpaid'::varchar
+             END as "paymentStatus"
+      FROM supplier_purchases sp
+      JOIN suppliers s ON s.id = sp.supplier_id
+      WHERE s.name ILIKE $1 OR sp.notes ILIKE $1
+      ORDER BY sp.purchase_date DESC, sp.created_at DESC
+      LIMIT $2 OFFSET $3;
+    `, [searchParam, limit, offset]);
+
+    return {
+      purchases,
+      total,
+      totalPages: Math.ceil(total / limit)
+    };
+  }
+
+  async getSupplierPurchaseDetails(id: string) {
+    const purchaseRes = await this.dataSource.query(`
+      SELECT sp.id, sp.purchase_date as "purchaseDate", sp.expected_arrival_date as "expectedArrivalDate",
+             sp.status, sp.total_value as "totalValue", sp.notes, sp.created_at as "createdAt",
+             s.name as "supplierName", s.id as "supplierId",
+             COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0)::float as "advancePaid",
+             (sp.total_value - COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0))::float as "remainingBalance",
+             CASE 
+               WHEN sp.status = 'Cancelled' AND EXISTS (SELECT 1 FROM cash_ledger WHERE type = 'Supplier Refund' AND source_type = 'Order' AND source_id = sp.id::varchar) THEN 'Refunded'::varchar
+               WHEN COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0) >= sp.total_value THEN 'Fully Paid'::varchar
+               WHEN COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0) > 0 THEN 'Partially Paid'::varchar
+               ELSE 'Unpaid'::varchar
+             END as "paymentStatus"
+      FROM supplier_purchases sp
+      JOIN suppliers s ON s.id = sp.supplier_id
+      WHERE sp.id = $1;
+    `, [id]);
+    if (purchaseRes.length === 0) throw new BadRequestException('Supplier Purchase not found');
+    const purchase = purchaseRes[0];
+
+    const items = await this.dataSource.query(`
+      SELECT spi.id, spi.product_id as "productId", spi.quantity, spi.purchase_price as "purchasePrice",
+             p.model_name as "name", p.brand, p.scale, p.sku,
+             COALESCE((
+               SELECT SUM(spri.quantity_received)::int 
+               FROM supplier_purchase_receipt_items spri
+               JOIN supplier_purchase_receipts spr ON spr.id = spri.purchase_receipt_id
+               WHERE spr.supplier_purchase_id = spi.supplier_purchase_id AND spri.product_id = spi.product_id
+             ), 0) as "receivedQuantity"
+      FROM supplier_purchase_items spi
+      JOIN products p ON p.id = spi.product_id
+      WHERE spi.supplier_purchase_id = $1;
+    `, [id]);
+
+    const payments = await this.dataSource.query(`
+      SELECT sp.id, sp.amount, sp.payment_date as "paymentDate", sp.payment_method as "paymentMethod",
+             sp.reference_number as "referenceNumber", sp.notes, sp.created_by as "createdBy", sp.created_at as "createdAt",
+             ca.name as "cashAccountName"
+      FROM supplier_payments sp
+      JOIN cash_accounts ca ON ca.id = sp.cash_account_id
+      WHERE sp.supplier_purchase_id = $1 
+      ORDER BY sp.payment_date DESC, sp.created_at DESC;
+    `, [id]);
+
+    const receipts = await this.dataSource.query(`
+      SELECT spr.id, spr.receipt_number as "receiptNumber", spr.received_date as "receivedDate", 
+             spr.received_by as "receivedBy", spr.notes, spr.created_at as "createdAt",
+             COALESCE((SELECT SUM(quantity_received) FROM supplier_purchase_receipt_items WHERE purchase_receipt_id = spr.id), 0)::int as "totalReceived"
+      FROM supplier_purchase_receipts spr
+      WHERE spr.supplier_purchase_id = $1
+      ORDER BY spr.received_date DESC, spr.created_at DESC;
+    `, [id]);
+
+    const attachments = await this.dataSource.query(`
+      SELECT * FROM supplier_purchase_attachments WHERE supplier_purchase_id = $1 ORDER BY uploaded_at DESC;
+    `, [id]);
+
+    return {
+      ...purchase,
+      items,
+      payments,
+      receipts,
+      attachments
+    };
+  }
+
+  async addSupplierPurchase(dto: any, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      let totalValue = 0;
+      for (const item of dto.items) {
+        totalValue += Number(item.quantity) * Number(item.purchasePrice);
+      }
+
+      const purchaseRes = await queryRunner.query(`
+        INSERT INTO supplier_purchases (supplier_id, purchase_date, expected_arrival_date, status, total_value, notes)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *;
+      `, [
+        dto.supplierId, 
+        dto.purchaseDate || new Date().toISOString().split('T')[0], 
+        dto.expectedArrivalDate || null,
+        Number(dto.advancePaid || 0) > 0 ? 'Awaiting Advance' : 'Draft', 
+        totalValue, 
+        dto.notes || null
+      ]);
+      const purchase = purchaseRes[0];
+
+      for (const item of dto.items) {
+        await queryRunner.query(`
+          INSERT INTO supplier_purchase_items (supplier_purchase_id, product_id, quantity, purchase_price)
+          VALUES ($1, $2, $3, $4);
+        `, [purchase.id, item.productId, Number(item.quantity), Number(item.purchasePrice)]);
+      }
+
+      if (Number(dto.advancePaid || 0) > 0) {
+        if (!dto.cashAccountId) throw new Error("cashAccountId is required for advance payment");
+
+        await queryRunner.query(`
+          INSERT INTO supplier_payments (supplier_purchase_id, amount, payment_date, cash_account_id, payment_method, reference_number, notes, created_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+        `, [
+          purchase.id, 
+          Number(dto.advancePaid), 
+          dto.purchaseDate || new Date().toISOString().split('T')[0], 
+          dto.cashAccountId, 
+          dto.paymentMethod || 'Bank Transfer', 
+          dto.referenceNumber || null, 
+          'Initial Booking Advance', 
+          adminEmail
+        ]);
+
+        const accounts = await queryRunner.query("SELECT name FROM cash_accounts WHERE id = $1;", [dto.cashAccountId]);
+        const accountName = accounts[0]?.name || 'Unknown Account';
+
+        await queryRunner.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reference_number, reason, date, created_by)
+          VALUES ($1, $2, 'Inventory Purchase', 'Completed', 'Order', $3, $4, $5, $6, $7);
+        `, [
+          dto.cashAccountId, 
+          -Number(dto.advancePaid), 
+          purchase.id.toString(), 
+          dto.referenceNumber || null, 
+          `Supplier Booking Advance via ${accountName}`, 
+          dto.purchaseDate || new Date().toISOString().split('T')[0], 
+          adminEmail
+        ]);
+
+        await queryRunner.query(`
+          UPDATE supplier_purchases SET status = 'Booked' WHERE id = $1;
+        `, [purchase.id]);
+        
+        purchase.status = 'Booked';
+      }
+
+      await queryRunner.commitTransaction();
+
+      await this.writeAuditLog(
+        'CREATE_SUPPLIER_PURCHASE',
+        'supplier_purchases',
+        purchase.id,
+        adminEmail,
+        ipAddress,
+        null,
+        purchase
+      );
+
+      return { success: true, id: purchase.id };
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async recordSupplierPayment(purchaseId: string, dto: any, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const purchaseRes = await queryRunner.query("SELECT * FROM supplier_purchases WHERE id = $1 FOR UPDATE;", [purchaseId]);
+      if (purchaseRes.length === 0) throw new Error('Supplier Purchase not found');
+      const purchase = purchaseRes[0];
+
+      if (purchase.status === 'Draft' || purchase.status === 'Cancelled' || purchase.status === 'Completed') {
+        throw new Error(`Cannot record payment for purchase in status: ${purchase.status}`);
+      }
+
+      await queryRunner.query(`
+        INSERT INTO supplier_payments (supplier_purchase_id, amount, payment_date, cash_account_id, payment_method, reference_number, notes, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+      `, [
+        purchaseId, 
+        Number(dto.amount), 
+        dto.date || new Date().toISOString().split('T')[0], 
+        dto.cashAccountId, 
+        dto.paymentMethod || 'Bank Transfer', 
+        dto.referenceNumber || null, 
+        dto.notes || 'Settlement Balance Payment', 
+        adminEmail
+      ]);
+
+      const accounts = await queryRunner.query("SELECT name FROM cash_accounts WHERE id = $1;", [dto.cashAccountId]);
+      const accountName = accounts[0]?.name || 'Unknown Account';
+
+      await queryRunner.query(`
+        INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reference_number, reason, date, created_by)
+        VALUES ($1, $2, 'Inventory Purchase', 'Completed', 'Order', $3, $4, $5, $6, $7);
+      `, [
+        dto.cashAccountId, 
+        -Number(dto.amount), 
+        purchaseId, 
+        dto.referenceNumber || null, 
+        `Supplier Settlement Payment via ${accountName}`, 
+        dto.date || new Date().toISOString().split('T')[0], 
+        adminEmail
+      ]);
+
+      const paymentsSumRes = await queryRunner.query("SELECT SUM(amount)::float as total FROM supplier_payments WHERE supplier_purchase_id = $1;", [purchaseId]);
+      const totalPaid = paymentsSumRes[0]?.total || 0;
+      
+      const orderedItems = await queryRunner.query("SELECT product_id, SUM(quantity)::int as ordered FROM supplier_purchase_items WHERE supplier_purchase_id = $1 GROUP BY product_id;", [purchaseId]);
+      const receivedItems = await queryRunner.query(`
+        SELECT spri.product_id, SUM(spri.quantity_received)::int as received 
+        FROM supplier_purchase_receipt_items spri
+        JOIN supplier_purchase_receipts spr ON spr.id = spri.purchase_receipt_id
+        WHERE spr.supplier_purchase_id = $1
+        GROUP BY spri.product_id;
+      `, [purchaseId]);
+
+      let isFullyReceived = true;
+      for (const ordered of orderedItems) {
+        const received = receivedItems.find(r => r.product_id === ordered.product_id)?.received || 0;
+        if (received < ordered.ordered) {
+          isFullyReceived = false;
+          break;
+        }
+      }
+
+      if (totalPaid >= Number(purchase.total_value) && isFullyReceived) {
+        await queryRunner.query("UPDATE supplier_purchases SET status = 'Completed', updated_at = NOW() WHERE id = $1;", [purchaseId]);
+      } else if (purchase.status === 'Awaiting Advance' && totalPaid > 0) {
+        await queryRunner.query("UPDATE supplier_purchases SET status = 'Booked', updated_at = NOW() WHERE id = $1;", [purchaseId]);
+      }
+
+      await queryRunner.commitTransaction();
+
+      await this.writeAuditLog(
+        'RECORD_SUPPLIER_PAYMENT',
+        'supplier_payments',
+        purchaseId,
+        adminEmail,
+        ipAddress,
+        null,
+        { amount: dto.amount, totalPaid }
+      );
+
+      return { success: true };
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async receiveSupplierShipment(purchaseId: string, dto: any, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const purchaseRes = await queryRunner.query("SELECT * FROM supplier_purchases WHERE id = $1 FOR UPDATE;", [purchaseId]);
+      if (purchaseRes.length === 0) throw new Error('Supplier Purchase not found');
+      const purchase = purchaseRes[0];
+
+      if (purchase.status === 'Draft' || purchase.status === 'Cancelled' || purchase.status === 'Completed') {
+        throw new Error(`Cannot receive stock for purchase in status: ${purchase.status}`);
+      }
+
+      const countRes = await queryRunner.query("SELECT COUNT(*)::int as count FROM supplier_purchase_receipts;");
+      const receiptCount = countRes[0].count + 1;
+      const receiptNumber = `PR-${new Date().getFullYear()}-${String(receiptCount).padStart(4, '0')}`;
+
+      const receiptRes = await queryRunner.query(`
+        INSERT INTO supplier_purchase_receipts (supplier_purchase_id, receipt_number, received_date, received_by, notes)
+        VALUES ($1, $2, CURRENT_DATE, $3, $4)
+        RETURNING *;
+      `, [purchaseId, receiptNumber, dto.receivedBy || adminEmail, dto.notes || null]);
+      const receiptId = receiptRes[0].id;
+
+      for (const item of dto.items) {
+        const productId = item.productId;
+        const qtyReceived = Number(item.quantityReceived || 0);
+        const qtyDamaged = Number(item.quantityDamaged || 0);
+        const qtyShort = Number(item.quantityShort || 0);
+        const qtyOver = Number(item.quantityOver || 0);
+
+        await queryRunner.query(`
+          INSERT INTO supplier_purchase_receipt_items (purchase_receipt_id, product_id, quantity_received, quantity_short, quantity_damaged, quantity_over)
+          VALUES ($1, $2, $3, $4, $5, $6);
+        `, [receiptId, productId, qtyReceived, qtyShort, qtyDamaged, qtyOver]);
+
+        const orderItemRes = await queryRunner.query("SELECT purchase_price FROM supplier_purchase_items WHERE supplier_purchase_id = $1 AND product_id = $2;", [purchaseId, productId]);
+        const purchasePrice = orderItemRes[0]?.purchase_price || 0;
+
+        const productRes = await queryRunner.query("SELECT selling_price, base_price, sku FROM products WHERE id = $1;", [productId]);
+        const sellingPrice = productRes[0]?.selling_price || productRes[0]?.base_price || 0;
+
+        if (qtyReceived > 0) {
+          await this.receiveInventoryBatchTx(
+            queryRunner,
+            productId,
+            purchase.supplier_id,
+            Number(purchasePrice),
+            Number(sellingPrice),
+            qtyReceived,
+            adminEmail,
+            ipAddress,
+            null,
+            purchaseId,
+            receiptId
+          );
+        }
+
+        if (qtyDamaged > 0) {
+          await queryRunner.query(`
+            UPDATE inventory
+            SET quantity_damaged = quantity_damaged + $1,
+                updated_at = NOW()
+            WHERE product_id = $2;
+          `, [qtyDamaged, productId]);
+        }
+      }
+
+      const orderedItems = await queryRunner.query("SELECT product_id, SUM(quantity)::int as ordered FROM supplier_purchase_items WHERE supplier_purchase_id = $1 GROUP BY product_id;", [purchaseId]);
+      const receivedItems = await queryRunner.query(`
+        SELECT spri.product_id, SUM(spri.quantity_received)::int as received 
+        FROM supplier_purchase_receipt_items spri
+        JOIN supplier_purchase_receipts spr ON spr.id = spri.purchase_receipt_id
+        WHERE spr.supplier_purchase_id = $1
+        GROUP BY spri.product_id;
+      `, [purchaseId]);
+
+      let isFullyReceived = true;
+      for (const ordered of orderedItems) {
+        const received = receivedItems.find(r => r.product_id === ordered.product_id)?.received || 0;
+        if (received < ordered.ordered) {
+          isFullyReceived = false;
+          break;
+        }
+      }
+
+      const newStatus = isFullyReceived ? 'Fully Received' : 'Partially Received';
+      await queryRunner.query("UPDATE supplier_purchases SET status = $1, updated_at = NOW() WHERE id = $2;", [newStatus, purchaseId]);
+
+      const paymentsSumRes = await queryRunner.query("SELECT SUM(amount)::float as total FROM supplier_payments WHERE supplier_purchase_id = $1;", [purchaseId]);
+      const totalPaid = paymentsSumRes[0]?.total || 0;
+      if (isFullyReceived && totalPaid >= Number(purchase.total_value)) {
+        await queryRunner.query("UPDATE supplier_purchases SET status = 'Completed', updated_at = NOW() WHERE id = $1;", [purchaseId]);
+      }
+
+      await queryRunner.commitTransaction();
+      
+      localCache.del('products_list_true');
+      localCache.del('products_list_false');
+
+      await this.writeAuditLog(
+        'RECEIVE_SUPPLIER_SHIPMENT',
+        'supplier_purchase_receipts',
+        receiptId,
+        adminEmail,
+        ipAddress,
+        null,
+        { receiptNumber, isFullyReceived }
+      );
+
+      return { success: true, receiptNumber };
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async getSupplierMetrics() {
+    const upcomingRes = await this.dataSource.query(`
+      SELECT COUNT(*)::int as count FROM supplier_purchases
+      WHERE status IN ('Booked', 'In Transit', 'Partially Received')
+        AND expected_arrival_date >= CURRENT_DATE;
+    `);
+    const upcomingArrivals = upcomingRes[0]?.count || 0;
+
+    const outstandingRes = await this.dataSource.query(`
+      SELECT COALESCE(
+        SUM(sp.total_value) - 
+        (SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 
+        0
+      )::float as total
+      FROM supplier_purchases sp
+      WHERE sp.status != 'Cancelled' AND sp.status != 'Completed';
+    `);
+    const outstandingPayables = outstandingRes[0]?.total || 0;
+
+    const awaitingRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(spi.quantity - COALESCE(
+        (SELECT SUM(spri.quantity_received) 
+         FROM supplier_purchase_receipt_items spri
+         JOIN supplier_purchase_receipts spr ON spr.id = spri.purchase_receipt_id
+         WHERE spr.supplier_purchase_id = spi.supplier_purchase_id AND spri.product_id = spi.product_id), 0
+      )), 0)::int as total
+      FROM supplier_purchase_items spi
+      JOIN supplier_purchases sp ON sp.id = spi.supplier_purchase_id
+      WHERE sp.status IN ('Booked', 'In Transit', 'Partially Received');
+    `);
+    const awaitingReceiptCount = awaitingRes[0]?.total || 0;
+
+    const delayedRes = await this.dataSource.query(`
+      SELECT COUNT(*)::int as count FROM supplier_purchases
+      WHERE status IN ('Booked', 'In Transit', 'Partially Received')
+        AND expected_arrival_date < CURRENT_DATE;
+    `);
+    const delayedShipments = delayedRes[0]?.count || 0;
+
+    const spendRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM supplier_payments;
+    `);
+    const totalSpend = spendRes[0]?.total || 0;
+
+    const leadTimeRes = await this.dataSource.query(`
+      SELECT COALESCE(AVG(spr.received_date - sp.purchase_date), 0)::float as avg_days
+      FROM supplier_purchase_receipts spr
+      JOIN supplier_purchases sp ON sp.id = spr.supplier_purchase_id;
+    `);
+    const avgLeadTimeDays = Math.round(leadTimeRes[0]?.avg_days || 0);
+
+    const timeline = await this.dataSource.query(`
+      SELECT sp.id, s.name as "supplierName", sp.purchase_date as "purchaseDate", sp.expected_arrival_date as "expectedArrivalDate",
+             sp.status, sp.total_value as "totalValue",
+             COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 0)::float as "advancePaid"
+      FROM supplier_purchases sp
+      JOIN suppliers s ON s.id = sp.supplier_id
+      ORDER BY sp.purchase_date DESC, sp.created_at DESC
+      LIMIT 10;
+    `);
+
+    return {
+      upcomingArrivals,
+      outstandingPayables,
+      awaitingReceiptCount,
+      delayedShipments,
+      totalSpend,
+      avgLeadTimeDays,
+      timeline
+    };
+  }
+
+  async updateSupplierPurchaseStatus(purchaseId: string, status: string, adminEmail: string, ipAddress: string) {
+    const validStates = ['Draft', 'Awaiting Advance', 'Booked', 'In Transit', 'Partially Received', 'Fully Received', 'Completed', 'Cancelled'];
+    if (!validStates.includes(status)) throw new Error('Invalid purchase status');
+
+    const purchaseRes = await this.dataSource.query("SELECT * FROM supplier_purchases WHERE id = $1;", [purchaseId]);
+    if (purchaseRes.length === 0) throw new Error('Supplier Purchase not found');
+    const old = purchaseRes[0];
+
+    // Handle cancellation refund if cancelled
+    if (status === 'Cancelled' && old.status !== 'Cancelled') {
+      const paymentsSumRes = await this.dataSource.query("SELECT SUM(amount)::float as total FROM supplier_payments WHERE supplier_purchase_id = $1;", [purchaseId]);
+      const totalPaid = paymentsSumRes[0]?.total || 0;
+      if (totalPaid > 0) {
+        // Log refund notification
+        await this.createSystemNotification(
+          'Supplier Purchase Cancelled',
+          `Purchase order from supplier was cancelled. Outstanding advance refund required: ₹${totalPaid}`,
+          'warning'
+        );
+      }
+    }
+
+    await this.dataSource.query("UPDATE supplier_purchases SET status = $1, updated_at = NOW() WHERE id = $2;", [status, purchaseId]);
+    
+    await this.writeAuditLog(
+      'UPDATE_SUPPLIER_PURCHASE_STATUS',
+      'supplier_purchases',
+      purchaseId,
+      adminEmail,
+      ipAddress,
+      old,
+      { status }
+    );
+    return { success: true };
+  }
+
+  async addSupplierPurchaseAttachment(purchaseId: string, fileBuffer: Buffer, fileName: string, fileExtension: string, adminEmail: string) {
+    const generatedName = `${crypto.randomUUID()}.${fileExtension}`;
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        await s3.send(new PutObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `attachments/${generatedName}`,
+          Body: fileBuffer,
+          ContentType: fileExtension === 'pdf' ? 'application/pdf' : `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
+        }));
+      } catch (err: any) {
+        console.error(`[S3] Failed to upload attachment: ${err.message}`);
+        throw err;
+      }
+    } else {
+      const filePath = path.join(privateUploadDir, generatedName);
+      fs.writeFileSync(filePath, fileBuffer);
+    }
+
+    const result = await this.dataSource.query(`
+      INSERT INTO supplier_purchase_attachments (supplier_purchase_id, file_name, file_path, uploaded_by)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *;
+    `, [purchaseId, fileName, generatedName, adminEmail]);
+
+    return result[0];
+  }
+
+  async getSupplierAttachmentStream(attachmentId: string) {
+    const rows = await this.dataSource.query(
+      "SELECT file_name, file_path FROM supplier_purchase_attachments WHERE id = $1", 
+      [attachmentId]
+    );
+    if (rows.length === 0) return null;
+    
+    const generatedName = rows[0].file_path;
+    const originalName = rows[0].file_name;
+
+    if (process.env.S3_ASSETS_BUCKET) {
+      try {
+        const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const res = await s3.send(new GetObjectCommand({
+          Bucket: process.env.S3_ASSETS_BUCKET,
+          Key: `attachments/${generatedName}`
+        }));
+        return {
+          stream: res.Body as any,
+          filename: originalName
+        };
+      } catch (err: any) {
+        console.error(`[S3] Failed to download attachment: ${err.message}`);
+        throw err;
+      }
+    } else {
+      const filePath = path.join(privateUploadDir, generatedName);
+      if (!fs.existsSync(filePath)) return null;
+      return {
+        stream: fs.createReadStream(filePath),
+        filename: originalName
+      };
     }
   }
 }
