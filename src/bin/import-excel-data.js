@@ -49,7 +49,7 @@ function getNumericId(orderIdStr) {
 
 async function runImport() {
   console.log("==================================================");
-  console.log("GARAGEKINGS EXCEL DATABASE REBUILDER");
+  console.log("GARAGEKINGS EXCEL DATABASE REBUILDER V3 (BATCH SYSTEMS)");
   console.log(`Excel file: ${excelPath}`);
   console.log("==================================================");
 
@@ -113,7 +113,7 @@ async function runImport() {
   // 4. Create Audit Log Run
   const initRunRes = await pgClient.query(`
     INSERT INTO migration_runs (status, executed_by)
-    VALUES ('Started', 'Excel Rebuild Script')
+    VALUES ('Started', 'Excel Rebuild Script V3')
     RETURNING id;
   `);
   const runId = initRunRes.rows[0].id;
@@ -125,9 +125,12 @@ async function runImport() {
     await pgClient.query(`
       TRUNCATE TABLE 
         expenses, 
+        order_inventory_allocations,
         order_items, 
         orders, 
         inventory_transactions, 
+        inventory_ledger,
+        inventory_snapshots,
         inventory, 
         product_images, 
         products, 
@@ -138,10 +141,23 @@ async function runImport() {
         split_settlements,
         receipts,
         receipt_items,
-        receipt_generation_jobs
+        receipt_generation_jobs,
+        distributors,
+        purchase_orders,
+        inventory_cycle_counts,
+        inventory_cycle_count_items
       RESTART IDENTITY CASCADE;
     `);
     console.log("✔ Database tables cleared successfully.");
+
+    // 5.2 Seed Default Distributor
+    console.log("Seeding default distributor...");
+    const distRes = await pgClient.query(`
+      INSERT INTO distributors (name)
+      VALUES ('Default Supplier')
+      RETURNING id;
+    `);
+    const distId = distRes.rows[0].id;
 
     // 6. Re-seed Admin Founders
     console.log("Seeding admin founders...");
@@ -169,7 +185,7 @@ async function runImport() {
     console.log("✔ Seeding of admin founders completed.");
 
     // 7. Insert products from Inventory Sheet (merge duplicate SKUs)
-    console.log("Processing and inserting products...");
+    console.log("Processing and inserting products into catalog and batches...");
     const mergedProducts = {};
     for (const row of rawProducts) {
       const sku = row['SKU ID'].toString().trim();
@@ -214,8 +230,8 @@ async function runImport() {
       const isPrebook = p.sku.toUpperCase().startsWith('PRE') || p.sku.toUpperCase().includes('PREBOOK') || p.name.toLowerCase().includes('pre-booking');
       
       const prodRes = await pgClient.query(`
-        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, sold_stock, status, is_prebook)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Published', $15)
+        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, sold_stock, status, is_prebook, availability_state)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Published', $15, $16)
         RETURNING id;
       `, [
         p.sku,
@@ -232,7 +248,8 @@ async function runImport() {
         p.price,
         p.totalStock,
         p.soldStock,
-        isPrebook
+        isPrebook,
+        isPrebook ? 'Pre-order' : 'Available'
       ]);
       const productId = prodRes.rows[0].id;
       productIdsMap[p.sku] = productId;
@@ -243,10 +260,43 @@ async function runImport() {
       `, [productId]);
 
       const quantityAvailable = Math.max(0, p.totalStock - p.soldStock);
+
+      // Seed core inventory aggregate cache
       await pgClient.query(`
-        INSERT INTO inventory (product_id, quantity_available, quantity_reserved)
-        VALUES ($1, $2, 0);
-      `, [productId, quantityAvailable]);
+        INSERT INTO inventory (product_id, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged, quantity_locked)
+        VALUES ($1, $2, 0, $3, 0, 0, 0);
+      `, [productId, quantityAvailable, p.soldStock]);
+
+      // Seed physical batch
+      const batchRes = await pgClient.query(`
+        INSERT INTO inventory_batches (product_id, distributor_id, sku, purchase_price, selling_price, quantity_received, quantity_available, quantity_reserved, quantity_sold, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9)
+        RETURNING id;
+      `, [
+        productId,
+        distId,
+        p.sku,
+        p.purchasePrice,
+        p.price,
+        p.totalStock,
+        quantityAvailable,
+        p.soldStock,
+        quantityAvailable === 0 ? 'Fully Consumed' : 'Partially Used'
+      ]);
+      const batchId = batchRes.rows[0].id;
+
+      // Seed append-only ledger logs
+      await pgClient.query(`
+        INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+        VALUES ($1, $2, 'RECEIVE', $3, $4, $5, 'Initial batch receipt import', 'System');
+      `, [productId, batchId, p.totalStock, p.purchasePrice, p.price]);
+
+      if (p.soldStock > 0) {
+        await pgClient.query(`
+          INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+          VALUES ($1, $2, 'SELL', $3, $4, $5, 'Initial sales depletion import', 'System');
+        `, [productId, batchId, -p.soldStock, p.purchasePrice, p.price]);
+      }
     }
     console.log(`✔ Seeding of ${Object.keys(mergedProducts).length} products completed.`);
 
@@ -352,16 +402,33 @@ async function runImport() {
       ]);
       const orderId = orderInsertRes.rows[0].id;
 
-      // Insert Order Items
+      // Insert Order Items and Traceable Allocations
       const skuList = skusColumn.split(',').map(s => s.trim());
       for (const s of skuList) {
         if (!s) continue;
         const productId = productIdsMap[s];
         if (productId) {
-          await pgClient.query(`
-            INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-            VALUES ($1, $2, 1, $3);
-          `, [orderId, productId, advancePaid]); // fallback purchase price to amountPaid
+          // Fetch default batch for margins
+          const batchRes = await pgClient.query("SELECT id, purchase_price, selling_price FROM inventory_batches WHERE product_id = $1 LIMIT 1;", [productId]);
+          const batch = batchRes.rows[0];
+
+          const purchaseCost = batch ? Number(batch.purchase_price) : 0;
+          const sellingPrice = batch ? Number(batch.selling_price) : advancePaid;
+
+          const itemInsertRes = await pgClient.query(`
+            INSERT INTO order_items (order_id, product_id, qty, price_at_purchase, purchase_price_at_purchase)
+            VALUES ($1, $2, 1, $3, $4)
+            RETURNING id;
+          `, [orderId, productId, sellingPrice, purchaseCost]);
+          const orderItemId = itemInsertRes.rows[0].id;
+
+          if (batch && (dbStatus === 'Delivered' || dbStatus === 'Confirmed' || dbStatus === 'Shipped' || dbStatus === 'Pre-Order')) {
+            // Insert allocation trace
+            await pgClient.query(`
+              INSERT INTO order_inventory_allocations (order_item_id, batch_id, quantity, purchase_price, selling_price)
+              VALUES ($1, $2, 1, $3, $4);
+            `, [orderItemId, batch.id, purchaseCost, sellingPrice]);
+          }
         } else {
           console.warn(`⚠️ Warning: SKU ${s} not found in productIdsMap for Order ${excelOrderId}`);
         }

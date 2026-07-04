@@ -225,15 +225,30 @@ export class ApiService implements OnModuleInit {
       `);
     }
 
-    // ── 15-SECOND RESERVATION TIMER WORKER ─────────────────────────
-    // Disabled reservation timer worker: Checkout is now first-come-first-served
-    // setInterval(async () => {
-    //   try {
-    //     await this.expireActiveReservations();
-    //   } catch (err) {
-    //     console.error("[Worker Error] Failed executing reservation cleanup:", err);
-    //   }
-    // }, 15000);
+    // Run Startup Automated Integrity Reconciliation Check
+    this.runInventoryReconciliation('Startup Automated Check').catch(err => {
+      console.error("[Inventory] Startup reconciliation failed:", err);
+    });
+
+    // Schedule Nightly Automated Reconciliation Check at 2:00 AM
+    const runNightlyReconcile = async () => {
+      try {
+        await this.runInventoryReconciliation('Nightly Automated Scheduler');
+      } catch (err) {
+        console.error("[Worker Error] Failed executing nightly reconciliation:", err);
+      }
+    };
+    const now = new Date();
+    const target = new Date();
+    target.setHours(2, 0, 0, 0);
+    if (target <= now) {
+      target.setDate(target.getDate() + 1);
+    }
+    const msUntilTarget = target.getTime() - now.getTime();
+    setTimeout(() => {
+      runNightlyReconcile();
+      setInterval(runNightlyReconcile, 24 * 60 * 60 * 1000);
+    }, msUntilTarget);
   }
 
   // ── AUDIT LOGGING SYSTEM (IMMUTABLE LOGS) ──────────────────────────
@@ -511,7 +526,7 @@ export class ApiService implements OnModuleInit {
     try {
       const prodRes = await queryRunner.query(`
         INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, supplier, arrival_date, release_date, status, show_on_homepage, created_by, max_qty_per_customer, is_prebook, prebook_deposit_amount)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 0, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         RETURNING id;
       `, [
         sku,
@@ -524,9 +539,7 @@ export class ApiService implements OnModuleInit {
         car.description || '',
         car.tags || [],
         car.category || 'JDM',
-        Number(car.purchasePrice || 0),
         Number(car.price || 0),
-        Number(car.totalStock || 10),
         car.supplier || '',
         car.arrivalDate || null,
         car.releaseDate || null,
@@ -548,16 +561,30 @@ export class ApiService implements OnModuleInit {
       }
 
       await queryRunner.query(`
-        INSERT INTO inventory (product_id, quantity_available, quantity_reserved)
-        VALUES ($1, $2, 0)
-        ON CONFLICT (product_id) DO UPDATE SET quantity_available = $2;
-      `, [productId, Number(car.totalStock || 10)]);
+        INSERT INTO inventory (product_id, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged, quantity_locked)
+        VALUES ($1, 0, 0, 0, 0, 0, 0)
+        ON CONFLICT (product_id) DO NOTHING;
+      `, [productId]);
+
+      const initialStock = Number(car.totalStock || 0);
+      if (initialStock > 0) {
+        await this.receiveInventoryBatchTx(
+          queryRunner,
+          productId,
+          car.supplier || 'Default Supplier',
+          Number(car.purchasePrice || 0),
+          Number(car.price || 0),
+          initialStock,
+          creatorEmail,
+          ipAddress
+        );
+      }
 
       // Low stock check trigger
-      if (Number(car.totalStock || 10) <= 3) {
+      if (initialStock <= 3) {
         await this.createSystemNotification(
           'Low Stock Alert',
-          `Casting "${car.name}" has critical stock count: ${car.totalStock}`,
+          `Casting "${car.name}" has critical stock count: ${initialStock}`,
           'low_stock'
         );
       }
@@ -587,58 +614,93 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
-      await queryRunner.query(`
-        UPDATE products 
-        SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
-            category = $9, purchase_price = $10, selling_price = $11, total_stock = $12, supplier = $13,
-            arrival_date = $14, release_date = $15, status = $16, show_on_homepage = $17, updated_by = $18, 
-            max_qty_per_customer = $19, is_prebook = $20, prebook_deposit_amount = $21, updated_at = NOW()
-        WHERE id = $22;
-      `, [
-        car.brand || 'MINI GT',
-        car.name || 'Unknown Casting',
-        car.series || '',
-        car.scale || '1:64',
-        car.lane || 'Standard Edition',
-        Number(car.price || 0),
-        car.description || '',
-        car.tags || [],
-        car.category || 'JDM',
-        Number(car.purchasePrice || 0),
-        Number(car.price || 0),
-        Number(car.totalStock || 10),
-        car.supplier || '',
-        car.arrivalDate || null,
-        car.releaseDate || null,
-        car.status || 'Published',
-        car.showOnHomepage !== false,
-        updaterEmail,
-        car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : null,
-        car.isPrebook === true,
-        car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : null,
-        id
-      ]);
+      const batchCountRes = await queryRunner.query("SELECT COUNT(*)::int as count FROM inventory_batches WHERE product_id = $1;", [id]);
+      const hasBatches = batchCountRes[0].count > 0;
 
-      if (car.image) {
-        await queryRunner.query(`DELETE FROM product_images WHERE product_id = $1;`, [id]);
+      if (hasBatches) {
+        // Only update static metadata, keeping prices and stock untouched
         await queryRunner.query(`
-          INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
-          VALUES ($1, $2, $3, $4, true);
-        `, [id, car.image, car.image, car.image]);
+          UPDATE products 
+          SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, description = $6, tags = $7,
+              category = $8, status = $9, show_on_homepage = $10, updated_by = $11, 
+              max_qty_per_customer = $12, is_prebook = $13, prebook_deposit_amount = $14, availability_state = $15, updated_at = NOW()
+          WHERE id = $16;
+        `, [
+          car.brand || oldData.brand,
+          car.name || oldData.model_name,
+          car.series !== undefined ? car.series : oldData.series,
+          car.scale || oldData.scale,
+          car.lane || oldData.rarity_level,
+          car.description !== undefined ? car.description : oldData.description,
+          car.tags || oldData.tags,
+          car.category || oldData.category,
+          car.status || oldData.status,
+          car.showOnHomepage !== false,
+          updaterEmail,
+          car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : oldData.max_qty_per_customer,
+          car.isPrebook === true,
+          car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : oldData.prebook_deposit_amount,
+          car.availabilityState || oldData.availability_state || 'Available',
+          id
+        ]);
+      } else {
+        // No batches exist yet: allow updating everything, and create default batch if totalStock changes
+        await queryRunner.query(`
+          UPDATE products 
+          SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
+              category = $9, purchase_price = $10, selling_price = $11, total_stock = $12, supplier = $13,
+              arrival_date = $14, release_date = $15, status = $16, show_on_homepage = $17, updated_by = $18, 
+              max_qty_per_customer = $19, is_prebook = $20, prebook_deposit_amount = $21, availability_state = $22, updated_at = NOW()
+          WHERE id = $23;
+        `, [
+          car.brand || oldData.brand,
+          car.name || oldData.model_name,
+          car.series !== undefined ? car.series : oldData.series,
+          car.scale || oldData.scale,
+          car.lane || oldData.rarity_level,
+          Number(car.price || oldData.base_price),
+          car.description !== undefined ? car.description : oldData.description,
+          car.tags || oldData.tags,
+          car.category || oldData.category,
+          Number(car.purchasePrice || oldData.purchase_price),
+          Number(car.price || oldData.selling_price),
+          Number(car.totalStock || oldData.total_stock),
+          car.supplier || oldData.supplier,
+          car.arrivalDate || oldData.arrival_date,
+          car.releaseDate || oldData.release_date,
+          car.status || oldData.status,
+          car.showOnHomepage !== false,
+          updaterEmail,
+          car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : oldData.max_qty_per_customer,
+          car.isPrebook === true,
+          car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : oldData.prebook_deposit_amount,
+          car.availabilityState || oldData.availability_state || 'Available',
+          id
+        ]);
+
+        const initialStock = Number(car.totalStock || 0);
+        if (initialStock > 0) {
+          await this.receiveInventoryBatchTx(
+            queryRunner,
+            id,
+            car.supplier || 'Default Supplier',
+            Number(car.purchasePrice || 0),
+            Number(car.price || 0),
+            initialStock,
+            updaterEmail,
+            ipAddress
+          );
+        }
       }
 
-      const available = Number(car.totalStock || 10) - Number(oldData.locked_stock || 0) - Number(oldData.sold_stock || 0);
-      await queryRunner.query(`
-        UPDATE inventory 
-        SET quantity_available = $1, updated_at = NOW()
-        WHERE product_id = $2;
-      `, [available, id]);
+      const invRows = await queryRunner.query("SELECT quantity_available, quantity_reserved FROM inventory WHERE product_id = $1;", [id]);
+      const currentAvailable = invRows[0]?.quantity_available || 0;
 
       // Trigger low stock notifications
-      if (available <= 3) {
+      if (currentAvailable <= 3) {
         await this.createSystemNotification(
           'Low Stock Alert',
-          `Casting "${car.name}" has critical stock count: ${available}`,
+          `Casting "${car.name || oldData.model_name}" has critical stock count: ${currentAvailable}`,
           'low_stock'
         );
       }
@@ -648,7 +710,15 @@ export class ApiService implements OnModuleInit {
       localCache.del('products_list_false');
 
       // Log audit trace
-      await this.writeAuditLog('UPDATE_PRODUCT', 'products', id, updaterEmail, ipAddress, oldData, car);
+      await this.writeAuditLog(
+        'UPDATE_PRODUCT',
+        'products',
+        id,
+        updaterEmail,
+        ipAddress,
+        oldData,
+        car
+      );
 
       return { success: true };
     } catch (err) {
@@ -1328,25 +1398,33 @@ export class ApiService implements OnModuleInit {
     `, [email.trim().toLowerCase()]);
   }
   async adminConfirmOrder(orderId: string, adminEmail: string, ipAddress: string) {
-    const oldRes = await this.dataSource.query("SELECT status FROM orders WHERE id = $1", [orderId]);
+    const oldRes = await this.dataSource.query("SELECT status, booking_type FROM orders WHERE id = $1", [orderId]);
     if (oldRes.length === 0) {
       throw new Error("Order not found.");
     }
-    if (oldRes[0].status === 'Confirmed') {
+    if (oldRes[0].status === 'Confirmed' || oldRes[0].status === 'Pre-Order') {
       return { success: true };
     }
     
+    const bookingType = oldRes[0].booking_type;
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
       // Get order items
-      const items = await queryRunner.query("SELECT product_id, qty FROM order_items WHERE order_id = $1", [orderId]);
+      const items = await queryRunner.query('SELECT id as "orderItemId", product_id, qty FROM order_items WHERE order_id = $1', [orderId]);
       for (const item of items) {
-        // Lock and check product stock
+        // Lock aggregate caches
+        const invRows = await queryRunner.query(`
+          SELECT quantity_available, quantity_reserved
+          FROM inventory
+          WHERE product_id = $1
+          FOR UPDATE;
+        `, [item.product_id]);
+        
         const prodRows = await queryRunner.query(`
-          SELECT id, model_name as name, total_stock, sold_stock, locked_stock
+          SELECT id, model_name as name, total_stock, locked_stock, sold_stock
           FROM products 
           WHERE id = $1 AND deleted_at IS NULL 
           FOR UPDATE;
@@ -1355,21 +1433,85 @@ export class ApiService implements OnModuleInit {
         if (prodRows.length === 0) {
           throw new Error("Target casting does not exist or has been archived.");
         }
-
-        const p = prodRows[0];
-        const available = Number(p.total_stock) - Number(p.locked_stock) - Number(p.sold_stock);
-        if (available < Number(item.qty)) {
-          throw new Error(`Cannot approve order. Casting "${p.name}" is sold out. Available: ${available}, requested: ${item.qty}.`);
+        
+        // Select available batches in FIFO order
+        const batches = await queryRunner.query(`
+          SELECT id, purchase_price, selling_price, quantity_available, quantity_reserved
+          FROM inventory_batches
+          WHERE product_id = $1 AND quantity_available > 0
+          ORDER BY received_at ASC
+          FOR UPDATE;
+        `, [item.product_id]);
+        
+        const totalAvailable = batches.reduce((sum, b) => sum + Number(b.quantity_available), 0);
+        
+        // If it's a standard order, we must have enough stock
+        if (bookingType !== 'pre_order' && totalAvailable < Number(item.qty)) {
+          throw new Error(`Cannot approve order. Casting "${prodRows[0].name}" is sold out. Available: ${totalAvailable}, requested: ${item.qty}.`);
         }
-
-        // Increment sold_stock and release locked_stock if legacy active reservation existed
-        await queryRunner.query(`
-          UPDATE products 
-          SET sold_stock = sold_stock + $1,
-              locked_stock = GREATEST(0, locked_stock - $1),
-              updated_at = NOW() 
-          WHERE id = $2;
-        `, [Number(item.qty), item.product_id]);
+        
+        // Deplete stock from batches using FIFO (only if stock is available)
+        let remainingToAllocate = Number(item.qty);
+        let mixedCostSum = 0;
+        let allocatedCount = 0;
+        
+        for (const b of batches) {
+          if (remainingToAllocate <= 0) break;
+          const allocQty = Math.min(remainingToAllocate, Number(b.quantity_available));
+          
+          // Allocate: available -> reserved
+          await queryRunner.query(`
+            UPDATE inventory_batches
+            SET quantity_available = quantity_available - $1,
+                quantity_reserved = quantity_reserved + $1,
+                status = CASE WHEN quantity_available - $1 = 0 THEN 'Fully Consumed'::VARCHAR ELSE 'Partially Used'::VARCHAR END,
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [allocQty, b.id]);
+          
+          // Record allocation
+          await queryRunner.query(`
+            INSERT INTO order_inventory_allocations (order_item_id, batch_id, quantity, purchase_price, selling_price)
+            VALUES ($1, $2, $3, $4, $5);
+          `, [item.orderItemId, b.id, allocQty, Number(b.purchase_price), Number(b.selling_price)]);
+          
+          // Record ledger RESERVE
+          await queryRunner.query(`
+            INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+            VALUES ($1, $2, $3, 'RESERVE', $4, $5, $6, $7, $8);
+          `, [item.product_id, b.id, orderId, -allocQty, Number(b.purchase_price), Number(b.selling_price), `Reserved stock for order approval`, adminEmail || 'System']);
+          
+          mixedCostSum += Number(b.purchase_price) * allocQty;
+          remainingToAllocate -= allocQty;
+          allocatedCount += allocQty;
+        }
+        
+        if (allocatedCount > 0) {
+          const avgUnitCost = mixedCostSum / allocatedCount;
+          // Save the cost permanently on the order item
+          await queryRunner.query(`
+            UPDATE order_items
+            SET purchase_price_at_purchase = $1
+            WHERE id = $2;
+          `, [avgUnitCost, item.orderItemId]);
+          
+          // Update products total stock cache
+          await queryRunner.query(`
+            UPDATE products
+            SET locked_stock = locked_stock + $1, -- reserving stock (locked_stock acts as reserved)
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [allocatedCount, item.product_id]);
+          
+          // Update inventory cache
+          await queryRunner.query(`
+            UPDATE inventory
+            SET quantity_available = quantity_available - $1,
+                quantity_reserved = quantity_reserved + $1,
+                updated_at = NOW()
+            WHERE product_id = $2;
+          `, [allocatedCount, item.product_id]);
+        }
       }
 
       // Get booking details to determine correct final status and billing updates
@@ -1454,24 +1596,128 @@ export class ApiService implements OnModuleInit {
         `, [orderId]);
       }
 
-      // If status transitioned to Cancelled, release stock
-      if (fields.status === 'Cancelled' && old.status !== 'Cancelled') {
-        const items = await queryRunner.query("SELECT product_id, qty FROM order_items WHERE order_id = $1", [orderId]);
-        for (const item of items) {
-          if (old.status === 'Confirmed' || old.status === 'Shipped' || old.status === 'Delivered') {
+      // Transition stock from Reserved to Sold on Shipment/Delivery
+      if ((targetStatus === 'Shipped' || targetStatus === 'Delivered') && old.status === 'Confirmed') {
+        const allocations = await queryRunner.query(`
+          SELECT a.*, oi.product_id 
+          FROM order_inventory_allocations a
+          JOIN order_items oi ON oi.id = a.order_item_id
+          WHERE oi.order_id = $1;
+        `, [orderId]);
+
+        for (const a of allocations) {
+          // Decrement reserved, increment sold
+          await queryRunner.query(`
+            UPDATE inventory_batches
+            SET quantity_reserved = GREATEST(0, quantity_reserved - $1),
+                quantity_sold = quantity_sold + $1,
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [a.quantity, a.batch_id]);
+
+          // Log to ledger
+          await queryRunner.query(`
+            INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+            VALUES ($1, $2, $3, 'SELL', 0, $4, $5, $6, $7);
+          `, [a.product_id, a.batch_id, orderId, Number(a.purchase_price), Number(a.selling_price), `Shipped/Delivered stock finalized`, adminEmail || 'System']);
+
+          // Update caches
+          await queryRunner.query(`
+            UPDATE products
+            SET locked_stock = GREATEST(0, locked_stock - $1),
+                sold_stock = sold_stock + $1,
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [a.quantity, a.product_id]);
+
+          await queryRunner.query(`
+            UPDATE inventory
+            SET quantity_reserved = GREATEST(0, quantity_reserved - $1),
+                quantity_sold = quantity_sold + $1,
+                updated_at = NOW()
+            WHERE product_id = $2;
+          `, [a.quantity, a.product_id]);
+        }
+      }
+
+      // If status transitioned to Cancelled, release stock and allocations
+      if (targetStatus === 'Cancelled' && old.status !== 'Cancelled') {
+        const allocations = await queryRunner.query(`
+          SELECT a.*, oi.product_id 
+          FROM order_inventory_allocations a
+          JOIN order_items oi ON oi.id = a.order_item_id
+          WHERE oi.order_id = $1;
+        `, [orderId]);
+
+        for (const a of allocations) {
+          if (old.status === 'Confirmed' || old.status === 'Pre-Order') {
+            // Stock was Reserved. Return to Available.
             await queryRunner.query(`
-              UPDATE products 
-              SET sold_stock = GREATEST(0, sold_stock - $1), updated_at = NOW()
+              UPDATE inventory_batches
+              SET quantity_reserved = GREATEST(0, quantity_reserved - $1),
+                  quantity_available = quantity_available + $1,
+                  status = 'Partially Used'::VARCHAR,
+                  updated_at = NOW()
               WHERE id = $2;
-            `, [item.qty, item.product_id]);
-          } else if (old.status === 'Reserved' || old.status === 'Verification Pending') {
+            `, [a.quantity, a.batch_id]);
+
             await queryRunner.query(`
-              UPDATE products 
-              SET locked_stock = GREATEST(0, locked_stock - $1), updated_at = NOW()
+              INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+              VALUES ($1, $2, $3, 'RELEASE_RESERVATION', $4, $5, $6, $7, $8);
+            `, [a.product_id, a.batch_id, orderId, a.quantity, Number(a.purchase_price), Number(a.selling_price), `Released reservation from cancelled order`, adminEmail || 'System']);
+
+            await queryRunner.query(`
+              UPDATE products
+              SET locked_stock = GREATEST(0, locked_stock - $1),
+                  updated_at = NOW()
               WHERE id = $2;
-            `, [item.qty, item.product_id]);
+            `, [a.quantity, a.product_id]);
+
+            await queryRunner.query(`
+              UPDATE inventory
+              SET quantity_reserved = GREATEST(0, quantity_reserved - $1),
+                  quantity_available = quantity_available + $1,
+                  updated_at = NOW()
+              WHERE product_id = $2;
+            `, [a.quantity, a.product_id]);
+
+          } else if (old.status === 'Shipped' || old.status === 'Delivered') {
+            // Stock was Sold. Return to Returned/Stock.
+            await queryRunner.query(`
+              UPDATE inventory_batches
+              SET quantity_sold = GREATEST(0, quantity_sold - $1),
+                  quantity_returned = quantity_returned + $1,
+                  updated_at = NOW()
+              WHERE id = $2;
+            `, [a.quantity, a.batch_id]);
+
+            await queryRunner.query(`
+              INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+              VALUES ($1, $2, $3, 'RETURN_CUSTOMER', $4, $5, $6, $7, $8);
+            `, [a.product_id, a.batch_id, orderId, a.quantity, Number(a.purchase_price), Number(a.selling_price), `Returned stock from cancelled order`, adminEmail || 'System']);
+
+            await queryRunner.query(`
+              UPDATE products
+              SET sold_stock = GREATEST(0, sold_stock - $1),
+                  updated_at = NOW()
+              WHERE id = $2;
+            `, [a.quantity, a.product_id]);
+
+            await queryRunner.query(`
+              UPDATE inventory
+              SET quantity_sold = GREATEST(0, quantity_sold - $1),
+                  quantity_returned = quantity_returned + $1,
+                  updated_at = NOW()
+              WHERE product_id = $2;
+            `, [a.quantity, a.product_id]);
           }
         }
+
+        // Delete allocations since order is cancelled
+        await queryRunner.query(`
+          DELETE FROM order_inventory_allocations 
+          WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = $1);
+        `, [orderId]);
       }
 
       await queryRunner.commitTransaction();
@@ -2150,6 +2396,372 @@ export class ApiService implements OnModuleInit {
     } catch (err) {
       console.error('Failed to fetch error logs from DB:', err);
       return [];
+    }
+  }
+
+  // ── INVENTORY BATCH & LEDGER SYSTEM SERVICES ──────────────────────
+  async createDistributor(body: any, adminEmail: string, ipAddress: string) {
+    const name = (body.name || '').trim();
+    if (!name) throw new Error('Distributor name is required');
+    
+    await this.dataSource.query(`
+      INSERT INTO distributors (name, contact_email, contact_phone, address)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (name) DO NOTHING;
+    `, [name, body.contactEmail || null, body.contactPhone || null, body.address || null]);
+    
+    const dist = await this.dataSource.query("SELECT * FROM distributors WHERE name = $1;", [name]);
+    
+    await this.writeAuditLog('CREATE_DISTRIBUTOR', 'distributors', dist[0].id, adminEmail, ipAddress, null, dist[0]);
+    return dist[0];
+  }
+
+  async getDistributors() {
+    return this.dataSource.query("SELECT * FROM distributors ORDER BY name ASC;");
+  }
+
+  async getProductBatches(productId: string) {
+    return this.dataSource.query(`
+      SELECT b.*, d.name as "distributorName"
+      FROM inventory_batches b
+      LEFT JOIN distributors d ON d.id = b.distributor_id
+      WHERE b.product_id = $1
+      ORDER BY b.received_at DESC;
+    `, [productId]);
+  }
+
+  async receiveInventoryBatchTx(
+    queryRunner: any,
+    productId: string,
+    distributorName: string,
+    purchasePrice: number,
+    sellingPrice: number,
+    quantity: number,
+    creatorEmail: string,
+    ipAddress: string
+  ) {
+    // Resolve/seed distributor
+    const distName = (distributorName || 'Default Supplier').trim();
+    let distId = null;
+    const distRes = await queryRunner.query("SELECT id FROM distributors WHERE name = $1", [distName]);
+    if (distRes.length > 0) {
+      distId = distRes[0].id;
+    } else {
+      const newDist = await queryRunner.query("INSERT INTO distributors (name) VALUES ($1) RETURNING id;", [distName]);
+      distId = newDist[0].id;
+    }
+
+    // Get product SKU
+    const prod = await queryRunner.query("SELECT sku FROM products WHERE id = $1;", [productId]);
+    const sku = prod[0]?.sku || `SKU-MIG-${Date.now()}`;
+
+    // Insert batch
+    const batchRes = await queryRunner.query(`
+      INSERT INTO inventory_batches (product_id, distributor_id, sku, purchase_price, selling_price, quantity_received, quantity_available)
+      VALUES ($1, $2, $3, $4, $5, $6, $6)
+      RETURNING id;
+    `, [productId, distId, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity)]);
+    const batchId = batchRes[0].id;
+
+    // Record ledger entry
+    await queryRunner.query(`
+      INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+      VALUES ($1, $2, 'RECEIVE', $3, $4, $5, $6, $7);
+    `, [productId, batchId, Number(quantity), Number(purchasePrice), Number(sellingPrice), `Received batch of ${quantity} units from ${distName}`, creatorEmail]);
+
+    // Update products cache
+    await queryRunner.query(`
+      UPDATE products 
+      SET total_stock = total_stock + $1,
+          purchase_price = $2,
+          selling_price = $3,
+          base_price = $3,
+          updated_at = NOW() 
+      WHERE id = $4;
+    `, [Number(quantity), Number(purchasePrice), Number(sellingPrice), productId]);
+
+    // Update inventory cache
+    await queryRunner.query(`
+      INSERT INTO inventory (product_id, quantity_available)
+      VALUES ($1, $2)
+      ON CONFLICT (product_id) DO UPDATE SET quantity_available = inventory.quantity_available + $2;
+    `, [productId, Number(quantity)]);
+
+    // Chronological Pre-order Allocation Engine queueing
+    const preorders = await queryRunner.query(`
+      SELECT oi.id as "orderItemId", oi.qty, o.id as "orderId", o.created_at
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.booking_type = 'pre_order' AND o.status = 'Confirmed'
+        AND NOT EXISTS (SELECT 1 FROM order_inventory_allocations WHERE order_item_id = oi.id)
+      ORDER BY o.created_at ASC
+      FOR UPDATE;
+    `);
+
+    let batchAvail = Number(quantity);
+    for (const po of preorders) {
+      if (batchAvail <= 0) break;
+      const allocQty = Math.min(po.qty, batchAvail);
+
+      // Create order_inventory_allocations
+      await queryRunner.query(`
+        INSERT INTO order_inventory_allocations (order_item_id, batch_id, quantity, purchase_price, selling_price)
+        VALUES ($1, $2, $3, $4, $5);
+      `, [po.orderItemId, batchId, allocQty, Number(purchasePrice), Number(sellingPrice)]);
+
+      // Record in ledger
+      await queryRunner.query(`
+        INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+        VALUES ($1, $2, $3, 'RESERVE', $4, $5, $6, $7, $8);
+      `, [productId, batchId, po.orderId, -allocQty, Number(purchasePrice), Number(sellingPrice), `Allocated pre-order for order item ${po.orderItemId}`, 'System/PreorderQueue']);
+
+      // Update batch
+      await queryRunner.query(`
+        UPDATE inventory_batches
+        SET quantity_available = quantity_available - $1,
+            quantity_reserved = quantity_reserved + $1,
+            status = CASE WHEN quantity_available - $1 = 0 THEN 'Fully Consumed'::VARCHAR ELSE 'Partially Used'::VARCHAR END,
+            updated_at = NOW()
+        WHERE id = $2;
+      `, [allocQty, batchId]);
+
+      // Update caches: deduct available and add to reserved
+      await queryRunner.query(`
+        UPDATE products
+        SET locked_stock = locked_stock + $1,
+            updated_at = NOW()
+        WHERE id = $2;
+      `, [allocQty, productId]);
+
+      await queryRunner.query(`
+        UPDATE inventory
+        SET quantity_available = quantity_available - $1,
+            quantity_reserved = quantity_reserved + $1,
+            updated_at = NOW()
+        WHERE product_id = $2;
+      `, [allocQty, productId]);
+
+      // Update order item purchase cost
+      await queryRunner.query(`
+        UPDATE order_items
+        SET purchase_price_at_purchase = $1
+        WHERE id = $2;
+      `, [Number(purchasePrice), po.orderItemId]);
+
+      batchAvail -= allocQty;
+    }
+
+    return batchId;
+  }
+
+  async receiveInventoryBatch(
+    productId: string,
+    distributorName: string,
+    purchasePrice: number,
+    sellingPrice: number,
+    quantity: number,
+    creatorEmail: string,
+    ipAddress: string
+  ) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const batchId = await this.receiveInventoryBatchTx(
+        queryRunner,
+        productId,
+        distributorName,
+        purchasePrice,
+        sellingPrice,
+        quantity,
+        creatorEmail,
+        ipAddress
+      );
+      await queryRunner.commitTransaction();
+      localCache.del('products_list_true');
+      localCache.del('products_list_false');
+      return { success: true, batchId };
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async adjustBatchInventory(batchId: string, quantityChange: number, type: string, reason: string, adminEmail: string, ipAddress: string) {
+    const change = Number(quantityChange);
+    if (!batchId || !change || isNaN(change)) {
+      throw new Error('Valid batchId and quantityChange are required');
+    }
+    
+    const allowedTypes = ['ADJUST_ADD', 'ADJUST_REMOVE', 'MARK_DAMAGED'];
+    if (!allowedTypes.includes(type)) {
+      throw new Error(`Adjustment type must be one of: ${allowedTypes.join(', ')}`);
+    }
+
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const batchRes = await queryRunner.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE;", [batchId]);
+      if (batchRes.length === 0) throw new Error('Batch not found');
+      const b = batchRes[0];
+
+      let newAvail = Number(b.quantity_available);
+      let newDamaged = Number(b.quantity_damaged);
+
+      if (type === 'ADJUST_ADD') {
+        newAvail += change;
+      } else if (type === 'ADJUST_REMOVE') {
+        if (newAvail < change) throw new Error('Insufficient available stock in batch to remove');
+        newAvail -= change;
+      } else if (type === 'MARK_DAMAGED') {
+        if (newAvail < change) throw new Error('Insufficient available stock in batch to mark as damaged');
+        newAvail -= change;
+        newDamaged += change;
+      }
+
+      // 1. Update batch quantities
+      await queryRunner.query(`
+        UPDATE inventory_batches
+        SET quantity_available = $1,
+            quantity_damaged = $2,
+            status = CASE WHEN $1 = 0 AND quantity_reserved = 0 THEN 'Fully Consumed'::VARCHAR ELSE status END,
+            updated_at = NOW()
+        WHERE id = $3;
+      `, [newAvail, newDamaged, batchId]);
+
+      // 2. Insert ledger movement entry
+      const ledgerQtyChange = (type === 'ADJUST_ADD') ? change : -change;
+      await queryRunner.query(`
+        INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+      `, [b.product_id, batchId, type, ledgerQtyChange, Number(b.purchase_price), Number(b.selling_price), reason || `Manual adjustment type ${type}`, adminEmail]);
+
+      // 3. Update products and inventory caches
+      const diffAvailable = ledgerQtyChange;
+      const diffDamaged = (type === 'MARK_DAMAGED') ? change : 0;
+
+      await queryRunner.query(`
+        UPDATE products
+        SET total_stock = total_stock + $1,
+            updated_at = NOW()
+        WHERE id = $2;
+      `, [diffAvailable, b.product_id]);
+
+      await queryRunner.query(`
+        UPDATE inventory
+        SET quantity_available = quantity_available + $1,
+            quantity_damaged = quantity_damaged + $2,
+            updated_at = NOW()
+        WHERE product_id = $3;
+      `, [diffAvailable, diffDamaged, b.product_id]);
+
+      await queryRunner.commitTransaction();
+      localCache.del('products_list_true');
+      localCache.del('products_list_false');
+
+      await this.writeAuditLog(
+        'ADJUST_INVENTORY',
+        'inventory_batches',
+        batchId,
+        adminEmail,
+        ipAddress,
+        b,
+        { quantity_available: newAvail, quantity_damaged: newDamaged, type, reason }
+      );
+
+      return { success: true };
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async runInventoryReconciliation(performedBy = 'System') {
+    console.log(`[Inventory] Running integrity reconciliation check triggered by ${performedBy}...`);
+    try {
+      const mismatches = [];
+      
+      // 1. Check if inventory cache matches batch totals
+      const batchSums = await this.dataSource.query(`
+        SELECT 
+          product_id,
+          SUM(quantity_available)::int as sum_available,
+          SUM(quantity_reserved)::int as sum_reserved,
+          SUM(quantity_sold)::int as sum_sold,
+          SUM(quantity_returned)::int as sum_returned,
+          SUM(quantity_damaged)::int as sum_damaged
+        FROM inventory_batches
+        GROUP BY product_id
+      `);
+      
+      for (const bs of batchSums) {
+        const inv = await this.dataSource.query("SELECT * FROM inventory WHERE product_id = $1", [bs.product_id]);
+        if (inv.length === 0) {
+          mismatches.push(`Product ID ${bs.product_id}: Inventory cache row missing.`);
+          continue;
+        }
+        const i = inv[0];
+        if (i.quantity_available !== bs.sum_available ||
+            i.quantity_reserved !== bs.sum_reserved ||
+            i.quantity_sold !== bs.sum_sold ||
+            i.quantity_returned !== bs.sum_returned ||
+            i.quantity_damaged !== bs.sum_damaged) {
+          mismatches.push(`Product ID ${bs.product_id}: Cache mismatch. Cache (Avail:${i.quantity_available}, Res:${i.quantity_reserved}, Sold:${i.quantity_sold}) vs Batches (Avail:${bs.sum_available}, Res:${bs.sum_reserved}, Sold:${bs.sum_sold}).`);
+        }
+      }
+      
+      // 2. Check if batch totals match ledger sums
+      const ledgerSums = await this.dataSource.query(`
+        SELECT 
+          batch_id,
+          SUM(quantity_changed)::int as total_change
+        FROM inventory_ledger
+        GROUP BY batch_id
+      `);
+      
+      for (const ls of ledgerSums) {
+        const batch = await this.dataSource.query("SELECT id, quantity_received, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged FROM inventory_batches WHERE id = $1", [ls.batch_id]);
+        if (batch.length === 0) {
+          mismatches.push(`Batch ID ${ls.batch_id}: Batch missing but exists in ledger.`);
+          continue;
+        }
+        const b = batch[0];
+        if (b.quantity_available !== ls.total_change) {
+          mismatches.push(`Batch ID ${ls.batch_id}: Ledger mismatch. Batch Available:${b.quantity_available} vs Ledger Total Change:${ls.total_change}.`);
+        }
+      }
+      
+      if (mismatches.length > 0) {
+        console.warn(`[Inventory Reconciliation] ❌ Inconsistencies detected!`, mismatches);
+        await this.createSystemNotification(
+          'Inventory Inconsistency Alert',
+          `Reconciliation check failed with ${mismatches.length} mismatches. Details: ${mismatches.slice(0, 3).join(', ')}`,
+          'critical'
+        );
+      } else {
+        console.log(`[Inventory Reconciliation] ✔ All inventory matches perfectly.`);
+      }
+      
+      await this.writeAuditLog(
+        'RUN_RECONCILIATION',
+        'inventory',
+        'reconciler',
+        performedBy,
+        '127.0.0.1',
+        null,
+        { mismatchesCount: mismatches.length, mismatches }
+      );
+      
+      return { success: mismatches.length === 0, mismatches };
+    } catch (err: any) {
+      console.error("[Inventory Reconciliation] Error executing check:", err);
+      return { success: false, error: err.message };
     }
   }
 }

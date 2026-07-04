@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS products (
     base_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_base_price CHECK (base_price >= 0),
     description TEXT,
     tags VARCHAR(50)[] DEFAULT '{}'::VARCHAR[],
+    availability_state VARCHAR(50) NOT NULL DEFAULT 'Available',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -86,17 +87,114 @@ CREATE TABLE IF NOT EXISTS product_images (
 );
 CREATE INDEX IF NOT EXISTS idx_product_images_parent ON product_images(product_id);
 
--- 5. Inventory Table (Quantities in Stock)
+-- 5. Distributors Table
+CREATE TABLE IF NOT EXISTS distributors (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) UNIQUE NOT NULL,
+    contact_email VARCHAR(255),
+    contact_phone VARCHAR(50),
+    address TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.2 Purchase Orders Table
+CREATE TABLE IF NOT EXISTS purchase_orders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    po_number VARCHAR(100) UNIQUE NOT NULL,
+    distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE RESTRICT,
+    status VARCHAR(50) NOT NULL DEFAULT 'Draft',
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 5.3 Inventory Batches Table
+CREATE TABLE IF NOT EXISTS inventory_batches (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL,
+    purchase_order_id UUID REFERENCES purchase_orders(id) ON DELETE SET NULL,
+    sku VARCHAR(100) NOT NULL,
+    purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    quantity_received INT NOT NULL DEFAULT 0 CHECK (quantity_received >= 0),
+    quantity_available INT NOT NULL DEFAULT 0 CHECK (quantity_available >= 0),
+    quantity_reserved INT NOT NULL DEFAULT 0 CHECK (quantity_reserved >= 0),
+    quantity_sold INT NOT NULL DEFAULT 0 CHECK (quantity_sold >= 0),
+    quantity_returned INT NOT NULL DEFAULT 0 CHECK (quantity_returned >= 0),
+    quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
+    status VARCHAR(50) NOT NULL DEFAULT 'Open',
+    received_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_inv_batches_fifo ON inventory_batches(product_id, received_at ASC);
+
+-- 5.4 Inventory Table (Quantities in Stock Cache)
 CREATE TABLE IF NOT EXISTS inventory (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID UNIQUE NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-    quantity_available INT NOT NULL DEFAULT 0 CONSTRAINT chk_qty_avail CHECK (quantity_available >= 0),
-    quantity_reserved INT NOT NULL DEFAULT 0 CONSTRAINT chk_qty_res CHECK (quantity_reserved >= 0),
+    product_id UUID UNIQUE NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    quantity_available INT NOT NULL DEFAULT 0 CHECK (quantity_available >= 0),
+    quantity_reserved INT NOT NULL DEFAULT 0 CHECK (quantity_reserved >= 0),
+    quantity_sold INT NOT NULL DEFAULT 0 CHECK (quantity_sold >= 0),
+    quantity_returned INT NOT NULL DEFAULT 0 CHECK (quantity_returned >= 0),
+    quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
+    quantity_locked INT NOT NULL DEFAULT 0 CHECK (quantity_locked >= 0),
     warehouse_shelf_location VARCHAR(100),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- 6. Inventory Transactions Table (Mandatory Audit Logs)
+-- 6. Inventory Ledger Table (Immutable Movement Trail)
+CREATE TABLE IF NOT EXISTS inventory_ledger (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
+    order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
+    type VARCHAR(50) NOT NULL,
+    quantity_changed INT NOT NULL,
+    purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    reason TEXT NOT NULL,
+    performed_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_product ON inventory_ledger(product_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_batch ON inventory_ledger(batch_id);
+
+-- 6.2 Inventory Snapshots Table
+CREATE TABLE IF NOT EXISTS inventory_snapshots (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    snapshot_date DATE NOT NULL,
+    quantity_available INT NOT NULL DEFAULT 0,
+    quantity_reserved INT NOT NULL DEFAULT 0,
+    quantity_sold INT NOT NULL DEFAULT 0,
+    quantity_returned INT NOT NULL DEFAULT 0,
+    quantity_damaged INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (product_id, snapshot_date)
+);
+
+-- 6.3 Cycle Count Audits Forward Compatibility
+CREATE TABLE IF NOT EXISTS inventory_cycle_counts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    audit_date DATE NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'Draft',
+    performed_by VARCHAR(255) NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS inventory_cycle_count_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    cycle_count_id UUID NOT NULL REFERENCES inventory_cycle_counts(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
+    system_qty INT NOT NULL,
+    physical_qty INT NOT NULL,
+    variance INT NOT NULL,
+    adjustment_reason TEXT
+);
+
+-- Legacy Inventory Transactions Table (Mandatory Audit Logs)
 CREATE TABLE IF NOT EXISTS inventory_transactions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
@@ -193,9 +291,22 @@ CREATE TABLE IF NOT EXISTS order_items (
     order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
     qty INT NOT NULL DEFAULT 1 CHECK (qty > 0),
-    price_at_purchase NUMERIC(12, 2) NOT NULL
+    price_at_purchase NUMERIC(12, 2) NOT NULL,
+    purchase_price_at_purchase NUMERIC(12, 2) DEFAULT 0.00
 );
 CREATE INDEX IF NOT EXISTS idx_order_items_parent ON order_items(order_id);
+
+-- 11.2 Order Inventory Allocations Table
+CREATE TABLE IF NOT EXISTS order_inventory_allocations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_item_id UUID NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    purchase_price NUMERIC(12, 2) NOT NULL,
+    selling_price NUMERIC(12, 2) NOT NULL,
+    allocated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_order_allocations_item ON order_inventory_allocations(order_item_id);
 
 -- 12. Wishlists Table
 CREATE TABLE IF NOT EXISTS wishlists (

@@ -595,6 +595,51 @@ export class ApiController {
     return this.apiService.softDeleteExpense(id, req.user.email, req.ip);
   }
 
+  // ── INVENTORY BATCH & DISTRIBUTOR ENDPOINTS ───────────────────────
+  @Post('admin/distributors')
+  @UseGuards(AuthGuard('jwt'))
+  async createDistributor(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.createDistributor(body, req.user.email, req.ip);
+  }
+
+  @Get('admin/distributors')
+  @UseGuards(AuthGuard('jwt'))
+  async getDistributors(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getDistributors();
+  }
+
+  @Post('admin/inventory/batches')
+  @UseGuards(AuthGuard('jwt'))
+  async receiveInventoryBatch(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    const { productId, distributorName, purchasePrice, sellingPrice, quantity } = body;
+    return this.apiService.receiveInventoryBatch(productId, distributorName, purchasePrice, sellingPrice, quantity, req.user.email, req.ip);
+  }
+
+  @Get('admin/inventory/batches/:productId')
+  @UseGuards(AuthGuard('jwt'))
+  async getProductBatches(@Param('productId') productId: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getProductBatches(productId);
+  }
+
+  @Post('admin/inventory/adjust')
+  @UseGuards(AuthGuard('jwt'))
+  async adjustBatchInventory(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    const { batchId, quantityChange, type, reason } = body;
+    return this.apiService.adjustBatchInventory(batchId, quantityChange, type, reason, req.user.email, req.ip);
+  }
+
+  @Post('admin/inventory/reconcile')
+  @UseGuards(AuthGuard('jwt'))
+  async triggerReconciliation(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.runInventoryReconciliation(req.user.email);
+  }
+
   // ── FOUNDER SPLITS & FINANCE LEDGER ───────────────────────────────
   @Get('admin/splits')
   @UseGuards(AuthGuard('jwt'))
