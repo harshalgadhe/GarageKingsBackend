@@ -29,10 +29,14 @@ END$$;
 -- 1. Users Table (Core Auth mapped to AWS Cognito)
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    cognito_sub VARCHAR(255) UNIQUE NOT NULL,
+    cognito_sub VARCHAR(255) UNIQUE,
     email VARCHAR(255) UNIQUE NOT NULL,
+    role VARCHAR(50) DEFAULT 'Viewer',
+    password_hash VARCHAR(255),
+    refresh_token_hash VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_users_cognito_sub ON users(cognito_sub);
 
@@ -69,8 +73,25 @@ CREATE TABLE IF NOT EXISTS products (
     description TEXT,
     tags VARCHAR(50)[] DEFAULT '{}'::VARCHAR[],
     availability_state VARCHAR(50) NOT NULL DEFAULT 'Available',
+    category VARCHAR(100),
+    purchase_price NUMERIC(12, 2) DEFAULT 0.00,
+    selling_price NUMERIC(12, 2) DEFAULT 0.00,
+    total_stock INT DEFAULT 0,
+    sold_stock INT DEFAULT 0,
+    locked_stock INT DEFAULT 0,
+    supplier VARCHAR(255),
+    arrival_date TIMESTAMP WITH TIME ZONE,
+    release_date TIMESTAMP WITH TIME ZONE,
+    status VARCHAR(50) DEFAULT 'Draft',
+    show_on_homepage BOOLEAN DEFAULT TRUE,
+    max_qty_per_customer INT DEFAULT NULL,
+    is_prebook BOOLEAN DEFAULT FALSE,
+    prebook_deposit_amount NUMERIC(12, 2) DEFAULT NULL,
+    created_by VARCHAR(255),
+    updated_by VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_products_brand_model ON products(brand, model_name);
 CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku);
@@ -143,6 +164,73 @@ CREATE TABLE IF NOT EXISTS inventory (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 7. Customers Table (CRM Record Tracks)
+CREATE TABLE IF NOT EXISTS customers (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    full_name VARCHAR(255) NOT NULL,
+    phone VARCHAR(50),
+    instagram VARCHAR(100),
+    instagram_username VARCHAR(100),
+    address TEXT,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    city VARCHAR(100) DEFAULT 'Unknown',
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_cust_phone_search ON customers(phone);
+CREATE INDEX IF NOT EXISTS idx_cust_name_search ON customers(full_name);
+
+-- 10. Orders Table (E-commerce Purchases)
+CREATE TABLE IF NOT EXISTS orders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    status order_status DEFAULT 'Pending',
+    total_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_order_total CHECK (total_price >= 0),
+    shipping_address TEXT NOT NULL,
+    tracking_number VARCHAR(100),
+    screenshot_url TEXT,
+    reservation_expires_at TIMESTAMP WITH TIME ZONE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    idempotency_key VARCHAR(255) UNIQUE,
+    courier_partner VARCHAR(100),
+    shipping_cost NUMERIC(12, 2) DEFAULT 0.00,
+    packaging_cost NUMERIC(12, 2) DEFAULT 0.00,
+    dispatch_date TIMESTAMP WITH TIME ZONE,
+    delivery_date TIMESTAMP WITH TIME ZONE,
+    booking_type VARCHAR(20) DEFAULT 'standard',
+    advance_amount NUMERIC(12, 2) DEFAULT 0.00,
+    remaining_amount NUMERIC(12, 2) DEFAULT 0.00,
+    advance_screenshot_url TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+
+-- 11. Order Items Table
+CREATE TABLE IF NOT EXISTS order_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    qty INT NOT NULL DEFAULT 1 CHECK (qty > 0),
+    price_at_purchase NUMERIC(12, 2) NOT NULL,
+    purchase_price_at_purchase NUMERIC(12, 2) DEFAULT 0.00
+);
+CREATE INDEX IF NOT EXISTS idx_order_items_parent ON order_items(order_id);
+
+-- 11.2 Order Inventory Allocations Table
+CREATE TABLE IF NOT EXISTS order_inventory_allocations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_item_id UUID NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+    batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    purchase_price NUMERIC(12, 2) NOT NULL,
+    selling_price NUMERIC(12, 2) NOT NULL,
+    allocated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_order_allocations_item ON order_inventory_allocations(order_item_id);
+
 -- 6. Inventory Ledger Table (Immutable Movement Trail)
 CREATE TABLE IF NOT EXISTS inventory_ledger (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -206,19 +294,6 @@ CREATE TABLE IF NOT EXISTS inventory_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_inv_tx_prod_type ON inventory_transactions(product_id, type);
 
--- 7. Customers Table (CRM Record Tracks)
-CREATE TABLE IF NOT EXISTS customers (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    full_name VARCHAR(255) NOT NULL,
-    phone VARCHAR(50) UNIQUE NOT NULL,
-    instagram VARCHAR(100),
-    address TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_cust_phone_search ON customers(phone);
-CREATE INDEX IF NOT EXISTS idx_cust_name_search ON customers(full_name);
-
 -- 8. Receipts Table (In-person & Manual Billing)
 CREATE TABLE IF NOT EXISTS receipts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -233,6 +308,11 @@ CREATE TABLE IF NOT EXISTS receipts (
     pending_balance NUMERIC(12, 2) DEFAULT 0.00,
     footer_note TEXT,
     pdf_url VARCHAR(512),
+    customer_name VARCHAR(255),
+    customer_phone VARCHAR(50),
+    customer_instagram VARCHAR(100),
+    customer_address TEXT,
+    order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_receipts_num ON receipts(receipt_number);
@@ -257,56 +337,12 @@ CREATE TABLE IF NOT EXISTS receipt_generation_jobs (
     max_retries INT DEFAULT 3,
     pdf_s3_url VARCHAR(512),
     error_log TEXT,
+    correlation_id VARCHAR(100),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_receipt_jobs_parent ON receipt_generation_jobs(receipt_id);
 CREATE INDEX IF NOT EXISTS idx_receipt_jobs_status ON receipt_generation_jobs(status);
-
--- 10. Orders Table (E-commerce Purchases)
-CREATE TABLE IF NOT EXISTS orders (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    status order_status DEFAULT 'Pending',
-    total_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_order_total CHECK (total_price >= 0),
-    shipping_address TEXT NOT NULL,
-    tracking_number VARCHAR(100),
-    screenshot_url TEXT,
-    reservation_expires_at TIMESTAMP WITH TIME ZONE,
-    deleted_at TIMESTAMP WITH TIME ZONE,
-    idempotency_key VARCHAR(255) UNIQUE,
-    courier_partner VARCHAR(100),
-    shipping_cost NUMERIC(12, 2) DEFAULT 0.00,
-    packaging_cost NUMERIC(12, 2) DEFAULT 0.00,
-    dispatch_date TIMESTAMP WITH TIME ZONE,
-    delivery_date TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
-
--- 11. Order Items Table
-CREATE TABLE IF NOT EXISTS order_items (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-    qty INT NOT NULL DEFAULT 1 CHECK (qty > 0),
-    price_at_purchase NUMERIC(12, 2) NOT NULL,
-    purchase_price_at_purchase NUMERIC(12, 2) DEFAULT 0.00
-);
-CREATE INDEX IF NOT EXISTS idx_order_items_parent ON order_items(order_id);
-
--- 11.2 Order Inventory Allocations Table
-CREATE TABLE IF NOT EXISTS order_inventory_allocations (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_item_id UUID NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
-    batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
-    quantity INT NOT NULL CHECK (quantity > 0),
-    purchase_price NUMERIC(12, 2) NOT NULL,
-    selling_price NUMERIC(12, 2) NOT NULL,
-    allocated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_order_allocations_item ON order_inventory_allocations(order_item_id);
 
 -- 12. Wishlists Table
 CREATE TABLE IF NOT EXISTS wishlists (
@@ -318,30 +354,33 @@ CREATE TABLE IF NOT EXISTS wishlists (
 );
 CREATE INDEX IF NOT EXISTS idx_wishlists_user ON wishlists(user_id);
 
--- 13. Garage Items Table (Collection Tracking)
+-- 13. Garage Items Table (Collection Vault)
 CREATE TABLE IF NOT EXISTS garage_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-    custom_nickname VARCHAR(100),
-    purchase_price NUMERIC(12, 2),
-    condition_grade VARCHAR(50) DEFAULT 'Card Mint',
-    is_featured BOOLEAN DEFAULT FALSE,
-    acquired_date DATE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    brand VARCHAR(100) NOT NULL,
+    model_name VARCHAR(255) NOT NULL,
+    scale VARCHAR(20) DEFAULT '1:64',
+    series VARCHAR(255),
+    rarity_level VARCHAR(100) DEFAULT 'Standard Edition',
+    description TEXT,
+    condition_grade VARCHAR(100) NOT NULL,
+    is_custom BOOLEAN DEFAULT FALSE,
+    estimated_value NUMERIC(12, 2) DEFAULT 0.00,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_garage_user_search ON garage_items(user_id);
-CREATE INDEX IF NOT EXISTS idx_garage_user_featured ON garage_items(user_id, is_featured);
+CREATE INDEX IF NOT EXISTS idx_garage_user ON garage_items(user_id);
 
--- 14. Garage Item Images Table (Collector Custom Photos)
+-- 14. Garage Item Images Table
 CREATE TABLE IF NOT EXISTS garage_item_images (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     garage_item_id UUID NOT NULL REFERENCES garage_items(id) ON DELETE CASCADE,
-    thumbnail_url TEXT NOT NULL,
-    full_url TEXT NOT NULL,
+    image_url TEXT NOT NULL,
+    is_primary BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_garage_item_images_parent ON garage_item_images(garage_item_id);
+CREATE INDEX IF NOT EXISTS idx_garage_images_parent ON garage_item_images(garage_item_id);
 
 -- 15. Drops Table (Timed Releases)
 CREATE TABLE IF NOT EXISTS drops (
@@ -472,6 +511,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     entity_id VARCHAR(100) NOT NULL,
     before_state JSONB,
     after_state JSONB,
+    correlation_id VARCHAR(100),
+    user_id UUID,
+    category VARCHAR(50),
     timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -542,9 +584,62 @@ CREATE TABLE IF NOT EXISTS performance_metrics (
 CREATE INDEX IF NOT EXISTS idx_perf_metrics_type_timestamp ON performance_metrics(metric_type, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_perf_metrics_feature ON performance_metrics(feature);
 
--- Alter existing tables to add correlation columns
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(100);
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS user_id UUID;
-ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS category VARCHAR(50);
+-- 28. Expenses Table
+CREATE TABLE IF NOT EXISTS expenses (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title VARCHAR(255) NOT NULL,
+    amount NUMERIC(12, 2) NOT NULL,
+    category VARCHAR(100) NOT NULL,
+    paid_by VARCHAR(100) NOT NULL,
+    date DATE NOT NULL DEFAULT CURRENT_DATE,
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_cat ON expenses(category);
+CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 
-ALTER TABLE receipt_generation_jobs ADD COLUMN IF NOT EXISTS correlation_id VARCHAR(100);
+-- 29. Split Settlements Table
+CREATE TABLE IF NOT EXISTS split_settlements (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    from_founder VARCHAR(100) NOT NULL,
+    to_founder VARCHAR(100) NOT NULL,
+    amount NUMERIC(12, 2) NOT NULL,
+    notes TEXT,
+    date DATE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 30. Reservations Table (Legacy Checkout holds)
+CREATE TABLE IF NOT EXISTS reservations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
+    quantity INT DEFAULT 1,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    status VARCHAR(50) DEFAULT 'Active',
+    idempotency_key VARCHAR(255) UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 31. System Notifications Table
+CREATE TABLE IF NOT EXISTS system_notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    type VARCHAR(50) DEFAULT 'info',
+    order_id UUID DEFAULT NULL REFERENCES orders(id) ON DELETE SET NULL,
+    is_read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 32. Homepage Sections Table
+CREATE TABLE IF NOT EXISTS homepage_sections (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    section_name VARCHAR(100) UNIQUE NOT NULL,
+    is_visible BOOLEAN DEFAULT TRUE,
+    display_order INT DEFAULT 0,
+    metadata JSONB DEFAULT '{}'::JSONB
+);
