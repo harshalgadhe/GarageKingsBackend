@@ -17,7 +17,7 @@ export const databaseConfig = (): TypeOrmModuleOptions => ({
     max: (process.env.IS_OFFLINE || process.env.LAMBDA_TASK_ROOT) ? 1 : 10, // Enforce 1 active socket in Lambda containers, support 10 in standard monolithic daemon mode
     min: 0, // Allow connection pool to completely drain when idle
     idleTimeoutMillis: 1000, // Instantly close idle connections
-    connectionTimeoutMillis: 1500, // Timeout queries quickly to free up connection pools
+    connectionTimeoutMillis: 10000, // Timeout queries after 10s to free up connection pools
     maxUses: 7500 // Recycle connections after 7,500 queries to prevent memory leaks
   }
 });
