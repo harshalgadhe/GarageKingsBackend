@@ -16,7 +16,7 @@ const prebookDefaults = {
   'GTSUPRA': 1700,
   'GTMAZDA': 1700,
   'GTMUSTANG': 1700,
-  'PRPAGANI': 2000,
+  'PRAGANI': 2000,
   'PR037': 1700,
   'GFCC1957': 3800,
   'CRVAN': 2200
@@ -48,14 +48,28 @@ function getNumericId(orderIdStr) {
   return match ? parseInt(match[0], 10) : null;
 }
 
-function normalizePhone(rawPhone) {
-  if (!rawPhone) return '';
-  return rawPhone.toString().replace(/[^0-9]/g, '');
+function normalizePhone(phone) {
+  if (!phone) return '';
+  return phone.toString().replace(/[^0-9]/g, '');
 }
 
-function normalizeText(text) {
-  if (!text) return '';
-  return text.toString().trim().replace(/\s+/g, ' ');
+function normalizeName(name) {
+  if (!name) return '';
+  return name.trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .split(' ')
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
+function nullifyNA(val) {
+  if (val === undefined || val === null) return null;
+  const clean = val.toString().trim();
+  if (clean === '' || clean.toUpperCase() === 'NA' || clean.toUpperCase() === 'N/A') {
+    return null;
+  }
+  return clean;
 }
 
 async function run() {
@@ -100,371 +114,269 @@ async function run() {
     manualReviewRequired: []
   };
 
+  const catalog = new Map();
+  const batches = [];
+  const duplicateSKUs = new Set();
+  
+  for (let i = 0; i < rawProducts.length; i++) {
+    const row = rawProducts[i];
+    if (!row['SKU ID']) {
+      report.productsSkipped++;
+      continue;
+    }
+    
+    const sku = (row['SKU ID'].toString().trim()).toUpperCase();
+    if (!sku) {
+      report.malformedSKUs.push(`Row ${i + 2}: Malformed SKU ID`);
+      continue;
+    }
+
+    const brand = row['Brand'] ? row['Brand'].toString().trim() : 'Unknown';
+    const name = row['Product Name'] ? row['Product Name'].toString().trim() : 'Unnamed Product';
+    const series = nullifyNA(row['Series']);
+    const scale = nullifyNA(row['Scale']) || '1:64';
+    const color = nullifyNA(row['Color Variant']);
+    const purchasePrice = Number(row['Purchase Price'] || 0);
+    const sellingPrice = Number(row['Selling Price'] || 0);
+    const qtyPurchased = Number(row['Quantity Purchased'] || 0);
+    const qtySold = Number(row['Quantity Sold'] || 0);
+    const qtyAvailable = Number(row['Quantity Available'] || (qtyPurchased - qtySold));
+
+    // Validate inventory equation: quantity_received = quantity_sold + quantity_available
+    if (qtyPurchased !== (qtySold + qtyAvailable)) {
+      const msg = `SKU: ${sku} - Quantity Purchased (${qtyPurchased}) does not equal Sold (${qtySold}) + Available (${qtyAvailable})`;
+      report.inventoryMismatches.push(msg);
+      report.warnings.push(msg);
+    }
+
+    if (catalog.has(sku)) {
+      report.duplicateProducts++;
+      duplicateSKUs.add(sku);
+      const prod = catalog.get(sku);
+      prod.totalStock += qtyPurchased;
+      prod.soldStock += qtySold;
+      prod.purchasePrice = purchasePrice;
+      prod.price = sellingPrice;
+    } else {
+      catalog.set(sku, {
+        sku,
+        brand,
+        name,
+        series,
+        scale,
+        color,
+        purchasePrice,
+        price: sellingPrice,
+        totalStock: qtyPurchased,
+        soldStock: qtySold,
+        lane: series || 'Standard Edition',
+        category: brand.toLowerCase().includes('hotwheels') ? 'Mainline' : 'JDM',
+        tags: series ? [series] : []
+      });
+    }
+
+    batches.push({
+      sku,
+      purchasePrice,
+      sellingPrice,
+      qtyPurchased,
+      qtySold,
+      qtyAvailable,
+      purchaseDate: parseExcelDate(row['Purchase Date'])
+    });
+    report.inventoryBatchesImported++;
+  }
+
+  // Resolve Customers & Orders
+  const resolvedCustomers = [];
+  const orderList = [];
+  const uniqueOrders = new Set();
+  const phoneCustomerMap = new Map();
+  const emailCustomerMap = new Map();
+  const nameCustomerMap = new Map();
+
+  for (let i = 0; i < rawOrders.length; i++) {
+    const row = rawOrders[i];
+    const rawId = row['Order ID'];
+    if (!rawId) {
+      report.rowsSkipped++;
+      continue;
+    }
+
+    const numericId = getNumericId(rawId);
+    if (!numericId) {
+      report.rowsSkipped++;
+      continue;
+    }
+
+    if (uniqueOrders.has(numericId)) {
+      report.duplicateOrders++;
+      continue;
+    }
+    uniqueOrders.add(numericId);
+
+    const name = normalizeName(row['Name']);
+    const phone = normalizePhone(row['Phone No']);
+    const address = row['Address'] ? row['Address'].toString().trim() : 'No Address';
+    const email = row['Email ID'] ? row['Email ID'].toString().trim().toLowerCase() : `migrated_${numericId}@garagekings.in`;
+    const skuRaw = row['Model ID (SKU)'] ? row['Model ID (SKU)'].toString().trim().toUpperCase() : '';
+    const dateVal = parseExcelDate(row['Date']);
+
+    const skuList = skuRaw.split(',').map(s => s.trim()).filter(Boolean);
+    const validSkus = [];
+    for (const s of skuList) {
+      if (catalog.has(s)) {
+        validSkus.push(s);
+      } else {
+        report.unknownSKUs.push(`Order ID ${numericId}: SKU ${s} not found in Inventory sheet`);
+      }
+    }
+
+    const totalAmount = Number(row['Total Amount'] || 0);
+    const advancePaid = Number(row['Advance Amount'] || 0);
+    const pendingBalance = Number(row['Pending balance'] || (totalAmount - advancePaid));
+
+    if (totalAmount !== (advancePaid + pendingBalance)) {
+      report.financialMismatches.push(`Order ID ${numericId}: Total (${totalAmount}) != Advance (${advancePaid}) + Pending (${pendingBalance})`);
+    }
+
+    // Resolve Customer
+    let customer = null;
+    if (phone && phoneCustomerMap.has(phone)) {
+      customer = phoneCustomerMap.get(phone);
+    } else if (email && emailCustomerMap.has(email)) {
+      customer = emailCustomerMap.get(email);
+    } else if (name && nameCustomerMap.has(name)) {
+      customer = nameCustomerMap.get(name);
+    }
+
+    if (!customer) {
+      customer = { id: `CUST_${Date.now()}_${numericId}`, name, phone, email, address };
+      resolvedCustomers.push(customer);
+      if (phone) phoneCustomerMap.set(phone, customer);
+      if (email) emailCustomerMap.set(email, customer);
+      if (name) nameCustomerMap.set(name, customer);
+      report.customersCreated++;
+    } else {
+      report.customersMatched++;
+    }
+
+    orderList.push({
+      excelOrderId: numericId,
+      customer,
+      address,
+      phone,
+      orderDate: dateVal,
+      skuList: validSkus,
+      totalAmount,
+      advancePaid,
+      pendingBalance,
+      bookingType: (row['Status'] && row['Status'].toString().toLowerCase().includes('pre')) ? 'pre_order' : 'standard',
+      status: row['Status'] ? row['Status'].toString().trim() : 'Done',
+      receiptDone: !!row['PDF Receipt Generated (Y/N)']
+    });
+    report.ordersImported++;
+    report.orderItemsImported += validSkus.length;
+  }
+
+  // Parse Expenses
+  const expenses = [];
+  for (let i = 0; i < rawExpenses.length; i++) {
+    const row = rawExpenses[i];
+    if (!row['Expense Description']) continue;
+
+    expenses.push({
+      description: row['Expense Description'].toString().trim(),
+      amount: Number(row['Amount'] || 0),
+      category: row['Category'] ? row['Category'].toString().trim() : 'Operational',
+      doneBy: row['Done by'] ? normalizeName(row['Done by']) : 'System',
+      date: parseExcelDate(row['Date'])
+    });
+    report.expensesImported++;
+  }
+
+  console.log("✔ Validation complete. Ready to perform writes.");
+
+  if (!isWrite) {
+    console.log("PHASE 1 COMPLETE: Dry validation check passed.");
+    process.exit(0);
+  }
+
+  // PHASE 2: WRITE TO DB
+  console.log("Connecting to PostgreSQL pool for final writes...");
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false
   });
+
   const client = await pool.connect();
-
   try {
-    // 1. Process Products Catalog and Batches
-    const catalog = new Map(); // sku -> product details
-    const batches = []; // list of all inventory batches
-    
-    for (let i = 0; i < rawProducts.length; i++) {
-      const row = rawProducts[i];
-      if (!row['SKU ID']) {
-        report.rowsSkipped++;
-        continue;
-      }
-      
-      const sku = normalizeText(row['SKU ID']).toUpperCase();
-      if (!sku || sku === 'NA') {
-        report.malformedSKUs.push(`Row ${i + 2}: Malformed or empty SKU`);
-        continue;
-      }
-
-      const brand = normalizeText(row['Brand']) || 'Unknown';
-      const name = normalizeText(row['Product Name']) || 'Unnamed Product';
-      const series = normalizeText(row['Series']) || 'NA';
-      const scale = normalizeText(row['Scale']) || '1:64';
-      const color = normalizeText(row['Color Variant']) || 'NA';
-      const purchasePrice = Number(row['Purchase Price'] || 0);
-      const sellingPrice = Number(row['Selling Price'] || 0);
-      const qtyPurchased = Number(row['Quantity Purchased'] || 0);
-      const qtySold = Number(row['Quantity Sold'] || 0);
-      const qtyAvailable = Number(row['Quantity Available'] || (qtyPurchased - qtySold));
-
-      // Validate FIFO inventory formula: quantity_received = quantity_sold + quantity_available
-      if (qtyPurchased !== (qtySold + qtyAvailable)) {
-        const msg = `SKU: ${sku} - Quantity Purchased (${qtyPurchased}) does not equal Sold (${qtySold}) + Available (${qtyAvailable})`;
-        report.inventoryMismatches.push(msg);
-        report.warnings.push(msg);
-      }
-
-      if (catalog.has(sku)) {
-        // Product SKU duplicate in sheet: means multiple batches of the same SKU
-        report.duplicateProducts++;
-        const prod = catalog.get(sku);
-        prod.totalStock += qtyPurchased;
-        prod.soldStock += qtySold;
-        prod.purchasePrice = purchasePrice; // Use latest purchase price
-        prod.price = sellingPrice; // Use latest selling price
-      } else {
-        report.productsCreated++;
-        catalog.set(sku, {
-          sku,
-          brand,
-          name,
-          series,
-          scale,
-          color,
-          purchasePrice,
-          price: sellingPrice,
-          totalStock: qtyPurchased,
-          soldStock: qtySold,
-          lane: series === 'NA' ? 'Standard Edition' : series,
-          category: brand.toLowerCase().includes('hotwheels') ? 'Mainline' : 'JDM',
-          tags: series !== 'NA' ? [series] : []
-        });
-      }
-
-      batches.push({
-        sku,
-        purchasePrice,
-        sellingPrice,
-        qtyPurchased,
-        qtySold,
-        qtyAvailable,
-        purchaseDate: parseExcelDate(row['Purchase Date'])
-      });
-      report.inventoryBatchesImported++;
-    }
-
-    // 2. Process Customers and Orders
-    const customers = new Map(); // email or phone -> customer id / info
-    const orders = [];
-    const uniqueOrdersSet = new Set();
-
-    for (let i = 0; i < rawOrders.length; i++) {
-      const row = rawOrders[i];
-      if (!row['Order ID']) {
-        report.rowsSkipped++;
-        continue;
-      }
-
-      const excelOrderId = normalizeText(row['Order ID']);
-      if (uniqueOrdersSet.has(excelOrderId)) {
-        report.duplicateOrders++;
-        report.warnings.push(`Duplicate Order ID found in sheet: ${excelOrderId}`);
-        continue;
-      }
-      uniqueOrdersSet.add(excelOrderId);
-
-      const customerName = normalizeText(row['Customer Name ']) || 'Guest Customer';
-      const rawPhone = row['Phone Number'] ? row['Phone Number'].toString().trim() : '';
-      const phone = rawPhone && rawPhone !== 'NA' ? rawPhone : `unknown_${excelOrderId}`;
-      const address = normalizeText(row['Address']) || 'No Address';
-      const skusColumn = normalizeText(row['SUK IDs']);
-      const amountPaid = Number(row['Amount Paid'] || 0);
-      const status = normalizeText(row['Status']) || 'Pending';
-      const receiptDone = row['Receipt'] ? row['Receipt'].toString().trim() === 'Done' : false;
-      const orderDate = parseExcelDate(row['Date']);
-      const type = normalizeText(row['Type']) || 'Order';
-
-      const cleanPhone = normalizePhone(phone);
-      const emailClean = `${cleanPhone || excelOrderId}@guest.garagekings.in`.toLowerCase();
-
-      // Check Customer Matches
-      let customerMatchKey = cleanPhone || emailClean;
-      let isNewCustomer = false;
-      if (customers.has(customerMatchKey)) {
-        report.customersMatched++;
-      } else {
-        isNewCustomer = true;
-        report.customersCreated++;
-        customers.set(customerMatchKey, {
-          name: customerName,
-          phone: phone,
-          address: address,
-          email: emailClean
-        });
-      }
-
-      // Parse and resolve SKUs
-      const skuList = skusColumn.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-      for (const s of skuList) {
-        if (!catalog.has(s)) {
-          report.unknownSKUs.push(`Order ${excelOrderId}: SKU "${s}" not found in Product Catalog`);
-          // Create virtual products if missing to maintain referential integrity
-          catalog.set(s, {
-            sku: s,
-            brand: 'Unknown',
-            name: `Product ${s} (Unresolved)`,
-            series: 'NA',
-            scale: '1:64',
-            color: 'NA',
-            purchasePrice: 0,
-            price: amountPaid,
-            totalStock: 0,
-            soldStock: 0,
-            lane: 'Standard Edition',
-            category: 'JDM',
-            tags: []
-          });
-        }
-        report.orderItemsImported++;
-      }
-
-      // Calculate pre-order metrics or standard metrics
-      const bookingType = (type === 'Pre-Booking') ? 'pre_order' : 'standard';
-      let advancePaid = amountPaid;
-      let pendingBalance = 0;
-      let totalAmount = amountPaid;
-
-      if (type === 'Pre-Booking') {
-        let calculatedRemaining = 0;
-        skuList.forEach(s => {
-          if (prebookDefaults[s]) {
-            calculatedRemaining += prebookDefaults[s];
-          } else {
-            calculatedRemaining += 1700;
-          }
-        });
-        advancePaid = amountPaid;
-        pendingBalance = calculatedRemaining;
-        totalAmount = advancePaid + pendingBalance;
-      }
-
-      // Validate Financial integrity: Order Total matches paid + pending
-      if (totalAmount !== (advancePaid + pendingBalance)) {
-        report.financialMismatches.push(`Order ${excelOrderId}: Total amount mismatch (${totalAmount} vs paid:${advancePaid} + pending:${pendingBalance})`);
-      }
-
-      orders.push({
-        excelOrderId,
-        customerName,
-        phone,
-        address,
-        emailClean,
-        skuList,
-        amountPaid,
-        status,
-        receiptDone,
-        orderDate,
-        bookingType,
-        advancePaid,
-        pendingBalance,
-        totalAmount
-      });
-      report.ordersImported++;
-    }
-
-    // 3. Process Expenses
-    const expenses = [];
-    for (let i = 0; i < rawExpenses.length; i++) {
-      const row = rawExpenses[i];
-      if (!row['Description']) continue;
-
-      const description = normalizeText(row['Description']);
-      const doneBy = normalizeText(row['Done By']) || 'Unknown';
-      const amount = Number(row['Amount'] || 0);
-      const settled = row['Settled '] ? row['Settled '].toString().trim().toLowerCase() === 'yes' : false;
-
-      let category = 'Uncategorized';
-      const descLower = description.toLowerCase();
-      if (descLower.includes('shipping') || descLower.includes('delivery') || descLower.includes('shiprocket')) {
-        category = 'Shipping';
-      } else if (descLower.includes('wrap') || descLower.includes('packaging') || descLower.includes('box')) {
-        category = 'Packaging';
-      } else if (descLower.includes('marketing')) {
-        category = 'Marketing';
-      } else if (descLower.includes('website') || descLower.includes('host') || descLower.includes('domain')) {
-        category = 'Operations';
-      }
-
-      expenses.push({
-        description,
-        amount,
-        category,
-        doneBy,
-        settled
-      });
-      report.expensesImported++;
-    }
-
-    // 4. Generate Migration Report markdown content
-    let md = `# Database Migration & Integrity Audit Report
-
-Generated on: ${new Date().toLocaleString()}
-
-## Executive Summary
-This report summarizes the dry-run validation results of the historical Excel workbook import to the GarageKings PostgreSQL database.
-
-| Metric | Count |
-| :--- | :--- |
-| **Products (SKUs) Created** | ${report.productsCreated} |
-| **Duplicate Products Detected** | ${report.duplicateProducts} |
-| **Inventory Batches Found** | ${report.inventoryBatchesImported} |
-| **Customers Created** | ${report.customersCreated} |
-| **Matched Customers** | ${report.customersMatched} |
-| **Duplicate Orders Logged** | ${report.duplicateOrders} |
-| **Orders Prepared** | ${report.ordersImported} |
-| **Order Items Prepared** | ${report.orderItemsImported} |
-| **Expenses Prepared** | ${report.expensesImported} |
-| **Skipped Empty Rows** | ${report.rowsSkipped} |
-
----
-
-## Integrity & Verification Checks
-
-### 1. FIFO Inventory Variance Check (Quantity Received = Sold + Available)
-${report.inventoryMismatches.length === 0 ? '✔ **PASSED**: All inventory rows reconcile perfectly.' : `❌ **WARNING**: ${report.inventoryMismatches.length} mismatches detected.
-` + report.inventoryMismatches.map(m => `- ${m}`).join('\n')}
-
-### 2. Malformed or Unknown SKUs Check
-${report.unknownSKUs.length === 0 ? '✔ **PASSED**: All ordered SKUs resolved in the product catalog.' : `❌ **WARNING**: ${report.unknownSKUs.length} unknown SKUs references in orders.
-` + report.unknownSKUs.map(u => `- ${u}`).join('\n')}
-
-### 3. Financial Totals Audit
-${report.financialMismatches.length === 0 ? '✔ **PASSED**: Order totals match line item sums.' : `❌ **WARNING**: ${report.financialMismatches.length} mismatches.
-` + report.financialMismatches.map(m => `- ${m}`).join('\n')}
-
----
-
-## Dry Run Status: **SUCCESSFUL**
-No database modifications were made during this validation pass. All relations are checked and ready for migration.
-`;
-
-    fs.writeFileSync(reportPath, md);
-    console.log(`✔ Phase 1 Migration Report written to: ${reportPath}`);
-
-    // Stop if dry run
-    if (!isWrite) {
-      console.log(`Dry run check complete. Please inspect the migration report artifact.`);
-      return;
-    }
-
-    // PHASE 2: Actual Database Migration Writes
-    console.log("Executing Phase 2: Writing normalized records inside a SQL Transaction...");
     await client.query('BEGIN');
+    console.log("Database transaction started.");
 
-    // Rebuild tables
+    console.log("Truncating all transactional tables to perform a clean backfill...");
     await client.query(`
       TRUNCATE TABLE 
-        expenses, 
         order_inventory_allocations,
-        order_items, 
-        orders, 
-        inventory_transactions, 
         inventory_ledger,
-        inventory_snapshots,
-        inventory, 
-        product_images, 
-        products, 
-        customers, 
-        profiles, 
-        users,
-        system_notifications,
+        inventory_batches,
+        inventory,
+        product_images,
+        products,
+        order_items,
+        orders,
+        customers,
         split_settlements,
+        expenses,
+        cash_ledger,
+        cash_accounts,
         receipts,
         receipt_items,
-        receipt_generation_jobs,
         distributors,
-        purchase_orders,
-        inventory_cycle_counts,
-        inventory_cycle_count_items
-      RESTART IDENTITY CASCADE;
+        users
+      CASCADE;
     `);
 
-    // Seed default distributor
-    const distInsert = await client.query(`
-      INSERT INTO distributors (name)
-      VALUES ('Historical Migration')
-      RETURNING id;
+    // Seed default Cash Accounts
+    console.log("Seeding default cash accounts...");
+    const accountsRes = await client.query(`
+      INSERT INTO cash_accounts (name, type, opening_balance, currency, display_order)
+      VALUES 
+        ('GarageKings Business Bank', 'Bank', 0.00, 'INR', 1),
+        ('GarageKings UPI', 'UPI', 0.00, 'INR', 2),
+        ('Cash Drawer', 'Cash Drawer', 0.00, 'INR', 3),
+        ('Petty Cash', 'Petty Cash', 0.00, 'INR', 4)
+      RETURNING id, name;
     `);
-    const defaultDistId = distInsert.rows[0].id;
+    const accountMap = {};
+    accountsRes.rows.forEach(r => {
+      accountMap[r.name] = r.id;
+    });
+    const defaultBankId = accountMap['GarageKings Business Bank'];
+    const defaultUpiId = accountMap['GarageKings UPI'];
+    const defaultPettyId = accountMap['Petty Cash'];
 
-    // Seed admin founders
-    const founders = [
-      { email: 'harshalgadhe123@gmail.com', name: 'Harshal', cognito: '7113cdfa-d021-7082-178e-ec3f8ff840c4' },
-      { email: 'anutosh@garagekings.com', name: 'Anutosh', cognito: 'cognito-sub-anutosh' },
-      { email: 'sanchit@garagekings.com', name: 'Sanchit', cognito: 'cognito-sub-sanchit' },
-      { email: 'anish@garagekings.com', name: 'Anish', cognito: 'cognito-sub-anish' }
-    ];
-    for (const f of founders) {
-      const userRes = await client.query(`
-        INSERT INTO users (email, role, cognito_sub)
-        VALUES ($1, 'Owner', $2)
-        RETURNING id;
-      `, [f.email, f.cognito]);
-      const userId = userRes.rows[0].id;
+    // Seed default supplier
+    const distRes = await client.query("INSERT INTO distributors (name) VALUES ('Initial Seed Supplier') RETURNING id;");
+    const defaultDistId = distRes.rows[0].id;
 
-      await client.query(`
-        INSERT INTO profiles (user_id, username, display_name, avatar_url)
-        VALUES ($1, $2, $3, $4);
-      `, [userId, f.name.toLowerCase(), f.name, `https://ui-avatars.com/api/?name=${f.name}`]);
-    }
-
-    // Insert Products Catalog
+    // Insert Products
     const productIdsMap = {};
-    for (const sku of catalog.keys()) {
-      const p = catalog.get(sku);
-      const isPrebook = p.sku.toUpperCase().startsWith('PRE') || p.sku.toUpperCase().includes('PREBOOK') || p.name.toLowerCase().includes('pre-booking');
-      
+    for (const [sku, p] of catalog.entries()) {
+      const isPrebook = prebookDefaults[sku] !== undefined;
       const prodRes = await client.query(`
-        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, sold_stock, status, is_prebook, availability_state)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'Published', $15, $16)
+        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, sold_stock, is_prebook, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING id;
       `, [
-        p.sku,
+        sku,
         p.brand,
         p.name,
         p.series,
         p.scale,
-        p.lane,
+        p.lane || 'Standard Edition',
         p.price,
-        `Premium highly-detailed scale model. Color Variant: ${p.color}.`,
+        `Premium scale model. Color: ${p.color || 'NA'}.`,
         p.tags,
         p.category,
         p.purchasePrice,
@@ -472,25 +384,25 @@ No database modifications were made during this validation pass. All relations a
         p.totalStock,
         p.soldStock,
         isPrebook,
-        isPrebook ? 'Pre-order' : 'Available'
+        isPrebook ? 'Prebook' : 'Available'
       ]);
-      productIdsMap[sku] = prodRes.rows[0].id;
+      const productId = prodRes.rows[0].id;
+      productIdsMap[sku] = productId;
 
       await client.query(`
         INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
         VALUES ($1, '/placeholder-car.png', '/placeholder-car.png', '/placeholder-car.png', true);
-      `, [prodRes.rows[0].id]);
+      `, [productId]);
 
-      // Core inventory cache
       const qtyAvailable = Math.max(0, p.totalStock - p.soldStock);
       await client.query(`
         INSERT INTO inventory (product_id, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged, quantity_locked)
         VALUES ($1, $2, 0, $3, 0, 0, 0);
-      `, [prodRes.rows[0].id, qtyAvailable, p.soldStock]);
+      `, [productId, qtyAvailable, p.soldStock]);
     }
 
-    // Insert Batches & Ledger Logs
-    const batchMap = {}; // sku -> batch id
+    // Insert Batches & Ledger Trails
+    const batchMap = {};
     for (const b of batches) {
       const productId = productIdsMap[b.sku];
       const batchRes = await client.query(`
@@ -512,13 +424,26 @@ No database modifications were made during this validation pass. All relations a
       const batchId = batchRes.rows[0].id;
       batchMap[b.sku] = batchId;
 
-      // Log Receive
       await client.query(`
         INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by, created_at)
         VALUES ($1, $2, 'RECEIVE', $3, $4, $5, 'Initial batch receipt import', 'System', $6);
       `, [productId, batchId, b.qtyPurchased, b.purchasePrice, b.sellingPrice, b.purchaseDate]);
 
-      // Log Depletion if sold
+      // Cash Ledger entry for Inventory Purchase
+      const totalCost = Number(b.qtyPurchased) * Number(b.purchasePrice);
+      if (totalCost > 0 && defaultBankId) {
+        await client.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, 'Inventory Purchase', 'Completed', 'Inventory Batch', $3, $4, 'Imported during historical migration', $5, 'System');
+        `, [
+          defaultBankId,
+          -totalCost,
+          batchId,
+          `Inventory purchase: ${b.qtyPurchased} units of SKU ${b.sku}`,
+          b.purchaseDate
+        ]);
+      }
+
       if (b.qtySold > 0) {
         await client.query(`
           INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by, created_at)
@@ -528,36 +453,34 @@ No database modifications were made during this validation pass. All relations a
     }
 
     // Insert Customers & Orders
-    const customerIdsMap = {};
-    const userIdsMap = {};
+    const customerDbIdsMap = new Map();
+    const userDbIdsMap = new Map();
 
-    for (const o of orders) {
-      const cleanPhone = normalizePhone(o.phone);
-      const customerMatchKey = cleanPhone || o.emailClean;
+    for (const o of orderList) {
+      const customerKey = o.customer.phone || o.customer.email;
+      let customerId = customerDbIdsMap.get(customerKey);
 
-      let customerId = customerIdsMap[customerMatchKey];
       if (!customerId) {
         const custRes = await client.query(`
           INSERT INTO customers (full_name, phone, address, email, city)
           VALUES ($1, $2, $3, $4, 'Unknown')
           RETURNING id;
-        `, [o.customerName, o.phone, o.address, o.emailClean]);
+        `, [o.customer.name, o.customer.phone || null, o.customer.address, o.customer.email]);
         customerId = custRes.rows[0].id;
-        customerIdsMap[customerMatchKey] = customerId;
+        customerDbIdsMap.set(customerKey, customerId);
       }
 
-      let userId = userIdsMap[customerMatchKey];
+      let userId = userDbIdsMap.get(customerKey);
       if (!userId) {
         const userRes = await client.query(`
           INSERT INTO users (email, role, cognito_sub)
           VALUES ($1, 'Viewer', $2)
           RETURNING id;
-        `, [o.emailClean, `guest_${customerId}`]);
+        `, [o.customer.email, `guest_${customerId}`]);
         userId = userRes.rows[0].id;
-        userIdsMap[customerMatchKey] = userId;
+        userDbIdsMap.set(customerKey, userId);
       }
 
-      // Map Order Status
       let dbStatus = 'Pending';
       if (o.pendingBalance === 0 && o.status.toLowerCase() === 'done') {
         dbStatus = 'Delivered';
@@ -581,6 +504,40 @@ No database modifications were made during this validation pass. All relations a
       ]);
       const orderId = orderInsertRes.rows[0].id;
 
+      // Cash Ledger entry for Order Payment
+      const isPre = o.bookingType === 'pre_order';
+      const ledgerType = isPre ? 'Pre-order Advance' : 'Customer Payment';
+      const ledgerAmount = Number(o.advancePaid);
+
+      if (ledgerAmount > 0 && defaultUpiId) {
+        await client.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, $3, 'Completed', 'Order', $4, $5, 'Imported during historical migration', $6, 'System');
+        `, [
+          defaultUpiId,
+          ledgerAmount,
+          ledgerType,
+          orderId,
+          `Payment verified for order ${orderId}`,
+          o.orderDate
+        ]);
+
+        const isPaidFull = dbStatus === 'Delivered' || dbStatus === 'Confirmed' || dbStatus === 'Shipped';
+        const remainingPaid = Number(o.totalAmount) - Number(o.advancePaid) - Number(o.pendingBalance);
+        if (isPaidFull && remainingPaid > 0) {
+          await client.query(`
+            INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+            VALUES ($1, $2, 'Pre-order Remaining Payment', 'Completed', 'Order', $3, $4, 'Imported during historical migration', $5, 'System');
+          `, [
+            defaultUpiId,
+            remainingPaid,
+            orderId,
+            `Remaining payment verified for order ${orderId}`,
+            o.orderDate
+          ]);
+        }
+      }
+
       // Insert Items & Allocations
       for (const s of o.skuList) {
         const productId = productIdsMap[s];
@@ -601,7 +558,7 @@ No database modifications were made during this validation pass. All relations a
         }
       }
 
-      // Insert Receipt
+      // Receipts Mapping
       if (o.receiptDone) {
         const formatType = (o.bookingType === 'pre_order') ? 'prebooking' : 'standard';
         const pdfUrl = `https://gk-public-assets.s3.ap-south-1.amazonaws.com/receipts/${o.excelOrderId}.pdf`;
@@ -622,7 +579,7 @@ No database modifications were made during this validation pass. All relations a
           o.advancePaid,
           o.pendingBalance,
           'In the event that the order cannot be fulfilled from our end, a full refund will be issued.',
-          o.customerName,
+          o.customer.name,
           o.phone,
           o.address,
           o.orderDate,
@@ -646,16 +603,91 @@ No database modifications were made during this validation pass. All relations a
       }
     }
 
-    // Insert Expenses
+    // Insert Expenses & Ledger entries
     for (const exp of expenses) {
-      await client.query(`
+      const expInsertRes = await client.query(`
         INSERT INTO expenses (title, amount, category, paid_by, date, notes)
-        VALUES ($1, $2, $3, $4, NOW(), 'Imported during historical migration');
-      `, [exp.description, exp.amount, exp.category, exp.doneBy]);
+        VALUES ($1, $2, $3, $4, $5, 'Imported during historical migration')
+        RETURNING id;
+      `, [exp.description, exp.amount, exp.category, exp.doneBy, exp.date]);
+      const expId = expInsertRes.rows[0].id;
+
+      // Log Operating Expense outflow
+      if (defaultPettyId) {
+        await client.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, 'Operating Expense', 'Completed', 'Expense', $3, $4, 'Imported during historical migration', $5, 'System');
+        `, [
+          defaultPettyId,
+          -Number(exp.amount),
+          expId,
+          exp.description,
+          exp.date
+        ]);
+
+        // If paid by founder personally, record their capital contribution
+        const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
+        if (founders.includes(exp.doneBy)) {
+          await client.query(`
+            INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
+            VALUES ($1, $2, 'Founder Contribution', 'Completed', 'Founder Ledger', 'Contribution', $3, $4, $5, $6, 'System');
+          `, [
+            defaultPettyId,
+            Number(exp.amount),
+            expId,
+            `Founder Contribution for expense: ${exp.description}`,
+            `Auto-created on expense migration (paid personally)`,
+            exp.doneBy,
+            exp.date
+          ]);
+        }
+      }
     }
 
     await client.query('COMMIT');
     console.log("✔ Phase 2 database writes completed and transaction committed successfully.");
+
+    // Success Verification Queries
+    console.log("Running post-migration verification checks...");
+    const mismatches = [];
+
+    // 1. Verify product caches vs batches
+    const sumCheck = await client.query(`
+      SELECT p.sku, p.total_stock, SUM(b.quantity_received)::int as batch_sum
+      FROM products p
+      JOIN inventory_batches b ON b.product_id = p.id
+      GROUP BY p.sku, p.total_stock
+      HAVING p.total_stock != SUM(b.quantity_received)::int;
+    `);
+    if (sumCheck.rows.length > 0) {
+      mismatches.push(`Product total stock cache mismatch for ${sumCheck.rows.length} rows.`);
+    }
+
+    // 2. Verify negative inventory
+    const negCheck = await client.query(`
+      SELECT COUNT(*) FROM inventory WHERE quantity_available < 0;
+    `);
+    if (Number(negCheck.rows[0].count) > 0) {
+      mismatches.push(`Found negative inventory caches!`);
+    }
+
+    // 3. Verify order relations
+    const orphanItems = await client.query(`
+      SELECT COUNT(*) FROM order_items WHERE product_id IS NULL;
+    `);
+    if (Number(orphanItems.rows[0].count) > 0) {
+      mismatches.push(`Found orphaned order items!`);
+    }
+
+    // 4. Verify Cash accounts vs ledger sum matches
+    const cashTotal = await client.query("SELECT SUM(amount)::float as total FROM cash_ledger WHERE status = 'Completed';");
+    console.log(`Verified Ledger Net Cash Balance: ₹${cashTotal.rows[0].total.toLocaleString('en-IN')}`);
+
+    if (mismatches.length > 0) {
+      console.error("❌ Post-migration verification failed!", mismatches);
+    } else {
+      console.log("✔ SUCCESS: All post-migration verifications passed successfully!");
+    }
 
   } catch (error) {
     await client.query('ROLLBACK');

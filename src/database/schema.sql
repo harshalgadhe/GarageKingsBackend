@@ -643,3 +643,68 @@ CREATE TABLE IF NOT EXISTS homepage_sections (
     display_order INT DEFAULT 0,
     metadata JSONB DEFAULT '{}'::JSONB
 );
+
+-- 33. Cash Accounts Table
+CREATE TABLE IF NOT EXISTS cash_accounts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) UNIQUE NOT NULL,
+    type VARCHAR(100) DEFAULT 'Bank', -- 'Bank', 'UPI', 'Cash Drawer', 'Petty Cash', 'Gateway'
+    opening_balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    currency VARCHAR(10) DEFAULT 'INR',
+    display_order INT DEFAULT 0,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+
+-- 34. Refunds Table
+CREATE TABLE IF NOT EXISTS refunds (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    amount NUMERIC(12, 2) NOT NULL CHECK (amount >= 0),
+    status VARCHAR(50) NOT NULL DEFAULT 'Completed', -- 'Pending', 'Completed'
+    reason TEXT,
+    restock_inventory BOOLEAN DEFAULT TRUE,
+    is_damaged BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_refunds_order ON refunds(order_id);
+
+-- 35. Immutable Cash Transaction Ledger Table
+CREATE TABLE IF NOT EXISTS cash_ledger (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    cash_account_id UUID REFERENCES cash_accounts(id) ON DELETE SET NULL,
+    amount NUMERIC(12, 2) NOT NULL, -- positive for inflows, negative for outflows
+    type VARCHAR(100) NOT NULL, -- 'Customer Payment', 'Pre-order Advance', 'Pre-order Remaining Payment', 'Founder Contribution', 'Founder Reimbursement', 'Founder Personal Inventory Purchase', 'Inventory Purchase', 'Inventory Purchase Adjustment', 'Operating Expense', 'Refund', 'Refund Reversal', 'Manual Adjustment', 'Owner Draw', 'Settlement Between Founders', 'Inventory Write-off', 'Inventory Damage', 'Inventory Loss', 'Inventory Correction', 'Cash Adjustment'
+    status VARCHAR(50) NOT NULL DEFAULT 'Completed', -- 'Pending', 'Completed', 'Cancelled', 'Reversed', 'Failed'
+    source_type VARCHAR(100) NOT NULL, -- 'Order', 'Expense', 'Inventory Batch', 'Founder Ledger', 'Refund', 'Invoice', 'Manual Adjustment'
+    source_id VARCHAR(100) NOT NULL, -- ID of the source entity
+    reference_number VARCHAR(255), -- UPI ID, bank reference, invoice number
+    reason TEXT NOT NULL,
+    notes TEXT,
+    founder_name VARCHAR(100),
+    to_founder VARCHAR(100),
+    date DATE NOT NULL DEFAULT CURRENT_DATE,
+    created_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_account ON cash_ledger(cash_account_id);
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_source ON cash_ledger(source_type, source_id);
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_type_status ON cash_ledger(type, status);
+CREATE INDEX IF NOT EXISTS idx_cash_ledger_date ON cash_ledger(date DESC);
+
+-- 36. Monthly Financial Snapshots Table (Performance cache)
+CREATE TABLE IF NOT EXISTS financial_monthly_snapshots (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    snapshot_month DATE UNIQUE NOT NULL, -- first day of the month (e.g. 2026-07-01)
+    revenue NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    cogs NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    gross_profit NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    operating_expenses NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    net_profit NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    inventory_value NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    cash_balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);

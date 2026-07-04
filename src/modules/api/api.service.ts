@@ -1538,6 +1538,28 @@ export class ApiService implements OnModuleInit {
         `, [orderId]);
       }
 
+      // Record payment in cash ledger
+      const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE name ILIKE '%UPI%' AND is_active = true LIMIT 1;");
+      const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
+      
+      const ledgerAmount = isInitialPreorder ? Number(order.advance_amount) : Number(order.total_price);
+      const ledgerType = isInitialPreorder ? 'Pre-order Advance' : 'Customer Payment';
+      
+      if (cashAccountId) {
+        await queryRunner.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, $3, 'Completed', 'Order', $4, $5, $6, NOW(), $7);
+        `, [
+          cashAccountId,
+          ledgerAmount,
+          ledgerType,
+          orderId,
+          `Payment verified for order ${orderId}`,
+          `Auto-created on order confirmation`,
+          adminEmail || 'System'
+        ]);
+      }
+
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
       localCache.del('products_list_false');
@@ -1594,6 +1616,26 @@ export class ApiService implements OnModuleInit {
           SET pending_balance = 0.00, advance_paid = total_amount
           WHERE receipt_number = $1
         `, [orderId]);
+
+        if (old.status === 'Verification Pending' && old.booking_type === 'pre_order') {
+          const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE name ILIKE '%UPI%' AND is_active = true LIMIT 1;");
+          const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
+          
+          const remainingAmount = Number(old.remaining_amount);
+          if (remainingAmount > 0 && cashAccountId) {
+            await queryRunner.query(`
+              INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+              VALUES ($1, $2, 'Pre-order Remaining Payment', 'Completed', 'Order', $3, $4, $5, NOW(), $6);
+            `, [
+              cashAccountId,
+              remainingAmount,
+              orderId,
+              `Remaining payment verified for pre-order ${orderId}`,
+              `Auto-created on remaining payment verification`,
+              adminEmail || 'System'
+            ]);
+          }
+        }
       }
 
       // Transition stock from Reserved to Sold on Shipment/Delivery
@@ -1718,6 +1760,34 @@ export class ApiService implements OnModuleInit {
           DELETE FROM order_inventory_allocations 
           WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = $1);
         `, [orderId]);
+
+        if (old.status === 'Confirmed' || old.status === 'Pre-Order' || old.status === 'Shipped' || old.status === 'Delivered') {
+          const refundAmount = old.status === 'Pre-Order' ? Number(old.advance_amount) : Number(old.total_price);
+          if (refundAmount > 0) {
+            const refundRes = await queryRunner.query(`
+              INSERT INTO refunds (order_id, amount, status, reason, restock_inventory)
+              VALUES ($1, $2, 'Completed', $3, true)
+              RETURNING id;
+            `, [orderId, refundAmount, `Refund for cancelled order ${orderId}`]);
+
+            const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE name ILIKE '%UPI%' AND is_active = true LIMIT 1;");
+            const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
+
+            if (cashAccountId) {
+              await queryRunner.query(`
+                INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+                VALUES ($1, $2, 'Refund', 'Completed', 'Refund', $3, $4, $5, NOW(), $6);
+              `, [
+                cashAccountId,
+                -refundAmount,
+                refundRes[0].id,
+                `Customer refund processed for order ${orderId}`,
+                `Auto-created on order cancellation`,
+                adminEmail || 'System'
+              ]);
+            }
+          }
+        }
       }
 
       await queryRunner.commitTransaction();
@@ -2007,43 +2077,460 @@ export class ApiService implements OnModuleInit {
 
 
   async addExpense(exp: any, adminEmail: string, ipAddress: string) {
-    const result = await this.dataSource.query(`
-      INSERT INTO expenses (title, amount, category, paid_by, date, notes)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id;
-    `, [exp.title, Number(exp.amount), exp.category, exp.paidBy, exp.date, exp.notes || '']);
-    
-    await this.writeAuditLog(
-      'CREATE_EXPENSE',
-      'expenses',
-      result[0].id,
-      adminEmail,
-      ipAddress,
-      null,
-      exp
-    );
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    return result[0];
+    try {
+      const result = await queryRunner.query(`
+        INSERT INTO expenses (title, amount, category, paid_by, date, notes)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id;
+      `, [exp.title, Number(exp.amount), exp.category, exp.paidBy, exp.date, exp.notes || '']);
+      const expenseId = result[0].id;
+
+      const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE name ILIKE '%Petty%' OR name ILIKE '%Drawer%' AND is_active = true LIMIT 1;");
+      const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
+
+      if (cashAccountId) {
+        await queryRunner.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, 'Operating Expense', 'Completed', 'Expense', $3, $4, $5, $6, $7);
+        `, [
+          cashAccountId,
+          -Number(exp.amount),
+          expenseId,
+          exp.title,
+          `Expense logged: ${exp.title}`,
+          exp.date ? new Date(exp.date) : new Date(),
+          adminEmail
+        ]);
+
+        const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
+        if (founders.includes(exp.paidBy)) {
+          await queryRunner.query(`
+            INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
+            VALUES ($1, $2, 'Founder Contribution', 'Completed', 'Founder Ledger', 'Contribution', $3, $4, $5, $6, $7);
+          `, [
+            cashAccountId,
+            Number(exp.amount),
+            expenseId,
+            `Founder Contribution for expense: ${exp.title}`,
+            `Auto-created on expense log (paid personally)`,
+            exp.paidBy,
+            exp.date ? new Date(exp.date) : new Date(),
+            adminEmail
+          ]);
+        }
+      }
+
+      await this.writeAuditLog(
+        'CREATE_EXPENSE',
+        'expenses',
+        expenseId,
+        adminEmail,
+        ipAddress,
+        null,
+        exp
+      );
+
+      await queryRunner.commitTransaction();
+      return result[0];
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   async softDeleteExpense(id: string, adminEmail: string, ipAddress: string) {
-    const old = await this.dataSource.query("SELECT * FROM expenses WHERE id = $1", [id]);
-    await this.dataSource.query("UPDATE expenses SET deleted_at = NOW() WHERE id = $1", [id]);
-    await this.writeAuditLog(
-      'DELETE_EXPENSE',
-      'expenses',
-      id,
-      adminEmail,
-      ipAddress,
-      old[0],
-      { deleted: true }
-    );
-    return { success: true };
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const old = await queryRunner.query("SELECT * FROM expenses WHERE id = $1", [id]);
+      if (old.length === 0) throw new BadRequestException('Expense not found.');
+      
+      await queryRunner.query("UPDATE expenses SET deleted_at = NOW() WHERE id = $1", [id]);
+
+      const ledgerEntries = await queryRunner.query(`
+        SELECT * FROM cash_ledger 
+        WHERE source_type = 'Expense' AND source_id = $1 AND status = 'Completed';
+      `, [id]);
+
+      for (const entry of ledgerEntries) {
+        await queryRunner.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+          VALUES ($1, $2, 'Cash Adjustment', 'Completed', 'Expense', $3, $4, $5, NOW(), $6);
+        `, [
+          entry.cash_account_id,
+          -Number(entry.amount),
+          id,
+          `Reversed entry: ${entry.reason}`,
+          `Reconciliation adjustment for soft-deleted expense ${id}`,
+          adminEmail
+        ]);
+      }
+
+      await this.writeAuditLog(
+        'DELETE_EXPENSE',
+        'expenses',
+        id,
+        adminEmail,
+        ipAddress,
+        old[0],
+        { deleted: true }
+      );
+
+      await queryRunner.commitTransaction();
+      return { success: true };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   // ── FOUNDER SPLITS & FINANCE METRICS ────────────────────────────────
+  getDateFilter(timeRange: string): { start: Date; end: Date } {
+    const end = new Date();
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    end.setHours(23, 59, 59, 999);
+
+    switch (timeRange) {
+      case 'Today':
+        break;
+      case 'Yesterday':
+        start.setDate(start.getDate() - 1);
+        end.setDate(end.getDate() - 1);
+        break;
+      case 'Last 7 Days':
+        start.setDate(start.getDate() - 6);
+        break;
+      case 'Last 30 Days':
+        start.setDate(start.getDate() - 29);
+        break;
+      case 'This Month':
+        start.setDate(1);
+        break;
+      case 'Previous Month':
+        start.setMonth(start.getMonth() - 1);
+        start.setDate(1);
+        end.setMonth(end.getMonth() - 1);
+        end.setDate(new Date(end.getFullYear(), end.getMonth() + 1, 0).getDate());
+        break;
+      case 'Quarter':
+        const qStartMonth = Math.floor(start.getMonth() / 3) * 3;
+        start.setMonth(qStartMonth);
+        start.setDate(1);
+        break;
+      case 'Year To Date':
+        start.setMonth(0);
+        start.setDate(1);
+        break;
+      case 'Previous Year':
+        start.setFullYear(start.getFullYear() - 1);
+        start.setMonth(0);
+        start.setDate(1);
+        end.setFullYear(end.getFullYear() - 1);
+        end.setMonth(11);
+        end.setDate(31);
+        break;
+      case 'Lifetime':
+      default:
+        start.setFullYear(2020);
+        break;
+    }
+    return { start, end };
+  }
+
+  getPreviousPeriod(timeRange: string): { start: Date; end: Date } {
+    const current = this.getDateFilter(timeRange);
+    const diff = current.end.getTime() - current.start.getTime();
+    const start = new Date(current.start.getTime() - diff - 1);
+    const end = new Date(current.start.getTime() - 1);
+    return { start, end };
+  }
+
+  async getCashAccounts() {
+    return this.dataSource.query("SELECT * FROM cash_accounts WHERE deleted_at IS NULL ORDER BY display_order ASC;");
+  }
+
+  async createCashAccount(name: string, type: string, openingBalance: number, currency: string, description: string) {
+    const res = await this.dataSource.query(`
+      INSERT INTO cash_accounts (name, type, opening_balance, currency, description)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id;
+    `, [name, type, openingBalance, currency || 'INR', description || '']);
+    return { success: true, id: res[0].id };
+  }
+
+  async getCashLedger(filters: { timeRange?: string; cashAccountId?: string; type?: string; limit?: number; offset?: number }) {
+    const timeRange = filters.timeRange || 'Lifetime';
+    const { start, end } = this.getDateFilter(timeRange);
+    
+    let queryStr = "SELECT l.*, a.name as cash_account_name FROM cash_ledger l LEFT JOIN cash_accounts a ON a.id = l.cash_account_id WHERE l.date BETWEEN $1 AND $2";
+    const params: any[] = [start, end];
+    let paramIndex = 3;
+
+    if (filters.cashAccountId) {
+      queryStr += ` AND l.cash_account_id = $${paramIndex}`;
+      params.push(filters.cashAccountId);
+      paramIndex++;
+    }
+
+    if (filters.type) {
+      queryStr += ` AND l.type = $${paramIndex}`;
+      params.push(filters.type);
+      paramIndex++;
+    }
+
+    queryStr += " ORDER BY l.date DESC, l.created_at DESC";
+
+    if (filters.limit) {
+      queryStr += ` LIMIT $${paramIndex}`;
+      params.push(Number(filters.limit));
+      paramIndex++;
+    }
+    if (filters.offset) {
+      queryStr += ` OFFSET $${paramIndex}`;
+      params.push(Number(filters.offset));
+      paramIndex++;
+    }
+
+    return this.dataSource.query(queryStr, params);
+  }
+
+  async addLedgerAdjustment(dto: { cashAccountId: string; amount: number; type: string; reason: string; notes?: string; referenceNumber?: string; date?: string }, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const dateVal = dto.date ? new Date(dto.date) : new Date();
+      const res = await queryRunner.query(`
+        INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reference_number, reason, notes, date, created_by)
+        VALUES ($1, $2, $3, 'Completed', 'Manual Adjustment', 'Manual', $4, $5, $6, $7, $8)
+        RETURNING id;
+      `, [dto.cashAccountId, Number(dto.amount), dto.type, dto.referenceNumber || null, dto.reason, dto.notes || '', dateVal, adminEmail]);
+      
+      await this.writeAuditLog(
+        'CREATE_LEDGER_ADJUSTMENT',
+        'cash_ledger',
+        res[0].id,
+        adminEmail,
+        ipAddress,
+        null,
+        { cashAccountId: dto.cashAccountId, amount: dto.amount, type: dto.type }
+      );
+      
+      await queryRunner.commitTransaction();
+      return { success: true, id: res[0].id };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async getFinanceMetrics(timeRange = 'Lifetime', cashAccountId?: string) {
+    const { start, end } = this.getDateFilter(timeRange);
+    const prev = this.getPreviousPeriod(timeRange);
+
+    const getMetricsForPeriod = async (s: Date, e: Date) => {
+      let filterAcc = "";
+      const params: any[] = [s, e];
+      if (cashAccountId) {
+        filterAcc = " AND cash_account_id = $3";
+        params.push(cashAccountId);
+      }
+
+      const revRes = await this.dataSource.query(`
+        SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+        WHERE type IN ('Customer Payment', 'Pre-order Advance', 'Pre-order Remaining Payment')
+          AND status = 'Completed'
+          AND date BETWEEN $1 AND $2 ${filterAcc}
+      `, params);
+      const revenue = revRes[0].total;
+
+      const cogsRes = await this.dataSource.query(`
+        SELECT COALESCE(SUM(a.quantity * a.purchase_price), 0)::float as total
+        FROM order_inventory_allocations a
+        JOIN order_items oi ON oi.id = a.order_item_id
+        JOIN orders o ON o.id = oi.order_id
+        WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+          AND o.created_at BETWEEN $1 AND $2
+      `, [s, e]);
+      const cogs = cogsRes[0].total;
+
+      const expRes = await this.dataSource.query(`
+        SELECT COALESCE(SUM(ABS(amount)), 0)::float as total FROM cash_ledger
+        WHERE type = 'Operating Expense'
+          AND status = 'Completed'
+          AND date BETWEEN $1 AND $2 ${filterAcc}
+      `, params);
+      const expenses = expRes[0].total;
+
+      const refRes = await this.dataSource.query(`
+        SELECT COALESCE(SUM(amount), 0)::float as total FROM refunds
+        WHERE status = 'Completed' AND created_at BETWEEN $1 AND $2
+      `, [s, e]);
+      const refunds = refRes[0].total;
+
+      const refPendingRes = await this.dataSource.query(`
+        SELECT COALESCE(SUM(amount), 0)::float as total FROM refunds
+        WHERE status = 'Pending'
+      `);
+      const pendingRefunds = refPendingRes[0].total;
+
+      const aovRes = await this.dataSource.query(`
+        SELECT COALESCE(AVG(total_price), 0)::float as val FROM orders
+        WHERE status IN ('Confirmed', 'Shipped', 'Delivered')
+          AND created_at BETWEEN $1 AND $2
+      `, [s, e]);
+      const aov = aovRes[0].val;
+
+      const grossProfit = revenue - cogs;
+      const netProfit = grossProfit - expenses;
+
+      return {
+        revenue,
+        cogs,
+        grossProfit,
+        expenses,
+        netProfit,
+        refunds,
+        pendingRefunds,
+        aov,
+        grossMarginPct: revenue > 0 ? (grossProfit / revenue) * 100 : 0,
+        netMarginPct: revenue > 0 ? (netProfit / revenue) * 100 : 0,
+        refundRate: revenue > 0 ? (refunds / revenue) * 100 : 0
+      };
+    };
+
+    const currentMetrics = await getMetricsForPeriod(start, end);
+    const prevMetrics = await getMetricsForPeriod(prev.start, prev.end);
+
+    // Business Cash positions
+    const cashBalRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger WHERE status = 'Completed'
+    `);
+    const currentCashBalance = cashBalRes[0].total;
+
+    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
+    const cashInToday = (await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE amount > 0 AND status = 'Completed' AND date BETWEEN $1 AND $2
+    `, [todayStart, todayEnd]))[0].total;
+
+    const cashOutToday = (await this.dataSource.query(`
+      SELECT COALESCE(SUM(ABS(amount)), 0)::float as total FROM cash_ledger
+      WHERE amount < 0 AND status = 'Completed' AND date BETWEEN $1 AND $2
+    `, [todayStart, todayEnd]))[0].total;
+
+    const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0,0,0,0);
+    const cashInMonth = (await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE amount > 0 AND status = 'Completed' AND date BETWEEN $1 AND $2
+    `, [monthStart, todayEnd]))[0].total;
+
+    const cashOutMonth = (await this.dataSource.query(`
+      SELECT COALESCE(SUM(ABS(amount)), 0)::float as total FROM cash_ledger
+      WHERE amount < 0 AND status = 'Completed' AND date BETWEEN $1 AND $2
+    `, [monthStart, todayEnd]))[0].total;
+
+    const invValueRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(quantity_available * purchase_price), 0)::float as total FROM inventory_batches
+    `);
+    const inventoryAssetValue = invValueRes[0].total;
+
+    // Outstanding founder capital
+    const fContr = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE type IN ('Founder Contribution', 'Founder Personal Inventory Purchase') AND status = 'Completed'
+    `);
+    const fReimb = await this.dataSource.query(`
+      SELECT COALESCE(SUM(ABS(amount)), 0)::float as total FROM cash_ledger
+      WHERE type = 'Founder Reimbursement' AND status = 'Completed'
+    `);
+    const outstandingFounderCapital = fContr[0].total - fReimb[0].total;
+
+    const pendingPayRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(total_price), 0)::float as total FROM orders
+      WHERE status = 'Verification Pending'
+    `);
+    const pendingPayments = pendingPayRes[0].total;
+
+    return {
+      ...currentMetrics,
+      profit: currentMetrics.netProfit,
+      pendingPayments,
+      inventoryValue: inventoryAssetValue,
+      currentCashBalance,
+      cashInToday,
+      cashOutToday,
+      cashInThisMonth: cashInMonth,
+      cashOutThisMonth: cashOutMonth,
+      inventoryAssetValue,
+      outstandingFounderCapital,
+      trends: {
+        revenueGrowth: prevMetrics.revenue > 0 ? ((currentMetrics.revenue - prevMetrics.revenue) / prevMetrics.revenue) * 100 : 0,
+        netProfitGrowth: prevMetrics.netProfit > 0 ? ((currentMetrics.netProfit - prevMetrics.netProfit) / prevMetrics.netProfit) * 100 : 0
+      }
+    };
+  }
+
+  async getAnalyticsMetrics(timeRange = 'Lifetime') {
+    const { start, end } = this.getDateFilter(timeRange);
+
+    const topSeller = await this.dataSource.query(`
+      SELECT p.model_name as name, p.brand, SUM(oi.qty) as sales
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+        AND o.created_at BETWEEN $1 AND $2
+      GROUP BY p.id, p.model_name, p.brand
+      ORDER BY sales DESC LIMIT 5;
+    `, [start, end]);
+
+    const topBrand = await this.dataSource.query(`
+      SELECT p.brand, SUM(oi.qty) as sales
+      FROM order_items oi
+      JOIN products p ON p.id = oi.product_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+        AND o.created_at BETWEEN $1 AND $2
+      GROUP BY p.brand
+      ORDER BY sales DESC LIMIT 5;
+    `, [start, end]);
+
+    const deadStock = await this.dataSource.query(`
+      SELECT p.id, p.model_name as name, p.brand, p.total_stock - p.locked_stock - p.sold_stock as available, p.created_at
+      FROM products p
+      LEFT JOIN order_items oi ON oi.product_id = p.id
+      WHERE p.created_at < NOW() - INTERVAL '90 days'
+      AND oi.id IS NULL AND p.deleted_at IS NULL
+      ORDER BY p.created_at ASC;
+    `);
+
+    return {
+      topSellingProduct: topSeller[0] || null,
+      topSellerList: topSeller,
+      topBrand: topBrand[0]?.brand || null,
+      topBrandList: topBrand,
+      deadStockCount: deadStock.length,
+      deadStock
+    };
+  }
+
   async getSplits() {
-    // 4 Founders
     const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
     const settings = await this.getGlobalSettings();
     const splits = settings.splits || {
@@ -2053,34 +2540,34 @@ export class ApiService implements OnModuleInit {
       'Anish': 25
     };
 
-    // Calculate total paid by each founder
-    const expRows = await this.dataSource.query(`
-      SELECT paid_by, SUM(amount) as total 
-      FROM expenses 
-      WHERE deleted_at IS NULL 
-      GROUP BY paid_by;
+    const contrRows = await this.dataSource.query(`
+      SELECT founder_name, SUM(amount)::float as total
+      FROM cash_ledger
+      WHERE type IN ('Founder Contribution', 'Founder Personal Inventory Purchase')
+        AND status = 'Completed'
+      GROUP BY founder_name;
     `);
 
     const paidMap = {};
     founders.forEach(f => paidMap[f] = 0);
-    expRows.forEach(row => {
-      if (founders.includes(row.paid_by)) {
-        paidMap[row.paid_by] = Number(row.total);
-      }
+    contrRows.forEach(r => {
+      if (founders.includes(r.founder_name)) paidMap[r.founder_name] = r.total;
     });
 
-    // Total expenses
     const totalExp = Object.values(paidMap).reduce((a: number, b: number) => a + b, 0) as number;
 
-    // What each owner should have paid based on splits percentage
     const targetOwed = {};
     founders.forEach(f => {
       const pct = splits[f] || 25;
       targetOwed[f] = totalExp * (pct / 100);
     });
 
-    // Calculate settlement adjustments
-    const settlements = await this.dataSource.query("SELECT * FROM split_settlements ORDER BY date DESC;");
+    const settlements = await this.dataSource.query(`
+      SELECT * FROM cash_ledger
+      WHERE type = 'Settlement Between Founders'
+        AND status = 'Completed'
+      ORDER BY date DESC;
+    `);
     const sentMap = {};
     const recMap = {};
     founders.forEach(f => {
@@ -2089,27 +2576,21 @@ export class ApiService implements OnModuleInit {
     });
 
     settlements.forEach(s => {
-      if (founders.includes(s.from_founder)) sentMap[s.from_founder] += Number(s.amount);
+      if (founders.includes(s.founder_name)) sentMap[s.founder_name] += Number(s.amount);
       if (founders.includes(s.to_founder)) recMap[s.to_founder] += Number(s.amount);
     });
 
-    // Final balance calculation
-    // Balance = (Actual Paid + Settlements Received) - (Target Owed + Settlements Sent)
-    // Positive balance = owed money; Negative balance = owes money
     const balances = {};
     founders.forEach(f => {
       balances[f] = (paidMap[f] + recMap[f]) - (targetOwed[f] + sentMap[f]);
     });
 
-    // Build ledger transfers recommendations
     const owesWho = [];
     const debtors = founders.filter(f => balances[f] < -0.01).sort((a,b) => balances[a] - balances[b]);
     const creditors = founders.filter(f => balances[f] > 0.01).sort((a,b) => balances[b] - balances[a]);
 
     let dIdx = 0;
     let cIdx = 0;
-    
-    // Copy balances to mutate
     const balTmp = { ...balances };
 
     while (dIdx < debtors.length && cIdx < creditors.length) {
@@ -2117,7 +2598,6 @@ export class ApiService implements OnModuleInit {
       const cr = creditors[cIdx];
       const dbOwes = Math.abs(balTmp[db]);
       const crNeeds = balTmp[cr];
-      
       const amount = Math.min(dbOwes, crNeeds);
       
       owesWho.push({
@@ -2143,108 +2623,132 @@ export class ApiService implements OnModuleInit {
     };
   }
 
+  async getFounderLedger() {
+    const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
+    
+    const contrRows = await this.dataSource.query(`
+      SELECT founder_name, SUM(amount)::float as total
+      FROM cash_ledger
+      WHERE type IN ('Founder Contribution', 'Founder Personal Inventory Purchase')
+        AND status = 'Completed'
+      GROUP BY founder_name;
+    `);
+    const contrMap = {};
+    founders.forEach(f => contrMap[f] = 0);
+    contrRows.forEach(r => {
+      if (founders.includes(r.founder_name)) contrMap[r.founder_name] = r.total;
+    });
+
+    const reimbRows = await this.dataSource.query(`
+      SELECT founder_name, SUM(ABS(amount))::float as total
+      FROM cash_ledger
+      WHERE type = 'Founder Reimbursement'
+        AND status = 'Completed'
+      GROUP BY founder_name;
+    `);
+    const reimbMap = {};
+    founders.forEach(f => reimbMap[f] = 0);
+    reimbRows.forEach(r => {
+      if (founders.includes(r.founder_name)) reimbMap[r.founder_name] = r.total;
+    });
+
+    const balances = {};
+    founders.forEach(f => {
+      balances[f] = contrMap[f] - reimbMap[f];
+    });
+
+    const timeline = await this.dataSource.query(`
+      SELECT id, founder_name as "founderName", amount, type, reason, notes, date, created_at
+      FROM cash_ledger
+      WHERE type IN ('Founder Contribution', 'Founder Personal Inventory Purchase', 'Founder Reimbursement', 'Settlement Between Founders')
+        AND status = 'Completed'
+      ORDER BY date DESC, created_at DESC;
+    `);
+
+    return {
+      founders,
+      contributions: contrMap,
+      reimbursements: reimbMap,
+      balances,
+      timeline
+    };
+  }
+
+  async addFounderContribution(dto: { founderName: string; amount: number; cashAccountId: string; reason: string; notes?: string; date?: string }, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const dateVal = dto.date ? new Date(dto.date) : new Date();
+      const res = await queryRunner.query(`
+        INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
+        VALUES ($1, $2, 'Founder Contribution', 'Completed', 'Founder Ledger', 'Contribution', $3, $4, $5, $6, $7)
+        RETURNING id;
+      `, [dto.cashAccountId, Number(dto.amount), dto.reason, dto.notes || '', dto.founderName, dateVal, adminEmail]);
+
+      await this.writeAuditLog(
+        'CREATE_FOUNDER_CONTRIBUTION',
+        'cash_ledger',
+        res[0].id,
+        adminEmail,
+        ipAddress,
+        null,
+        { founderName: dto.founderName, amount: dto.amount, cashAccountId: dto.cashAccountId }
+      );
+
+      await queryRunner.commitTransaction();
+      return { success: true, id: res[0].id };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async addFounderReimbursement(dto: { founderName: string; amount: number; cashAccountId: string; reason: string; notes?: string; date?: string }, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const dateVal = dto.date ? new Date(dto.date) : new Date();
+      const res = await queryRunner.query(`
+        INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
+        VALUES ($1, $2, 'Founder Reimbursement', 'Completed', 'Founder Ledger', 'Reimbursement', $3, $4, $5, $6, $7)
+        RETURNING id;
+      `, [dto.cashAccountId, -Number(dto.amount), dto.reason, dto.notes || '', dto.founderName, dateVal, adminEmail]);
+
+      await this.writeAuditLog(
+        'CREATE_FOUNDER_REIMBURSEMENT',
+        'cash_ledger',
+        res[0].id,
+        adminEmail,
+        ipAddress,
+        null,
+        { founderName: dto.founderName, amount: dto.amount, cashAccountId: dto.cashAccountId }
+      );
+
+      await queryRunner.commitTransaction();
+      return { success: true, id: res[0].id };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   async addSettlement(from: string, to: string, amount: number, notes: string, date: string) {
+    const accounts = await this.getCashAccounts();
+    const defaultAccId = accounts[0]?.id || null;
+
     await this.dataSource.query(`
-      INSERT INTO split_settlements (from_founder, to_founder, amount, notes, date)
-      VALUES ($1, $2, $3, $4, $5);
-    `, [from, to, amount, notes || '', date]);
+      INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, to_founder, date, created_by)
+      VALUES ($1, $2, 'Settlement Between Founders', 'Completed', 'Founder Ledger', 'Settlement', $3, $4, $5, $6, $7, 'System');
+    `, [defaultAccId, amount, `Settlement from ${from} to ${to}`, notes || '', from, to, date]);
     return { success: true };
-  }
-
-  async getFinanceMetrics() {
-    const revenueRows = await this.dataSource.query(`
-      SELECT SUM(total_price) as total 
-      FROM orders 
-      WHERE status IN ('Confirmed', 'Shipped', 'Delivered');
-    `);
-    const revenue = Number(revenueRows[0]?.total || 0);
-
-    const expenseRows = await this.dataSource.query(`
-      SELECT SUM(amount) as total 
-      FROM expenses 
-      WHERE deleted_at IS NULL;
-    `);
-    const expenses = Number(expenseRows[0]?.total || 0);
-
-    const pendingRows = await this.dataSource.query(`
-      SELECT SUM(total_price) as total 
-      FROM orders 
-      WHERE status = 'Verification Pending';
-    `);
-    const pending = Number(pendingRows[0]?.total || 0);
-
-    const invValueRows = await this.dataSource.query(`
-      SELECT SUM(purchase_price * total_stock) as total 
-      FROM products 
-      WHERE deleted_at IS NULL;
-    `);
-    const inventoryValue = Number(invValueRows[0]?.total || 0);
-
-    return {
-      revenue,
-      expenses,
-      profit: revenue - expenses,
-      pendingPayments: pending,
-      inventoryValue
-    };
-  }
-
-  // ── ANALYTICS METRICS CALCULATOR ───────────────────────────────────
-  async getAnalyticsMetrics() {
-    const topSeller = await this.dataSource.query(`
-      SELECT p.model_name as name, p.brand, SUM(oi.qty) as sales
-      FROM order_items oi
-      JOIN products p ON p.id = oi.product_id
-      JOIN orders o ON o.id = oi.order_id
-      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
-      GROUP BY p.id, p.model_name, p.brand
-      ORDER BY sales DESC LIMIT 1;
-    `);
-
-    const topBrand = await this.dataSource.query(`
-      SELECT p.brand, SUM(oi.qty) as sales
-      FROM order_items oi
-      JOIN products p ON p.id = oi.product_id
-      JOIN orders o ON o.id = oi.order_id
-      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
-      GROUP BY p.brand
-      ORDER BY sales DESC LIMIT 1;
-    `);
-
-    const avgOrderVal = await this.dataSource.query(`
-      SELECT AVG(total_price) as val 
-      FROM orders 
-      WHERE status IN ('Confirmed', 'Shipped', 'Delivered');
-    `);
-
-    const topCust = await this.dataSource.query(`
-      SELECT c.full_name as name, SUM(o.total_price) as spend
-      FROM orders o
-      JOIN users u ON u.id = o.user_id
-      JOIN customers c ON c.email = u.email
-      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
-      GROUP BY c.id, c.full_name
-      ORDER BY spend DESC LIMIT 1;
-    `);
-
-    // Dead Stock check: 90+ days unsold
-    const deadStock = await this.dataSource.query(`
-      SELECT p.id, p.model_name as name, p.brand, p.total_stock - p.locked_stock - p.sold_stock as available, p.created_at
-      FROM products p
-      LEFT JOIN order_items oi ON oi.product_id = p.id
-      WHERE p.created_at < NOW() - INTERVAL '90 days'
-      AND oi.id IS NULL AND p.deleted_at IS NULL
-      ORDER BY p.created_at ASC;
-    `);
-
-    return {
-      topSellingProduct: topSeller[0] || null,
-      topBrand: topBrand[0]?.brand || null,
-      averageOrderValue: Number(avgOrderVal[0]?.val || 0),
-      topCustomer: topCust[0] || null,
-      deadStockCount: deadStock.length,
-      deadStock
-    };
   }
 
   // ── CMS SECTIONS SETTINGS CONFIGURATION ──────────────────────────
@@ -2438,7 +2942,8 @@ export class ApiService implements OnModuleInit {
     sellingPrice: number,
     quantity: number,
     creatorEmail: string,
-    ipAddress: string
+    ipAddress: string,
+    fundedBy?: string
   ) {
     // Resolve/seed distributor
     const distName = (distributorName || 'Default Supplier').trim();
@@ -2462,6 +2967,42 @@ export class ApiService implements OnModuleInit {
       RETURNING id;
     `, [productId, distId, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity)]);
     const batchId = batchRes[0].id;
+
+    // Record Inventory Purchase Cash Ledger entry
+    const accounts = await queryRunner.query("SELECT id FROM cash_accounts WHERE type = 'Bank' AND is_active = true LIMIT 1;");
+    const cashAccountId = accounts[0]?.id || (await queryRunner.query("SELECT id FROM cash_accounts WHERE is_active = true LIMIT 1;"))[0]?.id;
+    const totalCost = Number(quantity) * Number(purchasePrice);
+
+    if (cashAccountId && totalCost > 0) {
+      await queryRunner.query(`
+        INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, date, created_by)
+        VALUES ($1, $2, 'Inventory Purchase', 'Completed', 'Inventory Batch', $3, $4, $5, NOW(), $6);
+      `, [
+        cashAccountId,
+        -totalCost,
+        batchId,
+        `Inventory purchase: ${quantity} units of SKU ${sku}`,
+        `Received from supplier ${distName}`,
+        creatorEmail || 'System'
+      ]);
+
+      const founders = ['Harshal', 'Anutosh', 'Sanchit', 'Anish'];
+      const fundSrc = (fundedBy || '').trim();
+      if (founders.includes(fundSrc)) {
+        await queryRunner.query(`
+          INSERT INTO cash_ledger (cash_account_id, amount, type, status, source_type, source_id, reason, notes, founder_name, date, created_by)
+          VALUES ($1, $2, 'Founder Contribution', 'Completed', 'Founder Ledger', 'Contribution', $3, $4, $5, NOW(), $6);
+        `, [
+          cashAccountId,
+          totalCost,
+          batchId,
+          `Founder Personal Purchase for batch: ${sku}`,
+          `Founder ${fundSrc} paid personally for this batch`,
+          fundSrc,
+          creatorEmail || 'System'
+        ]);
+      }
+    }
 
     // Record ledger entry
     await queryRunner.query(`
@@ -2561,7 +3102,8 @@ export class ApiService implements OnModuleInit {
     sellingPrice: number,
     quantity: number,
     creatorEmail: string,
-    ipAddress: string
+    ipAddress: string,
+    fundedBy?: string
   ) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
@@ -2575,7 +3117,8 @@ export class ApiService implements OnModuleInit {
         sellingPrice,
         quantity,
         creatorEmail,
-        ipAddress
+        ipAddress,
+        fundedBy
       );
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');

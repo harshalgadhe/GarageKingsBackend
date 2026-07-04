@@ -47,8 +47,8 @@ export class ApiController {
     }
 
     const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
-    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 15 * 60); // 15 mins
-    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 7 * 24 * 60 * 60); // 7 days
+    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 30 * 24 * 60 * 60); // 30 days
+    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 90 * 24 * 60 * 60); // 90 days
 
     await this.apiService.updateRefreshToken(user.id, refreshToken);
 
@@ -56,14 +56,14 @@ export class ApiController {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 15 * 60 * 1000
+      maxAge: 30 * 24 * 60 * 60 * 1000
     });
 
     res.cookie('gk_refresh_token', refreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
+      maxAge: 90 * 24 * 60 * 60 * 1000
     });
 
     return { success: true, user: { id: user.id, email: user.email, role: user.role } };
@@ -81,8 +81,8 @@ export class ApiController {
     }
 
     const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
-    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 15 * 60); // 15 mins
-    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 7 * 24 * 60 * 60); // 7 days
+    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 30 * 24 * 60 * 60); // 30 days
+    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 90 * 24 * 60 * 60); // 90 days
 
     await this.apiService.updateRefreshToken(user.id, refreshToken);
 
@@ -90,14 +90,14 @@ export class ApiController {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 15 * 60 * 1000
+      maxAge: 30 * 24 * 60 * 60 * 1000
     });
 
     res.cookie('gk_refresh_token', refreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
+      maxAge: 90 * 24 * 60 * 60 * 1000
     });
 
     return { success: true, user: { id: user.id, email: user.email, role: user.role } };
@@ -141,8 +141,8 @@ export class ApiController {
       throw new UnauthorizedException('User no longer exists.');
     }
 
-    const newAccessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 15 * 60);
-    const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 7 * 24 * 60 * 60);
+    const newAccessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 30 * 24 * 60 * 60);
+    const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 90 * 24 * 60 * 60);
 
     await this.apiService.updateRefreshToken(user.id, newRefreshToken);
 
@@ -150,14 +150,14 @@ export class ApiController {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 15 * 60 * 1000
+      maxAge: 30 * 24 * 60 * 60 * 1000
     });
 
     res.cookie('gk_refresh_token', newRefreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
+      maxAge: 90 * 24 * 60 * 60 * 1000
     });
 
     return { success: true };
@@ -269,8 +269,8 @@ export class ApiController {
       const user = await this.apiService.syncGoogleUser(cleanEmail, securePassword);
 
       // 4. Issue local cookie tokens
-      const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 15 * 60); // 15 mins
-      const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 7 * 24 * 60 * 60); // 7 days
+      const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 30 * 24 * 60 * 60); // 30 days
+      const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 90 * 24 * 60 * 60); // 90 days
 
       await this.apiService.updateRefreshToken(user.id, refreshToken);
 
@@ -278,14 +278,14 @@ export class ApiController {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
-        maxAge: 15 * 60 * 1000
+        maxAge: 30 * 24 * 60 * 60 * 1000
       });
 
       res.cookie('gk_refresh_token', refreshToken, {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60 * 1000
+        maxAge: 90 * 24 * 60 * 60 * 1000
       });
 
       return { 
@@ -614,8 +614,8 @@ export class ApiController {
   @UseGuards(AuthGuard('jwt'))
   async receiveInventoryBatch(@Body() body: any, @Request() req: any) {
     this.checkAdmin(req);
-    const { productId, distributorName, purchasePrice, sellingPrice, quantity } = body;
-    return this.apiService.receiveInventoryBatch(productId, distributorName, purchasePrice, sellingPrice, quantity, req.user.email, req.ip);
+    const { productId, distributorName, purchasePrice, sellingPrice, quantity, fundedBy } = body;
+    return this.apiService.receiveInventoryBatch(productId, distributorName, purchasePrice, sellingPrice, quantity, req.user.email, req.ip, fundedBy);
   }
 
   @Get('admin/inventory/batches/:productId')
@@ -656,19 +656,82 @@ export class ApiController {
     return this.apiService.addSettlement(from, to, Number(amount), notes, date);
   }
 
+  @Get('admin/cash-accounts')
+  @UseGuards(AuthGuard('jwt'))
+  async getCashAccounts(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getCashAccounts();
+  }
+
+  @Post('admin/cash-accounts')
+  @UseGuards(AuthGuard('jwt'))
+  async createCashAccount(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    const { name, type, openingBalance, currency, description } = dto;
+    return this.apiService.createCashAccount(name, type, Number(openingBalance), currency, description);
+  }
+
+  @Get('admin/cash-ledger')
+  @UseGuards(AuthGuard('jwt'))
+  async getCashLedger(
+    @Query('timeRange') timeRange?: string,
+    @Query('cashAccountId') cashAccountId?: string,
+    @Query('type') type?: string,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+    @Request() req?: any
+  ) {
+    this.checkAdmin(req);
+    return this.apiService.getCashLedger({
+      timeRange,
+      cashAccountId,
+      type,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      offset: offset ? parseInt(offset, 10) : undefined
+    });
+  }
+
+  @Post('admin/cash-ledger/adjust')
+  @UseGuards(AuthGuard('jwt'))
+  async addLedgerAdjustment(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.addLedgerAdjustment(dto, req.user.email, req.ip);
+  }
+
+  @Get('admin/founder-ledger')
+  @UseGuards(AuthGuard('jwt'))
+  async getFounderLedger(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getFounderLedger();
+  }
+
+  @Post('admin/founder-ledger/contribute')
+  @UseGuards(AuthGuard('jwt'))
+  async addFounderContribution(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.addFounderContribution(dto, req.user.email, req.ip);
+  }
+
+  @Post('admin/founder-ledger/reimburse')
+  @UseGuards(AuthGuard('jwt'))
+  async addFounderReimbursement(@Body() dto: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.addFounderReimbursement(dto, req.user.email, req.ip);
+  }
+
   @Get('admin/dashboard/kpis')
   @UseGuards(AuthGuard('jwt'))
-  async getDashboardKpis(@Request() req: any) {
+  async getDashboardKpis(@Query('timeRange') timeRange?: string, @Query('cashAccountId') cashAccountId?: string, @Request() req?: any) {
     this.checkAdmin(req);
-    return this.apiService.getFinanceMetrics();
+    return this.apiService.getFinanceMetrics(timeRange, cashAccountId);
   }
 
   // ── ANALYTICS METRICS ──────────────────────────────────────────────
   @Get('admin/analytics')
   @UseGuards(AuthGuard('jwt'))
-  async getAnalytics(@Request() req: any) {
+  async getAnalytics(@Query('timeRange') timeRange?: string, @Request() req?: any) {
     this.checkAdmin(req);
-    return this.apiService.getAnalyticsMetrics();
+    return this.apiService.getAnalyticsMetrics(timeRange);
   }
 
   // ── AUDIT LOGS ────────────────────────────────────────────────────
