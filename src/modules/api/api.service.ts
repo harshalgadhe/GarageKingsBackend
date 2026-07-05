@@ -1474,10 +1474,14 @@ export class ApiService implements OnModuleInit {
     const params: any[] = [];
     let paramIndex = 1;
 
+    const validStatuses = ['Pending', 'Paid', 'Shipped', 'Delivered', 'Cancelled', 'Confirmed', 'Reserved', 'Verification Pending'];
     if (options.status && options.status !== 'All') {
-      queryStr += ` AND o.status = $${paramIndex}`;
-      params.push(options.status);
-      paramIndex++;
+      const sanitizedStatus = validStatuses.includes(options.status) ? options.status : null;
+      if (sanitizedStatus) {
+        queryStr += ` AND o.status = $${paramIndex}`;
+        params.push(sanitizedStatus);
+        paramIndex++;
+      }
     }
 
     if (options.search) {
@@ -3904,13 +3908,12 @@ export class ApiService implements OnModuleInit {
     const upcomingArrivals = upcomingRes[0]?.count || 0;
 
     const outstandingRes = await this.dataSource.query(`
-      SELECT COALESCE(
-        SUM(sp.total_value) - 
-        (SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_purchase_id = sp.id), 
-        0
-      )::float as total
-      FROM supplier_purchases sp
-      WHERE sp.status != 'Cancelled' AND sp.status != 'Completed';
+      SELECT (
+        COALESCE((SELECT SUM(total_value) FROM supplier_purchases WHERE status != 'Cancelled' AND status != 'Completed'), 0) -
+        COALESCE((SELECT SUM(amount) FROM supplier_payments WHERE supplier_purchase_id IN (
+          SELECT id FROM supplier_purchases WHERE status != 'Cancelled' AND status != 'Completed'
+        )), 0)
+      )::float as total;
     `);
     const outstandingPayables = outstandingRes[0]?.total || 0;
 
