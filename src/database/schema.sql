@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS products (
     tags VARCHAR(50)[] DEFAULT '{}'::VARCHAR[],
     availability_state VARCHAR(50) NOT NULL DEFAULT 'Available',
     category VARCHAR(100),
+    casing_types VARCHAR(50)[] DEFAULT '{"box"}'::VARCHAR[],
     purchase_price NUMERIC(12, 2) DEFAULT 0.00,
     selling_price NUMERIC(12, 2) DEFAULT 0.00,
     total_stock INT DEFAULT 0,
@@ -149,6 +150,7 @@ CREATE TABLE IF NOT EXISTS supplier_purchase_items (
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
     quantity INT NOT NULL CHECK (quantity > 0),
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    casing_type VARCHAR(50) DEFAULT 'box',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -182,6 +184,7 @@ CREATE TABLE IF NOT EXISTS supplier_purchase_receipt_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     purchase_receipt_id UUID NOT NULL REFERENCES supplier_purchase_receipts(id) ON DELETE CASCADE,
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    casing_type VARCHAR(50) DEFAULT 'box',
     quantity_received INT NOT NULL CHECK (quantity_received >= 0),
     quantity_short INT NOT NULL DEFAULT 0 CHECK (quantity_short >= 0),
     quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
@@ -209,6 +212,7 @@ CREATE TABLE IF NOT EXISTS inventory_batches (
     purchase_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE SET NULL,
     purchase_order_id UUID REFERENCES purchase_orders(id) ON DELETE SET NULL,
     sku VARCHAR(100) NOT NULL,
+    casing_type VARCHAR(50) DEFAULT 'box',
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     quantity_received INT NOT NULL DEFAULT 0 CHECK (quantity_received >= 0),

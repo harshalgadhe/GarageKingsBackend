@@ -11,6 +11,9 @@ const cognitoClient = new CognitoIdentityProviderClient({
   region: process.env.COGNITO_AWS_REGION || 'ap-south-1'
 });
 
+/**
+ * @deprecated Legacy monolithic controller. Endpoints are being migrated to feature modules under `/api/v1/public`, `/api/v1/customer`, and `/api/v1/admin`.
+ */
 @Controller('api/v1')
 export class ApiController {
   constructor(private readonly apiService: ApiService) {}

@@ -472,14 +472,24 @@ export class ApiService implements OnModuleInit {
     const cached = localCache.get(cacheKey);
     if (cached) return cached;
 
+    const adminFields = adminMode ? `
+      p.purchase_price as "purchasePrice",
+      p.total_stock as "totalStock",
+      p.locked_stock as "lockedStock",
+      p.sold_stock as "soldStock",
+      p.supplier,
+      p.created_by as "createdBy",
+      p.updated_by as "updatedBy",
+    ` : '';
+
     let queryStr = `
       SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
              p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             p.tags, p.category, p.purchase_price as "purchasePrice", p.selling_price as "sellingPrice",
-             p.total_stock as "totalStock", p.locked_stock as "lockedStock", p.sold_stock as "soldStock",
+             p.tags, p.category, p.selling_price as "sellingPrice",
+             ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.supplier, p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage", p.created_by as "createdBy", p.updated_by as "updatedBy",
+             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
+             p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
              pi.thumbnail_url as image, p.created_at
@@ -514,16 +524,27 @@ export class ApiService implements OnModuleInit {
     const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
     const offset = (page - 1) * limit;
 
+    const adminFields = options.adminMode ? `
+      p.purchase_price as "purchasePrice",
+      p.total_stock as "totalStock",
+      p.locked_stock as "lockedStock",
+      p.sold_stock as "soldStock",
+      p.supplier,
+      p.created_by as "createdBy",
+      p.updated_by as "updatedBy",
+    ` : '';
+
     let queryStr = `
       SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
              p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             p.tags, p.category, p.purchase_price as "purchasePrice", p.selling_price as "sellingPrice",
-             p.total_stock as "totalStock", p.locked_stock as "lockedStock", p.sold_stock as "soldStock",
+             p.tags, p.category, p.selling_price as "sellingPrice",
+             ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.supplier, p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage", p.created_by as "createdBy", p.updated_by as "updatedBy",
+             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
+             p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
+             p.casing_types as "casingTypes",
              pi.thumbnail_url as image, p.created_at
       FROM products p
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
@@ -594,21 +615,32 @@ export class ApiService implements OnModuleInit {
     };
   }
 
-  async getProduct(id: string) {
-    const cacheKey = `product_${id}`;
+  async getProduct(id: string, adminMode = false) {
+    const cacheKey = `product_${id}_${adminMode}`;
     const cached = localCache.get(cacheKey);
     if (cached) return cached;
+
+    const adminFields = adminMode ? `
+      p.purchase_price as "purchasePrice",
+      p.total_stock as "totalStock",
+      p.locked_stock as "lockedStock",
+      p.sold_stock as "soldStock",
+      p.supplier,
+      p.created_by as "createdBy",
+      p.updated_by as "updatedBy",
+    ` : '';
 
     const queryStr = `
       SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
              p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             p.tags, p.category, p.purchase_price as "purchasePrice", p.selling_price as "sellingPrice",
-             p.total_stock as "totalStock", p.locked_stock as "lockedStock", p.sold_stock as "soldStock",
+             p.tags, p.category, p.selling_price as "sellingPrice",
+             ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.supplier, p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage", p.created_by as "createdBy", p.updated_by as "updatedBy",
+             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
+             p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
+             p.casing_types as "casingTypes",
              pi.thumbnail_url as image, p.created_at
       FROM products p
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
@@ -618,8 +650,22 @@ export class ApiService implements OnModuleInit {
 
     const rows = await this.dataSource.query(queryStr, [id]);
     if (rows.length === 0) return null;
-    localCache.set(cacheKey, rows[0], 10); // Cache single item for 10 seconds
-    return rows[0];
+    const product = rows[0];
+
+    const casings = await this.dataSource.query(`
+      SELECT casing_type as "casingType", 
+             MAX(selling_price)::float as "price",
+             SUM(quantity_available)::int as "availableStock"
+      FROM inventory_batches
+      WHERE product_id = $1 AND status = 'Open' AND quantity_available > 0
+      GROUP BY casing_type
+      ORDER BY price ASC;
+    `, [id]);
+
+    product.availableCasings = casings;
+
+    localCache.set(cacheKey, product, 10); // Cache single item for 10 seconds
+    return product;
   }
 
   async addProduct(car: any, creatorEmail: string, ipAddress: string) {
@@ -630,8 +676,8 @@ export class ApiService implements OnModuleInit {
 
     try {
       const prodRes = await queryRunner.query(`
-        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, supplier, arrival_date, release_date, status, show_on_homepage, created_by, max_qty_per_customer, is_prebook, prebook_deposit_amount)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 0, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, supplier, arrival_date, release_date, status, show_on_homepage, created_by, max_qty_per_customer, is_prebook, prebook_deposit_amount, casing_types)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 0, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         RETURNING id;
       `, [
         sku,
@@ -653,7 +699,8 @@ export class ApiService implements OnModuleInit {
         creatorEmail,
         car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : null,
         car.isPrebook === true,
-        car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : null
+        car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : null,
+        car.casingTypes || ['box']
       ]);
 
       const productId = prodRes[0].id;
@@ -728,8 +775,8 @@ export class ApiService implements OnModuleInit {
           UPDATE products 
           SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
               category = $9, purchase_price = $10, selling_price = $11, status = $12, show_on_homepage = $13, updated_by = $14, 
-              max_qty_per_customer = $15, is_prebook = $16, prebook_deposit_amount = $17, availability_state = $18, updated_at = NOW()
-          WHERE id = $19;
+              max_qty_per_customer = $15, is_prebook = $16, prebook_deposit_amount = $17, availability_state = $18, casing_types = $19, updated_at = NOW()
+          WHERE id = $20;
         `, [
           car.brand || oldData.brand,
           car.name || oldData.model_name,
@@ -749,6 +796,7 @@ export class ApiService implements OnModuleInit {
           car.isPrebook === true,
           car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : oldData.prebook_deposit_amount,
           car.availabilityState || oldData.availability_state || 'Available',
+          car.casingTypes || oldData.casing_types || ['box'],
           id
         ]);
         
@@ -811,8 +859,8 @@ export class ApiService implements OnModuleInit {
           SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
               category = $9, purchase_price = $10, selling_price = $11, total_stock = $12, supplier = $13,
               arrival_date = $14, release_date = $15, status = $16, show_on_homepage = $17, updated_by = $18, 
-              max_qty_per_customer = $19, is_prebook = $20, prebook_deposit_amount = $21, availability_state = $22, updated_at = NOW()
-          WHERE id = $23;
+              max_qty_per_customer = $19, is_prebook = $20, prebook_deposit_amount = $21, availability_state = $22, casing_types = $23, updated_at = NOW()
+          WHERE id = $24;
         `, [
           car.brand || oldData.brand,
           car.name || oldData.model_name,
@@ -836,6 +884,7 @@ export class ApiService implements OnModuleInit {
           car.isPrebook === true,
           car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : oldData.prebook_deposit_amount,
           car.availabilityState || oldData.availability_state || 'Available',
+          car.casingTypes || oldData.casing_types || ['box'],
           id
         ]);
 
@@ -3110,7 +3159,8 @@ export class ApiService implements OnModuleInit {
     ipAddress: string,
     fundedBy?: string,
     supplierPurchaseId?: string,
-    purchaseReceiptId?: string
+    purchaseReceiptId?: string,
+    casingType?: string
   ) {
     // Resolve/seed supplier
     let distId = null;
@@ -3142,10 +3192,10 @@ export class ApiService implements OnModuleInit {
 
     // Insert batch
     const batchRes = await queryRunner.query(`
-      INSERT INTO inventory_batches (product_id, supplier_id, supplier_purchase_id, purchase_receipt_id, sku, purchase_price, selling_price, quantity_received, quantity_available)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+      INSERT INTO inventory_batches (product_id, supplier_id, supplier_purchase_id, purchase_receipt_id, sku, purchase_price, selling_price, quantity_received, quantity_available, casing_type)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9)
       RETURNING id;
-    `, [productId, distId, supplierPurchaseId || null, purchaseReceiptId || null, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity)]);
+    `, [productId, distId, supplierPurchaseId || null, purchaseReceiptId || null, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity), casingType || 'box']);
     const batchId = batchRes[0].id;
 
     // Record Inventory Purchase Cash Ledger entry (Skip if it's from a Supplier Purchase since payments are tracked separately)
@@ -3285,7 +3335,8 @@ export class ApiService implements OnModuleInit {
     quantity: number,
     creatorEmail: string,
     ipAddress: string,
-    fundedBy?: string
+    fundedBy?: string,
+    casingType?: string
   ) {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
@@ -3300,7 +3351,10 @@ export class ApiService implements OnModuleInit {
         quantity,
         creatorEmail,
         ipAddress,
-        fundedBy
+        fundedBy,
+        null,
+        null,
+        casingType
       );
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -3550,12 +3604,12 @@ export class ApiService implements OnModuleInit {
 
     const items = await this.dataSource.query(`
       SELECT spi.id, spi.product_id as "productId", spi.quantity, spi.purchase_price as "purchasePrice",
-             p.model_name as "name", p.brand, p.scale, p.sku,
+             p.model_name as "name", p.brand, p.scale, p.sku, spi.casing_type as "casingType",
              COALESCE((
                SELECT SUM(spri.quantity_received)::int 
                FROM supplier_purchase_receipt_items spri
                JOIN supplier_purchase_receipts spr ON spr.id = spri.purchase_receipt_id
-               WHERE spr.supplier_purchase_id = spi.supplier_purchase_id AND spri.product_id = spi.product_id
+               WHERE spr.supplier_purchase_id = spi.supplier_purchase_id AND spri.product_id = spi.product_id AND spri.casing_type = spi.casing_type
              ), 0) as "receivedQuantity"
       FROM supplier_purchase_items spi
       JOIN products p ON p.id = spi.product_id
@@ -3621,9 +3675,9 @@ export class ApiService implements OnModuleInit {
 
       for (const item of dto.items) {
         await queryRunner.query(`
-          INSERT INTO supplier_purchase_items (supplier_purchase_id, product_id, quantity, purchase_price)
-          VALUES ($1, $2, $3, $4);
-        `, [purchase.id, item.productId, Number(item.quantity), Number(item.purchasePrice)]);
+          INSERT INTO supplier_purchase_items (supplier_purchase_id, product_id, quantity, purchase_price, casing_type)
+          VALUES ($1, $2, $3, $4, $5);
+        `, [purchase.id, item.productId, Number(item.quantity), Number(item.purchasePrice), item.casingType || 'box']);
       }
 
       if (Number(dto.advancePaid || 0) > 0) {
@@ -3812,11 +3866,11 @@ export class ApiService implements OnModuleInit {
         const qtyOver = Number(item.quantityOver || 0);
 
         await queryRunner.query(`
-          INSERT INTO supplier_purchase_receipt_items (purchase_receipt_id, product_id, quantity_received, quantity_short, quantity_damaged, quantity_over)
-          VALUES ($1, $2, $3, $4, $5, $6);
-        `, [receiptId, productId, qtyReceived, qtyShort, qtyDamaged, qtyOver]);
+          INSERT INTO supplier_purchase_receipt_items (purchase_receipt_id, product_id, quantity_received, quantity_short, quantity_damaged, quantity_over, casing_type)
+          VALUES ($1, $2, $3, $4, $5, $6, $7);
+        `, [receiptId, productId, qtyReceived, qtyShort, qtyDamaged, qtyOver, item.casingType || 'box']);
 
-        const orderItemRes = await queryRunner.query("SELECT purchase_price FROM supplier_purchase_items WHERE supplier_purchase_id = $1 AND product_id = $2;", [purchaseId, productId]);
+        const orderItemRes = await queryRunner.query("SELECT purchase_price FROM supplier_purchase_items WHERE supplier_purchase_id = $1 AND product_id = $2 AND casing_type = $3;", [purchaseId, productId, item.casingType || 'box']);
         const purchasePrice = orderItemRes[0]?.purchase_price || 0;
 
         const productRes = await queryRunner.query("SELECT selling_price, base_price, sku FROM products WHERE id = $1;", [productId]);
@@ -3834,7 +3888,8 @@ export class ApiService implements OnModuleInit {
             ipAddress,
             null,
             purchaseId,
-            receiptId
+            receiptId,
+            item.casingType || 'box'
           );
         }
 

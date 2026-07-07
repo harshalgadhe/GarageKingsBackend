@@ -11,6 +11,15 @@ import { ObservabilityModule } from './modules/observability/observability.modul
 import { TraceMiddleware } from './common/middleware/trace.middleware.js';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor.js';
 
+// New Feature Modules
+import { ProductsModule } from './modules/products/products.module.js';
+import { OrdersModule } from './modules/orders/orders.module.js';
+import { SuppliersModule } from './modules/suppliers/suppliers.module.js';
+import { FinanceModule } from './modules/finance/finance.module.js';
+import { AnalyticsModule } from './modules/analytics/analytics.module.js';
+import { SettingsModule } from './modules/settings/settings.module.js';
+import { NotificationsModule } from './modules/notifications/notifications.module.js';
+
 @Module({
   imports: [
     // 1. Dynamic Serverless-optimized database connections
@@ -25,7 +34,14 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor.js
     // 3. Domain Modules
     ReceiptsModule,
     ApiModule,
-    ObservabilityModule
+    ObservabilityModule,
+    ProductsModule,
+    OrdersModule,
+    SuppliersModule,
+    FinanceModule,
+    AnalyticsModule,
+    SettingsModule,
+    NotificationsModule
   ],
   providers: [
     JwtStrategy,

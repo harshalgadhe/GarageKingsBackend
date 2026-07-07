@@ -1,0 +1,49 @@
+import { Controller, Get, Param, Query, NotFoundException } from '@nestjs/common';
+import { ProductsService } from './products.service.js';
+import { PublicProductResponseDto } from './dto/public-product-response.dto.js';
+
+@Controller('api/v1/public/products')
+export class PublicProductsController {
+  constructor(private readonly productsService: ProductsService) {}
+
+  @Get()
+  async getProducts(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('brand') brand?: string,
+    @Query('scale') scale?: string,
+    @Query('tag') tag?: string,
+    @Query('search') search?: string,
+    @Query('inStock') inStock?: string,
+    @Query('preBooking') preBooking?: string
+  ) {
+    const result = await this.productsService.getPaginatedProducts({
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      brand,
+      scale,
+      tag,
+      search,
+      inStock: inStock === 'true',
+      preBooking: preBooking === 'true',
+      adminMode: false
+    });
+
+    return {
+      products: result.products.map(p => PublicProductResponseDto.fromEntity(p)),
+      total: result.total,
+      page: result.page,
+      limit: result.limit,
+      totalPages: result.totalPages
+    };
+  }
+
+  @Get(':id')
+  async getProduct(@Param('id') id: string) {
+    const product = await this.productsService.getProduct(id, false);
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+    return PublicProductResponseDto.fromEntity(product);
+  }
+}
