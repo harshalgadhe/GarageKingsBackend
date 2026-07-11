@@ -718,6 +718,61 @@ export class ApiService implements OnModuleInit {
         ON CONFLICT (product_id) DO NOTHING;
       `, [productId]);
 
+      // Resolve casing type mapping
+      const casingTypesRes = await queryRunner.query("SELECT id, name FROM casing_types;");
+      const casingMap = {};
+      for (const ct of casingTypesRes) {
+        casingMap[ct.name.toUpperCase()] = ct.id;
+      }
+
+      if (car.variants && car.variants.length > 0) {
+        for (const v of car.variants) {
+          const casingTypeId = casingMap[v.casing.toUpperCase()] || casingTypesRes[0]?.id;
+          if (!casingTypeId) {
+            throw new Error(`Casing type "${v.casing}" not registered in database.`);
+          }
+          
+          await queryRunner.query(`
+            INSERT INTO product_variants (
+              product_id, casing_type_id, sku, barcode, name, selling_price, customer_eta, 
+              visibility, status, sales_status, dimensions, weight, variant_attributes, created_by
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
+          `, [
+            productId,
+            casingTypeId,
+            v.sku.trim(),
+            v.barcode || null,
+            v.name || `${car.name || 'Unknown Casting'} (${v.casing})`,
+            Number(v.price || 0),
+            v.customerEta || null,
+            v.isVisible !== false ? 'Visible' : 'Hidden',
+            v.status || 'Active',
+            v.salesStatus || 'Available',
+            v.dimensions || null,
+            v.weight ? Number(v.weight) : null,
+            v.variantAttributes ? JSON.stringify(v.variantAttributes) : '{}',
+            creatorEmail
+          ]);
+        }
+      } else {
+        // Fallback default variant if no variants array is provided
+        const casingTypeId = casingMap['BOX'] || casingTypesRes[0]?.id;
+        await queryRunner.query(`
+          INSERT INTO product_variants (
+            product_id, casing_type_id, sku, name, selling_price, visibility, status, sales_status, created_by
+          )
+          VALUES ($1, $2, $3, $4, $5, 'Visible', 'Active', 'Available', $6);
+        `, [
+          productId,
+          casingTypeId,
+          sku,
+          `${car.name || 'Unknown Casting'} (Box)`,
+          Number(car.price || 0),
+          creatorEmail
+        ]);
+      }
+
       const initialStock = Number(car.totalStock || 0);
       if (initialStock > 0) {
         await this.receiveInventoryBatchTx(
@@ -766,7 +821,12 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
-      const batchCountRes = await queryRunner.query("SELECT COUNT(*)::int as count FROM inventory_batches WHERE product_id = $1;", [id]);
+      const batchCountRes = await queryRunner.query(`
+        SELECT COUNT(*)::int as count 
+        FROM inventory_batches ib
+        JOIN product_variants pv ON ib.variant_id = pv.id
+        WHERE pv.product_id = $1;
+      `, [id]);
       const hasBatches = batchCountRes[0].count > 0;
 
       if (hasBatches) {
@@ -805,9 +865,11 @@ export class ApiService implements OnModuleInit {
         const diff = newStock - Number(oldData.total_stock);
         if (diff !== 0) {
           const latestBatchRes = await queryRunner.query(`
-            SELECT * FROM inventory_batches 
-            WHERE product_id = $1 
-            ORDER BY received_at DESC, id DESC 
+            SELECT ib.* 
+            FROM inventory_batches ib
+            JOIN product_variants pv ON ib.variant_id = pv.id
+            WHERE pv.product_id = $1 
+            ORDER BY ib.received_at DESC, ib.id DESC 
             LIMIT 1;
           `, [id]);
           
@@ -900,6 +962,90 @@ export class ApiService implements OnModuleInit {
             updaterEmail,
             ipAddress
           );
+        }
+      }
+
+      // Resolve casing type mapping and upsert variants
+      const casingTypesRes = await queryRunner.query("SELECT id, name FROM casing_types;");
+      const casingMap = {};
+      for (const ct of casingTypesRes) {
+        casingMap[ct.name.toUpperCase()] = ct.id;
+      }
+
+      if (car.variants && car.variants.length > 0) {
+        // Fetch current variants for this product
+        const existingVariants = await queryRunner.query("SELECT id, sku FROM product_variants WHERE product_id = $1 AND deleted_at IS NULL;", [id]);
+        const existingMap = {};
+        for (const ev of existingVariants) {
+          existingMap[ev.id] = ev;
+        }
+
+        const incomingIds = [];
+        for (const v of car.variants) {
+          const casingTypeId = casingMap[v.casing.toUpperCase()] || casingTypesRes[0]?.id;
+          if (!casingTypeId) {
+            throw new Error(`Casing type "${v.casing}" not registered in database.`);
+          }
+
+          if (v.id && existingMap[v.id]) {
+            // Update existing variant
+            incomingIds.push(v.id);
+            await queryRunner.query(`
+              UPDATE product_variants
+              SET casing_type_id = $1, sku = $2, barcode = $3, name = $4, selling_price = $5, customer_eta = $6,
+                  visibility = $7, status = $8, sales_status = $9, dimensions = $10, weight = $11, variant_attributes = $12, 
+                  updated_by = $13, updated_at = NOW()
+              WHERE id = $14;
+            `, [
+              casingTypeId,
+              v.sku.trim(),
+              v.barcode || null,
+              v.name || `${car.name || oldData.model_name} (${v.casing})`,
+              Number(v.price || 0),
+              v.customerEta || null,
+              v.isVisible !== false ? 'Visible' : 'Hidden',
+              v.status || 'Active',
+              v.salesStatus || 'Available',
+              v.dimensions || null,
+              v.weight ? Number(v.weight) : null,
+              v.variantAttributes ? JSON.stringify(v.variantAttributes) : '{}',
+              updaterEmail,
+              v.id
+            ]);
+          } else {
+            // Insert new variant
+            const newVarRes = await queryRunner.query(`
+              INSERT INTO product_variants (
+                product_id, casing_type_id, sku, barcode, name, selling_price, customer_eta, 
+                visibility, status, sales_status, dimensions, weight, variant_attributes, created_by
+              )
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+              RETURNING id;
+            `, [
+              id,
+              casingTypeId,
+              v.sku.trim(),
+              v.barcode || null,
+              v.name || `${car.name || oldData.model_name} (${v.casing})`,
+              Number(v.price || 0),
+              v.customerEta || null,
+              v.isVisible !== false ? 'Visible' : 'Hidden',
+              v.status || 'Active',
+              v.salesStatus || 'Available',
+              v.dimensions || null,
+              v.weight ? Number(v.weight) : null,
+              v.variantAttributes ? JSON.stringify(v.variantAttributes) : '{}',
+              updaterEmail
+            ]);
+            incomingIds.push(newVarRes[0].id);
+          }
+        }
+
+        // Soft delete any old variants that were not in the incoming payload
+        for (const ev of existingVariants) {
+          if (!incomingIds.includes(ev.id)) {
+            await queryRunner.query("UPDATE product_variants SET deleted_at = NOW(), status = 'Archived' WHERE id = $1;", [ev.id]);
+          }
         }
       }
 
