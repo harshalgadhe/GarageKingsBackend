@@ -70,41 +70,72 @@ async function main() {
   await client.connect();
   console.log("Connected to PostgreSQL database.");
 
-  // Truncate non-preserved transactional data
-  console.log("Truncating transactional database tables...");
-  await client.query(`
-    TRUNCATE TABLE 
-      cash_ledger,
-      supplier_payments,
-      supplier_purchase_receipt_items,
-      supplier_purchase_receipts,
-      supplier_purchase_items,
-      supplier_purchases,
-      suppliers,
-      order_inventory_allocations,
-      order_items,
-      orders,
-      inventory_ledger,
-      inventory_snapshots,
-      inventory_cycle_count_items,
-      inventory_cycle_counts,
-      inventory_batches,
-      inventory,
-      product_images,
-      products,
-      expenses,
-      split_settlements,
-      customers,
-      system_notifications,
-      audit_logs
-    CASCADE;
+  // Truncate all tables CASCADE to ensure clean state
+  console.log("Truncating all database tables...");
+  const resTables = await client.query(`
+    SELECT tablename 
+    FROM pg_tables 
+    WHERE schemaname = 'public';
   `);
-  console.log("Transactional tables truncated successfully.");
+  const tables = resTables.rows.map(r => `"${r.tablename}"`);
+  if (tables.length > 0) {
+    await client.query(`TRUNCATE TABLE ${tables.join(', ')} CASCADE;`);
+  }
+  console.log("Database tables truncated successfully.");
+
+  // Drop NOT NULL constraints on products.sku and products.base_price for master-variant compatibility
+  await client.query(`
+    ALTER TABLE products ALTER COLUMN sku DROP NOT NULL;
+    ALTER TABLE products ALTER COLUMN base_price DROP NOT NULL;
+    ALTER TABLE inventory_batches ALTER COLUMN product_id DROP NOT NULL;
+    ALTER TABLE order_items ALTER COLUMN product_id DROP NOT NULL;
+    ALTER TABLE supplier_purchase_items ALTER COLUMN product_id DROP NOT NULL;
+    ALTER TABLE supplier_purchase_receipt_items ALTER COLUMN product_id DROP NOT NULL;
+    ALTER TABLE inventory_ledger ALTER COLUMN product_id DROP NOT NULL;
+    ALTER TABLE reservations ALTER COLUMN product_id DROP NOT NULL;
+  `);
+
+  // Seed default casing types
+  await client.query(`
+    INSERT INTO casing_types (name, display_name, description)
+    VALUES 
+      ('BOX', 'Standard Boxed Casing', 'Standard packaging'),
+      ('BLISTER', 'Blister Card Casing', 'Blister backing packaging'),
+      ('ACRYLIC', 'Premium Acrylic Case Casing', 'Premium acrylic case display')
+    ON CONFLICT (name) DO NOTHING;
+  `);
+
+  const casingRes = await client.query("SELECT id, name, display_name FROM casing_types;");
+  const casingMap = new Map(casingRes.rows.map(c => [c.name.toUpperCase(), c.id]));
+  const casingDisplayMap = new Map(casingRes.rows.map(c => [c.name.toUpperCase(), c.display_name]));
+
+  // Seed default supplier
+  const supInsert = await client.query(
+    "INSERT INTO suppliers (name, contact_email, contact_phone, address) VALUES ($1, $2, $3, $4) RETURNING id",
+    ['Diecast Distributors India', 'contact@ddi.com', '+91 99999 88888', 'Mumbai, India']
+  );
+  const supplierId = supInsert.rows[0].id;
+
+  // Seed default company cash account
+  const cashAccInsert = await client.query(`
+    INSERT INTO cash_accounts (name, type, currency, opening_balance)
+    VALUES ($1, $2, $3, $4)
+    RETURNING id;
+  `, ['Company Bank Account', 'Bank', 'INR', 0.00]);
+  const cashAccountId = cashAccInsert.rows[0].id;
+
+  // Seed admin user
+  await client.query(`
+    INSERT INTO users (email, role, cognito_sub)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (email) DO UPDATE SET role = 'Admin';
+  `, ['sanchitjain0801@gmail.com', 'Admin', 'admin-sanchit']);
 
   const workbook = XLSX.readFile(excelPath);
 
   // Initialize Report Variables
   let productsImported = 0;
+  let variantsCreated = 0;
   let batchesCreated = 0;
   let ordersImported = 0;
   let expensesImported = 0;
@@ -118,13 +149,6 @@ async function main() {
   console.log("\n--- Importing Inventory Sheet ---");
   const invSheet = workbook.Sheets['Inventory'];
   const rawInventory = XLSX.utils.sheet_to_json(invSheet);
-
-  // Create default supplier
-  const supInsert = await client.query(
-    "INSERT INTO suppliers (name, contact_email, contact_phone, address) VALUES ($1, $2, $3, $4) RETURNING id",
-    ['Diecast Distributors India', 'contact@ddi.com', '+91 99999 88888', 'Mumbai, India']
-  );
-  const supplierId = supInsert.rows[0].id;
 
   const skuMap = new Set();
 
@@ -157,38 +181,93 @@ async function main() {
     const prebookingDetails = row['Pre- Booking Details'];
     const isPrebook = !!(prebookingDetails && String(prebookingDetails).trim());
 
-    // Parse casing type from name
-    let parsedCasing = 'box';
+    // Parse casing type from Product Name
+    let parsedCasing = 'BOX';
     const nameLower = name.toLowerCase();
     if (nameLower.includes('blister')) {
-      parsedCasing = 'blister';
+      parsedCasing = 'BLISTER';
     } else if (nameLower.includes('acrylic')) {
-      parsedCasing = 'acrylic casing';
+      parsedCasing = 'ACRYLIC';
+    }
+    const casingTypeId = casingMap.get(parsedCasing);
+
+    // Check if product already exists under brand and model name
+    const normalizedModelName = name
+      .replace(/\s+(blister|box|acrylic|casing)\b/gi, '')
+      .replace(/\b(blister|box|acrylic|casing)\b/gi, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    let productId;
+    const existingRes = await client.query(`
+      SELECT id FROM products 
+      WHERE LOWER(brand) = LOWER($1) AND LOWER(model_name) = LOWER($2)
+      LIMIT 1
+    `, [brand, normalizedModelName]);
+
+    if (existingRes.rows.length > 0) {
+      productId = existingRes.rows[0].id;
+    } else {
+      const newProd = await client.query(`
+        INSERT INTO products (brand, model_name, series, scale, status, description)
+        VALUES ($1, $2, $3, $4, 'Published', $5)
+        RETURNING id;
+      `, [brand, normalizedModelName, series, scale, `Color Variant: ${color}`]);
+      productId = newProd.rows[0].id;
+      productsImported++;
     }
 
-    // Insert product catalog entry (setting status to Published for immediate visibility)
-    const newProd = await client.query(`
-      INSERT INTO products (brand, model_name, series, scale, sku, base_price, purchase_price, selling_price, total_stock, status, is_prebook, description, casing_types)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'Published', $10, $11, $12)
+    // Insert or update Variant
+    const variantSku = `${sku}-${parsedCasing}`;
+    const variantName = `${normalizedModelName} (${casingDisplayMap.get(parsedCasing)})`;
+
+    let variantId;
+    const varRes = await client.query(`
+      SELECT id FROM product_variants 
+      WHERE product_id = $1 AND casing_type_id = $2
+      LIMIT 1
+    `, [productId, casingTypeId]);
+
+    if (varRes.rows.length > 0) {
+      variantId = varRes.rows[0].id;
+      await client.query(`
+        UPDATE product_variants 
+        SET total_stock = total_stock + $1, sold_stock = sold_stock + $2, updated_at = NOW()
+        WHERE id = $3;
+      `, [quantityPurchased, quantitySold, variantId]);
+    } else {
+      const newVar = await client.query(`
+        INSERT INTO product_variants (product_id, casing_type_id, sku, name, selling_price, status, sales_status, total_stock, sold_stock)
+        VALUES ($1, $2, $3, $4, $5, 'Published', $6, $7, $8)
+        RETURNING id;
+      `, [productId, casingTypeId, variantSku, variantName, sellingPrice, isPrebook ? 'Preorder' : 'Available', quantityPurchased, quantitySold]);
+      variantId = newVar.rows[0].id;
+      variantsCreated++;
+    }
+
+    // Seed catalog price
+    await client.query(`
+      INSERT INTO catalog_prices (variant_id, selling_price, reason, created_by)
+      VALUES ($1, $2, 'Historical data import', 'Import Pipeline');
+    `, [variantId, sellingPrice]);
+
+    // Insert Inventory Batch
+    const batchInsert = await client.query(`
+      INSERT INTO inventory_batches (variant_id, sku, purchase_price, quantity_received, quantity_available, quantity_sold, supplier_id, received_at, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING id;
-    `, [brand, name, series, scale, sku, sellingPrice, purchasePrice, sellingPrice, quantityPurchased, isPrebook, `Color Variant: ${color}`, [parsedCasing]]);
-    const productId = newProd.rows[0].id;
+    `, [variantId, variantSku, purchasePrice, quantityPurchased, currentStock, quantitySold, supplierId, purchaseDate, currentStock === 0 ? 'Fully Consumed' : 'Open']);
+    const batchId = batchInsert.rows[0].id;
 
-    // Insert inventory batch
+    // Create Initial FIFO transaction ledger
     await client.query(`
-      INSERT INTO inventory_batches (product_id, sku, purchase_price, selling_price, quantity_received, quantity_available, quantity_sold, supplier_id, received_at, casing_type)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-    `, [productId, sku, purchasePrice, sellingPrice, quantityPurchased, currentStock, quantitySold, supplierId, purchaseDate, parsedCasing]);
+      INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, reason, performed_by)
+      VALUES ($1, $2, 'INITIAL_INFLOW', $3, $4, $5, $6);
+    `, [variantId, batchId, quantityPurchased, purchasePrice, 'Historical batch import', 'Import Pipeline']);
 
-    // Insert inventory cache
-    await client.query(`
-      INSERT INTO inventory (product_id, quantity_available, quantity_sold, quantity_reserved, quantity_damaged)
-      VALUES ($1, $2, $3, 0, 0)
-    `, [productId, currentStock, quantitySold]);
-
-    productsImported++;
     batchesCreated++;
   }
+  console.log(`Successfully synced details for ${productsImported} products, ${variantsCreated} variants, and ${batchesCreated} batches.`);
 
   // ==========================================
   // 2. IMPORT CUSTOMERS & ORDERS (Orders)
@@ -221,8 +300,9 @@ async function main() {
     const rawStatus = String(row['Status'] || 'Pending').trim().toLowerCase();
     const orderDate = parseExcelDate(row['Date']);
     const orderType = String(row['Type'] || 'Order').trim().toLowerCase();
+    const paidTo = String(row['Paid To'] || 'Company Account').trim();
 
-    // Historical status mapping
+    // Map status
     let status = 'Pending';
     if (rawStatus === 'done' || rawStatus === 'shipped') {
       status = 'Shipped';
@@ -234,7 +314,7 @@ async function main() {
       status = 'Pending';
     } else if (rawStatus === 'cancelled') {
       status = 'Cancelled';
-    } else if (rawStatus === 'pending receipt' || rawStatus === 'verification pending') {
+    } else if (rawStatus === 'pending receipt') {
       status = 'Verification Pending';
     }
 
@@ -242,7 +322,7 @@ async function main() {
     const advanceAmount = bookingType === 'pre_order' ? amountPaid : 0;
     const remainingAmount = 0;
 
-    // Derived unique email to avoid duplicates
+    // Derived unique email
     const emailSafe = customerName.replace(/\s+/g, '').toLowerCase() + (phone !== 'NA' ? `.${phone.slice(-4)}` : '') + '@garagekings.in';
 
     // Find or create user
@@ -258,7 +338,7 @@ async function main() {
       userId = newUser.rows[0].id;
     }
 
-    // Find or create customer CRM record
+    // Find or create customer
     const custRes = await client.query("SELECT id FROM customers WHERE email = $1 LIMIT 1", [emailSafe]);
     if (custRes.rows.length === 0) {
       await client.query(
@@ -278,20 +358,38 @@ async function main() {
     // Parse product SKUs
     const skus = skuListString.split(',').map(s => s.trim()).filter(Boolean);
     for (const itemSku of skus) {
-      const prodRes = await client.query("SELECT id, selling_price, purchase_price FROM products WHERE sku = $1 LIMIT 1", [itemSku]);
-      if (prodRes.rows.length > 0) {
-        const prod = prodRes.rows[0];
+      // Find matching variant (fallback from standard SKU to BOX variant)
+      const varRes = await client.query(`
+        SELECT pv.id, pv.selling_price, pv.name, pv.sku, p.brand, ct.display_name as casing_display
+        FROM product_variants pv
+        JOIN products p ON p.id = pv.product_id
+        JOIN casing_types ct ON ct.id = pv.casing_type_id
+        WHERE pv.sku = $1 OR pv.sku = $2
+        LIMIT 1;
+      `, [itemSku, `${itemSku}-BOX`]);
+
+      if (varRes.rows.length > 0) {
+        const v = varRes.rows[0];
         await client.query(`
-          INSERT INTO order_items (order_id, product_id, qty, price_at_purchase, purchase_price_at_purchase)
-          VALUES ($1, $2, 1, $3, $4)
-        `, [dbOrderId, prod.id, prod.selling_price || amountPaid, prod.purchase_price || 0]);
+          INSERT INTO order_items (order_id, variant_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
+          VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8)
+        `, [dbOrderId, v.id, v.selling_price || amountPaid, v.name, v.sku, v.brand, v.casing_display, v.brand]);
       } else {
         validationWarnings.push(`Order SKU reference not found: SKU ${itemSku} on Order ${orderId}`);
       }
     }
 
+    // Add inflow payment to cash ledger
+    if (amountPaid > 0) {
+      await client.query(`
+        INSERT INTO cash_ledger (cash_account_id, type, amount, source_type, source_id, created_by, reason, notes)
+        VALUES ($1, 'Sales Revenue', $2, 'Order', $3, 'System', $4, $5);
+      `, [cashAccountId, amountPaid, dbOrderId, `Inflow for order: ${orderId}`, `Payment via: ${paidTo}`]);
+    }
+
     ordersImported++;
   }
+  console.log(`Successfully synced ${ordersImported} orders.`);
 
   // ==========================================
   // 3. IMPORT EXPENSES (Expense)
@@ -299,10 +397,6 @@ async function main() {
   console.log("\n--- Importing Expense Sheet ---");
   const expenseSheet = workbook.Sheets['Expense'];
   const rawExpenses = XLSX.utils.sheet_to_json(expenseSheet);
-
-  // Fetch default cash account ID
-  const accountRes = await client.query("SELECT id FROM cash_accounts WHERE type = 'Bank' LIMIT 1;");
-  const cashAccountId = accountRes.rows[0]?.id;
 
   for (const row of rawExpenses) {
     const desc = row['Description'];
@@ -340,6 +434,7 @@ async function main() {
   console.log("     DATABASE IMPORT METRICS REPORT");
   console.log("==========================================");
   console.log(`Products Imported:            ${productsImported}`);
+  console.log(`Variants Created:             ${variantsCreated}`);
   console.log(`Inventory Batches Created:    ${batchesCreated}`);
   console.log(`Orders Imported:              ${ordersImported}`);
   console.log(`Expenses Imported:            ${expensesImported}`);

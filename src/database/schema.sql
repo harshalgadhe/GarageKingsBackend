@@ -95,19 +95,87 @@ CREATE TABLE IF NOT EXISTS products (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_products_brand_model ON products(brand, model_name);
-CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku);
+
+-- 3.2 Casing Types Table (Relational Casing Normalization)
+CREATE TABLE IF NOT EXISTS casing_types (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(100) UNIQUE NOT NULL,
+    display_name VARCHAR(100) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3.3 Product Variants Table (Commerce Entity)
+CREATE TABLE IF NOT EXISTS product_variants (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    casing_type_id UUID NOT NULL REFERENCES casing_types(id) ON DELETE RESTRICT,
+    sku VARCHAR(100) UNIQUE NOT NULL,
+    barcode VARCHAR(100),
+    name VARCHAR(255) NOT NULL,
+    selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00 CHECK (selling_price >= 0),
+    customer_eta DATE,
+    visibility VARCHAR(50) NOT NULL DEFAULT 'Visible',
+    status VARCHAR(50) NOT NULL DEFAULT 'Draft',
+    sales_status VARCHAR(50) NOT NULL DEFAULT 'Coming Soon',
+    dimensions VARCHAR(100),
+    weight NUMERIC(8, 2),
+    variant_attributes JSONB DEFAULT '{}'::JSONB,
+    total_stock INT NOT NULL DEFAULT 0 CHECK (total_stock >= 0),
+    sold_stock INT NOT NULL DEFAULT 0 CHECK (sold_stock >= 0),
+    locked_stock INT NOT NULL DEFAULT 0 CHECK (locked_stock >= 0),
+    created_by VARCHAR(255),
+    updated_by VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_variants_sku_active ON product_variants(sku) WHERE deleted_at IS NULL;
+
+-- 3.4 Product Price History Table (Auditing Pricing Changes)
+CREATE TABLE IF NOT EXISTS product_price_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+    previous_price NUMERIC(12, 2) NOT NULL CHECK (previous_price >= 0),
+    new_price NUMERIC(12, 2) NOT NULL CHECK (new_price >= 0),
+    reason TEXT,
+    admin_email VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_prod_price_history_variant ON product_price_history(variant_id);
+
+-- 3.5 Catalog Prices Table (Price Books Scheduling)
+CREATE TABLE IF NOT EXISTS catalog_prices (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+    selling_price NUMERIC(12, 2) NOT NULL CHECK (selling_price >= 0),
+    currency VARCHAR(3) NOT NULL DEFAULT 'INR',
+    marketplace_id VARCHAR(50) DEFAULT 'website',
+    customer_type VARCHAR(50) DEFAULT 'Retail',
+    reason TEXT,
+    effective_from TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    effective_to TIMESTAMP WITH TIME ZONE,
+    created_by VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_prices_variant ON catalog_prices(variant_id);
 
 -- 4. Product Images Table (Multi-resolution Assets Store)
 CREATE TABLE IF NOT EXISTS product_images (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    thumbnail_url TEXT NOT NULL,
-    medium_url TEXT NOT NULL,
-    full_url TEXT NOT NULL,
+    variant_id UUID REFERENCES product_variants(id) ON DELETE SET NULL,
+    media_type VARCHAR(20) NOT NULL DEFAULT 'image',
+    url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    alt_text VARCHAR(255),
     is_primary BOOLEAN DEFAULT FALSE,
+    display_order INT DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_product_images_parent ON product_images(product_id);
+CREATE INDEX IF NOT EXISTS idx_product_images_variant ON product_images(variant_id);
 
 -- 5. Suppliers Table (formerly Distributors)
 CREATE TABLE IF NOT EXISTS suppliers (
@@ -147,10 +215,12 @@ CREATE TABLE IF NOT EXISTS supplier_purchases (
 CREATE TABLE IF NOT EXISTS supplier_purchase_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
     quantity INT NOT NULL CHECK (quantity > 0),
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-    casing_type VARCHAR(50) DEFAULT 'box',
+    supplier_eta DATE,
+    warehouse_eta DATE,
+    received_quantity_cache INT NOT NULL DEFAULT 0 CHECK (received_quantity_cache >= 0),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -183,8 +253,7 @@ CREATE TABLE IF NOT EXISTS supplier_purchase_receipts (
 CREATE TABLE IF NOT EXISTS supplier_purchase_receipt_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     purchase_receipt_id UUID NOT NULL REFERENCES supplier_purchase_receipts(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-    casing_type VARCHAR(50) DEFAULT 'box',
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
     quantity_received INT NOT NULL CHECK (quantity_received >= 0),
     quantity_short INT NOT NULL DEFAULT 0 CHECK (quantity_short >= 0),
     quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
@@ -206,15 +275,13 @@ CREATE TABLE IF NOT EXISTS supplier_purchase_attachments (
 -- 5.9 Inventory Batches Table (Enhanced)
 CREATE TABLE IF NOT EXISTS inventory_batches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
     supplier_id UUID REFERENCES suppliers(id) ON DELETE SET NULL,
     supplier_purchase_id UUID REFERENCES supplier_purchases(id) ON DELETE SET NULL,
     purchase_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE SET NULL,
     purchase_order_id UUID REFERENCES purchase_orders(id) ON DELETE SET NULL,
     sku VARCHAR(100) NOT NULL,
-    casing_type VARCHAR(50) DEFAULT 'box',
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-    selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     quantity_received INT NOT NULL DEFAULT 0 CHECK (quantity_received >= 0),
     quantity_available INT NOT NULL DEFAULT 0 CHECK (quantity_available >= 0),
     quantity_reserved INT NOT NULL DEFAULT 0 CHECK (quantity_reserved >= 0),
@@ -225,21 +292,7 @@ CREATE TABLE IF NOT EXISTS inventory_batches (
     received_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_inv_batches_fifo ON inventory_batches(product_id, received_at ASC);
-
--- 5.4 Inventory Table (Quantities in Stock Cache)
-CREATE TABLE IF NOT EXISTS inventory (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID UNIQUE NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    quantity_available INT NOT NULL DEFAULT 0 CHECK (quantity_available >= 0),
-    quantity_reserved INT NOT NULL DEFAULT 0 CHECK (quantity_reserved >= 0),
-    quantity_sold INT NOT NULL DEFAULT 0 CHECK (quantity_sold >= 0),
-    quantity_returned INT NOT NULL DEFAULT 0 CHECK (quantity_returned >= 0),
-    quantity_damaged INT NOT NULL DEFAULT 0 CHECK (quantity_damaged >= 0),
-    quantity_locked INT NOT NULL DEFAULT 0 CHECK (quantity_locked >= 0),
-    warehouse_shelf_location VARCHAR(100),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+CREATE INDEX IF NOT EXISTS idx_inv_batches_fifo ON inventory_batches(variant_id, received_at ASC);
 
 -- 7. Customers Table (CRM Record Tracks)
 CREATE TABLE IF NOT EXISTS customers (
@@ -289,12 +342,20 @@ CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 CREATE TABLE IF NOT EXISTS order_items (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
     qty INT NOT NULL DEFAULT 1 CHECK (qty > 0),
     price_at_purchase NUMERIC(12, 2) NOT NULL,
-    purchase_price_at_purchase NUMERIC(12, 2) DEFAULT 0.00
+    purchase_price_at_purchase NUMERIC(12, 2) DEFAULT 0.00,
+    variant_name_snapshot VARCHAR(255) NOT NULL,
+    sku_snapshot VARCHAR(100) NOT NULL,
+    barcode_snapshot VARCHAR(100),
+    brand_snapshot VARCHAR(100) NOT NULL,
+    casing_snapshot VARCHAR(100) NOT NULL,
+    manufacturer_snapshot VARCHAR(100) NOT NULL,
+    metadata_snapshot JSONB DEFAULT '{}'::JSONB
 );
 CREATE INDEX IF NOT EXISTS idx_order_items_parent ON order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_order_items_variant ON order_items(variant_id);
 
 -- 11.2 Order Inventory Allocations Table
 CREATE TABLE IF NOT EXISTS order_inventory_allocations (
@@ -303,7 +364,6 @@ CREATE TABLE IF NOT EXISTS order_inventory_allocations (
     batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
     quantity INT NOT NULL CHECK (quantity > 0),
     purchase_price NUMERIC(12, 2) NOT NULL,
-    selling_price NUMERIC(12, 2) NOT NULL,
     allocated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_order_allocations_item ON order_inventory_allocations(order_item_id);
@@ -311,24 +371,23 @@ CREATE INDEX IF NOT EXISTS idx_order_allocations_item ON order_inventory_allocat
 -- 6. Inventory Ledger Table (Immutable Movement Trail)
 CREATE TABLE IF NOT EXISTS inventory_ledger (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
     batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
     order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
     type VARCHAR(50) NOT NULL,
     quantity_changed INT NOT NULL,
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
-    selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     reason TEXT NOT NULL,
     performed_by VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_ledger_product ON inventory_ledger(product_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_variant ON inventory_ledger(variant_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_batch ON inventory_ledger(batch_id);
 
 -- 6.2 Inventory Snapshots Table
 CREATE TABLE IF NOT EXISTS inventory_snapshots (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
     snapshot_date DATE NOT NULL,
     quantity_available INT NOT NULL DEFAULT 0,
     quantity_reserved INT NOT NULL DEFAULT 0,
@@ -336,7 +395,7 @@ CREATE TABLE IF NOT EXISTS inventory_snapshots (
     quantity_returned INT NOT NULL DEFAULT 0,
     quantity_damaged INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (product_id, snapshot_date)
+    UNIQUE (variant_id, snapshot_date)
 );
 
 -- 6.3 Cycle Count Audits Forward Compatibility
@@ -362,14 +421,14 @@ CREATE TABLE IF NOT EXISTS inventory_cycle_count_items (
 -- Legacy Inventory Transactions Table (Mandatory Audit Logs)
 CREATE TABLE IF NOT EXISTS inventory_transactions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
     type inventory_tx_type NOT NULL,
     quantity_changed INT NOT NULL,
     reason TEXT NOT NULL,
     admin_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_inv_tx_prod_type ON inventory_transactions(product_id, type);
+CREATE INDEX IF NOT EXISTS idx_inv_tx_var_type ON inventory_transactions(variant_id, type);
 
 -- 8. Receipts Table (In-person & Manual Billing)
 CREATE TABLE IF NOT EXISTS receipts (
@@ -425,11 +484,12 @@ CREATE INDEX IF NOT EXISTS idx_receipt_jobs_status ON receipt_generation_jobs(st
 CREATE TABLE IF NOT EXISTS wishlists (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, product_id)
+    UNIQUE(user_id, variant_id)
 );
 CREATE INDEX IF NOT EXISTS idx_wishlists_user ON wishlists(user_id);
+CREATE INDEX IF NOT EXISTS idx_wishlists_variant ON wishlists(variant_id);
 
 -- 13. Garage Items Table (Collection Vault)
 CREATE TABLE IF NOT EXISTS garage_items (
@@ -471,13 +531,13 @@ CREATE TABLE IF NOT EXISTS drops (
 );
 CREATE INDEX IF NOT EXISTS idx_drops_schedule ON drops(scheduled_time, is_active);
 
--- 16. Drop Products Table
-CREATE TABLE IF NOT EXISTS drop_products (
+-- 16. Drop Variants Table
+CREATE TABLE IF NOT EXISTS drop_variants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     drop_id UUID NOT NULL REFERENCES drops(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
     allocated_qty INT NOT NULL DEFAULT 1 CHECK (allocated_qty > 0),
-    UNIQUE(drop_id, product_id)
+    UNIQUE(drop_id, variant_id)
 );
 
 -- 17. Notifications Table (System Messaging alerts)
@@ -495,16 +555,27 @@ CREATE INDEX IF NOT EXISTS idx_notif_user_unread ON notifications(user_id, is_re
 CREATE TABLE IF NOT EXISTS marketplace_listings (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     seller_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-    asking_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_ask CHECK (asking_price > 0),
-    condition_grade VARCHAR(100) NOT NULL,
-    status listing_status DEFAULT 'Active',
+    title VARCHAR(255),
     description TEXT,
+    visibility VARCHAR(50) NOT NULL DEFAULT 'Visible',
+    status listing_status DEFAULT 'Active',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_market_prod_status ON marketplace_listings(product_id, status);
 CREATE INDEX IF NOT EXISTS idx_market_seller_status ON marketplace_listings(seller_id, status);
+
+-- 18.2 Marketplace Listing Items Table (Supporting Bundles)
+CREATE TABLE IF NOT EXISTS marketplace_listing_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    listing_id UUID NOT NULL REFERENCES marketplace_listings(id) ON DELETE CASCADE,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
+    quantity INT NOT NULL DEFAULT 1 CHECK (quantity > 0),
+    asking_price NUMERIC(12, 2) NOT NULL CHECK (asking_price > 0),
+    condition_grade VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_market_listing_items_parent ON marketplace_listing_items(listing_id);
+CREATE INDEX IF NOT EXISTS idx_market_listing_items_variant ON marketplace_listing_items(variant_id);
 
 -- 19. Offers Table (Negotiations)
 CREATE TABLE IF NOT EXISTS offers (
@@ -532,7 +603,7 @@ CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
 -- 21. Auction Events Table (Auction Management)
 CREATE TABLE IF NOT EXISTS auction_events (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
     title VARCHAR(255) NOT NULL,
     start_time TIMESTAMP WITH TIME ZONE NOT NULL,
     end_time TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -544,7 +615,7 @@ CREATE TABLE IF NOT EXISTS auction_events (
     CONSTRAINT chk_time CHECK (start_time < end_time)
 );
 CREATE INDEX IF NOT EXISTS idx_auction_status ON auction_events(status, start_time, end_time);
-CREATE INDEX IF NOT EXISTS idx_auction_product ON auction_events(product_id);
+CREATE INDEX IF NOT EXISTS idx_auction_variant ON auction_events(variant_id);
 
 -- 22. Auction Bids Table (Real-time Bidding Entries)
 CREATE TABLE IF NOT EXISTS auction_bids (
@@ -691,11 +762,12 @@ CREATE TABLE IF NOT EXISTS split_settlements (
 -- 30. Reservations Table (Legacy Checkout holds)
 CREATE TABLE IF NOT EXISTS reservations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
-    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+    customer_id UUID REFERENCES customers(id) ON DELETE CASCADE,
     order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
-    quantity INT DEFAULT 1,
+    quantity INT DEFAULT 1 CHECK (quantity > 0),
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    released_at TIMESTAMP WITH TIME ZONE,
     status VARCHAR(50) DEFAULT 'Active',
     idempotency_key VARCHAR(255) UNIQUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -785,3 +857,72 @@ CREATE TABLE IF NOT EXISTS financial_monthly_snapshots (
     cash_balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 37. Supplier Payment Allocations Table
+CREATE TABLE IF NOT EXISTS supplier_payment_allocations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_payment_id UUID NOT NULL REFERENCES supplier_payments(id) ON DELETE CASCADE,
+    supplier_purchase_id UUID NOT NULL REFERENCES supplier_purchases(id) ON DELETE CASCADE,
+    amount_allocated NUMERIC(12, 2) NOT NULL CHECK (amount_allocated > 0),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sup_pay_alloc_pay ON supplier_payment_allocations(supplier_payment_id);
+CREATE INDEX IF NOT EXISTS idx_sup_pay_alloc_purch ON supplier_payment_allocations(supplier_purchase_id);
+
+-- 38. Supplier Credits Table
+CREATE TABLE IF NOT EXISTS supplier_credits (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    supplier_id UUID NOT NULL REFERENCES suppliers(id) ON DELETE RESTRICT,
+    amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+    source_receipt_id UUID REFERENCES supplier_purchase_receipts(id) ON DELETE SET NULL,
+    applied_payment_id UUID REFERENCES supplier_payments(id) ON DELETE SET NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'Available', -- 'Available', 'Applied', 'Refunded'
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sup_credits_supplier ON supplier_credits(supplier_id);
+
+-- 39. Inventory Adjustments Table
+CREATE TABLE IF NOT EXISTS inventory_adjustments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
+    quantity_changed INT NOT NULL,
+    type VARCHAR(50) NOT NULL, -- 'Write-off', 'Found', 'Correction', 'Damage'
+    reason TEXT NOT NULL,
+    requested_by VARCHAR(255) NOT NULL,
+    approved_by VARCHAR(255),
+    status VARCHAR(50) NOT NULL DEFAULT 'Pending', -- 'Pending', 'Approved', 'Rejected'
+    approved_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_inv_adjustments_variant ON inventory_adjustments(variant_id);
+
+-- 40. Customer Payments Table
+CREATE TABLE IF NOT EXISTS customer_payments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+    payment_method VARCHAR(50) NOT NULL, -- 'Razorpay', 'UPI', 'Bank Transfer', 'Cash'
+    transaction_reference VARCHAR(255) UNIQUE,
+    reconciliation_status VARCHAR(50) NOT NULL DEFAULT 'Unreconciled', -- 'Unreconciled', 'Reconciled', 'Flagged'
+    reconciled_at TIMESTAMP WITH TIME ZONE,
+    reconciled_by VARCHAR(255),
+    notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_cust_payments_order ON customer_payments(order_id);
+
+-- 41. Customer Returns Table
+CREATE TABLE IF NOT EXISTS customer_returns (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+    variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    reason TEXT NOT NULL,
+    action_taken VARCHAR(50) NOT NULL, -- 'Restocked', 'Written-off', 'Replacement Shipped'
+    refunded_amount NUMERIC(12, 2) DEFAULT 0.00 CHECK (refunded_amount >= 0),
+    received_by VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_cust_returns_order ON customer_returns(order_id);
+CREATE INDEX IF NOT EXISTS idx_cust_returns_variant ON customer_returns(variant_id);

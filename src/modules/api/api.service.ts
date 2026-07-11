@@ -1627,7 +1627,7 @@ export class ApiService implements OnModuleInit {
 
     try {
       // Get order items
-      const items = await queryRunner.query('SELECT id as "orderItemId", product_id, qty FROM order_items WHERE order_id = $1', [orderId]);
+      const items = await queryRunner.query('SELECT id as "orderItemId", product_id, qty, price_at_purchase as "priceAtPurchase", variant_id FROM order_items WHERE order_id = $1', [orderId]);
       for (const item of items) {
         // Lock aggregate caches
         const invRows = await queryRunner.query(`
@@ -1650,12 +1650,12 @@ export class ApiService implements OnModuleInit {
         
         // Select available batches in FIFO order
         const batches = await queryRunner.query(`
-          SELECT id, purchase_price, selling_price, quantity_available, quantity_reserved
+          SELECT id, purchase_price, quantity_available, quantity_reserved
           FROM inventory_batches
-          WHERE product_id = $1 AND quantity_available > 0
+          WHERE variant_id = $1 AND quantity_available > 0
           ORDER BY received_at ASC
           FOR UPDATE;
-        `, [item.product_id]);
+        `, [item.variant_id || item.product_id]);
         
         const totalAvailable = batches.reduce((sum, b) => sum + Number(b.quantity_available), 0);
         
@@ -1687,13 +1687,13 @@ export class ApiService implements OnModuleInit {
           await queryRunner.query(`
             INSERT INTO order_inventory_allocations (order_item_id, batch_id, quantity, purchase_price, selling_price)
             VALUES ($1, $2, $3, $4, $5);
-          `, [item.orderItemId, b.id, allocQty, Number(b.purchase_price), Number(b.selling_price)]);
+          `, [item.orderItemId, b.id, allocQty, Number(b.purchase_price), Number(item.priceAtPurchase || 0)]);
           
           // Record ledger RESERVE
           await queryRunner.query(`
-            INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+            INSERT INTO inventory_ledger (variant_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
             VALUES ($1, $2, $3, 'RESERVE', $4, $5, $6, $7, $8);
-          `, [item.product_id, b.id, orderId, -allocQty, Number(b.purchase_price), Number(b.selling_price), `Reserved stock for order approval`, adminEmail || 'System']);
+          `, [item.variant_id, b.id, orderId, -allocQty, Number(b.purchase_price), Number(item.priceAtPurchase || 0), `Reserved stock for order approval`, adminEmail || 'System']);
           
           mixedCostSum += Number(b.purchase_price) * allocQty;
           remainingToAllocate -= allocQty;
@@ -3150,7 +3150,7 @@ export class ApiService implements OnModuleInit {
 
   async receiveInventoryBatchTx(
     queryRunner: any,
-    productId: string,
+    variantId: string,
     distributorName: string, // Can be supplier name or supplier UUID
     purchasePrice: number,
     sellingPrice: number,
@@ -3186,16 +3186,17 @@ export class ApiService implements OnModuleInit {
       }
     }
 
-    // Get product SKU
-    const prod = await queryRunner.query("SELECT sku FROM products WHERE id = $1;", [productId]);
-    const sku = prod[0]?.sku || `SKU-MIG-${Date.now()}`;
+    // Get variant SKU and parent product ID
+    const varRows = await queryRunner.query("SELECT sku, product_id FROM product_variants WHERE id = $1;", [variantId]);
+    const sku = varRows[0]?.sku || `SKU-MIG-${Date.now()}`;
+    const parentProductId = varRows[0]?.product_id;
 
     // Insert batch
     const batchRes = await queryRunner.query(`
-      INSERT INTO inventory_batches (product_id, supplier_id, supplier_purchase_id, purchase_receipt_id, sku, purchase_price, selling_price, quantity_received, quantity_available, casing_type)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9)
+      INSERT INTO inventory_batches (variant_id, supplier_id, supplier_purchase_id, purchase_receipt_id, sku, purchase_price, quantity_received, quantity_available, status, received_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'Open', NOW())
       RETURNING id;
-    `, [productId, distId, supplierPurchaseId || null, purchaseReceiptId || null, sku, Number(purchasePrice), Number(sellingPrice), Number(quantity), casingType || 'box']);
+    `, [variantId, distId, supplierPurchaseId || null, purchaseReceiptId || null, sku, Number(purchasePrice), Number(quantity)]);
     const batchId = batchRes[0].id;
 
     // Record Inventory Purchase Cash Ledger entry (Skip if it's from a Supplier Purchase since payments are tracked separately)
@@ -3238,27 +3239,38 @@ export class ApiService implements OnModuleInit {
 
     // Record ledger entry
     await queryRunner.query(`
-      INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+      INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
       VALUES ($1, $2, 'RECEIVE', $3, $4, $5, $6, $7);
-    `, [productId, batchId, Number(quantity), Number(purchasePrice), Number(sellingPrice), `Received batch of ${quantity} units from ${distName}`, creatorEmail]);
+    `, [variantId, batchId, Number(quantity), Number(purchasePrice), Number(sellingPrice), `Received batch of ${quantity} units from ${distName}`, creatorEmail]);
+
+    // Update variant stock and price
+    await queryRunner.query(`
+      UPDATE product_variants 
+      SET total_stock = total_stock + $1,
+          selling_price = $2,
+          updated_at = NOW() 
+      WHERE id = $3;
+    `, [Number(quantity), Number(sellingPrice), variantId]);
 
     // Update products cache
-    await queryRunner.query(`
-      UPDATE products 
-      SET total_stock = total_stock + $1,
-          purchase_price = $2,
-          selling_price = $3,
-          base_price = $3,
-          updated_at = NOW() 
-      WHERE id = $4;
-    `, [Number(quantity), Number(purchasePrice), Number(sellingPrice), productId]);
+    if (parentProductId) {
+      await queryRunner.query(`
+        UPDATE products 
+        SET total_stock = total_stock + $1,
+            purchase_price = $2,
+            selling_price = $3,
+            base_price = $3,
+            updated_at = NOW() 
+        WHERE id = $4;
+      `, [Number(quantity), Number(purchasePrice), Number(sellingPrice), parentProductId]);
 
-    // Update inventory cache
-    await queryRunner.query(`
-      INSERT INTO inventory (product_id, quantity_available)
-      VALUES ($1, $2)
-      ON CONFLICT (product_id) DO UPDATE SET quantity_available = inventory.quantity_available + $2;
-    `, [productId, Number(quantity)]);
+      // Update legacy inventory cache
+      await queryRunner.query(`
+        INSERT INTO inventory (product_id, quantity_available)
+        VALUES ($1, $2)
+        ON CONFLICT (product_id) DO UPDATE SET quantity_available = inventory.quantity_available + $2;
+      `, [parentProductId, Number(quantity)]);
+    }
 
     // Chronological Pre-order Allocation Engine queueing
     const preorders = await queryRunner.query(`
@@ -3284,9 +3296,9 @@ export class ApiService implements OnModuleInit {
 
       // Record in ledger
       await queryRunner.query(`
-        INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+        INSERT INTO inventory_ledger (variant_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
         VALUES ($1, $2, $3, 'RESERVE', $4, $5, $6, $7, $8);
-      `, [productId, batchId, po.orderId, -allocQty, Number(purchasePrice), Number(sellingPrice), `Allocated pre-order for order item ${po.orderItemId}`, 'System/PreorderQueue']);
+      `, [variantId, batchId, po.orderId, -allocQty, Number(purchasePrice), Number(sellingPrice), `Allocated pre-order for order item ${po.orderItemId}`, 'System/PreorderQueue']);
 
       // Update batch
       await queryRunner.query(`
@@ -3298,21 +3310,31 @@ export class ApiService implements OnModuleInit {
         WHERE id = $2;
       `, [allocQty, batchId]);
 
-      // Update caches: deduct available and add to reserved
+      // Update variant locked stock cache
       await queryRunner.query(`
-        UPDATE products
+        UPDATE product_variants
         SET locked_stock = locked_stock + $1,
             updated_at = NOW()
         WHERE id = $2;
-      `, [allocQty, productId]);
+      `, [allocQty, variantId]);
 
-      await queryRunner.query(`
-        UPDATE inventory
-        SET quantity_available = quantity_available - $1,
-            quantity_reserved = quantity_reserved + $1,
-            updated_at = NOW()
-        WHERE product_id = $2;
-      `, [allocQty, productId]);
+      // Update caches: deduct available and add to reserved
+      if (parentProductId) {
+        await queryRunner.query(`
+          UPDATE products
+          SET locked_stock = locked_stock + $1,
+              updated_at = NOW()
+          WHERE id = $2;
+        `, [allocQty, parentProductId]);
+
+        await queryRunner.query(`
+          UPDATE inventory
+          SET quantity_available = quantity_available - $1,
+              quantity_reserved = quantity_reserved + $1,
+              updated_at = NOW()
+          WHERE product_id = $2;
+        `, [allocQty, parentProductId]);
+      }
 
       // Update order item purchase cost
       await queryRunner.query(`
@@ -4058,6 +4080,186 @@ export class ApiService implements OnModuleInit {
       old,
       { status }
     );
+    return { success: true };
+  }
+
+  // ==========================================
+  //      MASTER DATA LOOKUP RESOLVERS
+  // ==========================================
+
+  // Brands
+  async getBrands(adminMode = false) {
+    if (adminMode) {
+      return this.dataSource.query("SELECT * FROM brands ORDER BY display_order ASC, name ASC;");
+    }
+    return this.dataSource.query("SELECT * FROM brands WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;");
+  }
+
+  async createBrand(body: any) {
+    const { name, logoUrl, website, displayOrder, isVisible, status } = body;
+    const slug = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    const result = await this.dataSource.query(`
+      INSERT INTO brands (name, slug, logo_url, website, display_order, is_visible, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *;
+    `, [name, slug, logoUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active']);
+    return result[0];
+  }
+
+  async updateBrand(id: string, body: any) {
+    const { name, logoUrl, website, displayOrder, isVisible, status } = body;
+    const slug = name ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '') : undefined;
+    
+    const fields: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) { fields.push(`name = $${paramIndex++}`, `slug = $${paramIndex++}`); params.push(name, slug); }
+    if (logoUrl !== undefined) { fields.push(`logo_url = $${paramIndex++}`); params.push(logoUrl); }
+    if (website !== undefined) { fields.push(`website = $${paramIndex++}`); params.push(website); }
+    if (displayOrder !== undefined) { fields.push(`display_order = $${paramIndex++}`); params.push(displayOrder); }
+    if (isVisible !== undefined) { fields.push(`is_visible = $${paramIndex++}`); params.push(isVisible); }
+    if (status !== undefined) { fields.push(`status = $${paramIndex++}`); params.push(status); }
+
+    if (fields.length === 0) return { success: true };
+
+    params.push(id);
+    const query = `UPDATE brands SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${paramIndex} RETURNING *;`;
+    const result = await this.dataSource.query(query, params);
+    return result[0];
+  }
+
+  async archiveBrand(id: string) {
+    await this.dataSource.query("UPDATE brands SET status = 'Archived', deleted_at = NOW() WHERE id = $1;", [id]);
+    return { success: true };
+  }
+
+  // Manufacturers
+  async getManufacturers(adminMode = false) {
+    if (adminMode) {
+      return this.dataSource.query("SELECT * FROM manufacturers ORDER BY display_order ASC, name ASC;");
+    }
+    return this.dataSource.query("SELECT * FROM manufacturers WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;");
+  }
+
+  async createManufacturer(body: any) {
+    const { name, logoUrl, website, displayOrder, isVisible, status } = body;
+    const slug = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    const result = await this.dataSource.query(`
+      INSERT INTO manufacturers (name, slug, logo_url, website, display_order, is_visible, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING *;
+    `, [name, slug, logoUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active']);
+    return result[0];
+  }
+
+  async updateManufacturer(id: string, body: any) {
+    const { name, logoUrl, website, displayOrder, isVisible, status } = body;
+    const slug = name ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '') : undefined;
+    
+    const fields: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) { fields.push(`name = $${paramIndex++}`, `slug = $${paramIndex++}`); params.push(name, slug); }
+    if (logoUrl !== undefined) { fields.push(`logo_url = $${paramIndex++}`); params.push(logoUrl); }
+    if (website !== undefined) { fields.push(`website = $${paramIndex++}`); params.push(website); }
+    if (displayOrder !== undefined) { fields.push(`display_order = $${paramIndex++}`); params.push(displayOrder); }
+    if (isVisible !== undefined) { fields.push(`is_visible = $${paramIndex++}`); params.push(isVisible); }
+    if (status !== undefined) { fields.push(`status = $${paramIndex++}`); params.push(status); }
+
+    if (fields.length === 0) return { success: true };
+
+    params.push(id);
+    const query = `UPDATE manufacturers SET ${fields.join(', ')}, updated_at = NOW() WHERE id = $${paramIndex} RETURNING *;`;
+    const result = await this.dataSource.query(query, params);
+    return result[0];
+  }
+
+  async archiveManufacturer(id: string) {
+    await this.dataSource.query("UPDATE manufacturers SET status = 'Archived', deleted_at = NOW() WHERE id = $1;", [id]);
+    return { success: true };
+  }
+
+  // Scales
+  async getScales(adminMode = false) {
+    if (adminMode) {
+      return this.dataSource.query("SELECT * FROM scales ORDER BY display_order ASC, name ASC;");
+    }
+    return this.dataSource.query("SELECT * FROM scales WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;");
+  }
+
+  async createScale(body: any) {
+    const { name, displayOrder, status } = body;
+    const result = await this.dataSource.query(`
+      INSERT INTO scales (name, display_order, status)
+      VALUES ($1, $2, $3)
+      RETURNING *;
+    `, [name, displayOrder || 0, status || 'Active']);
+    return result[0];
+  }
+
+  async updateScale(id: string, body: any) {
+    const { name, displayOrder, status } = body;
+    const fields: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) { fields.push(`name = $${paramIndex++}`); params.push(name); }
+    if (displayOrder !== undefined) { fields.push(`display_order = $${paramIndex++}`); params.push(displayOrder); }
+    if (status !== undefined) { fields.push(`status = $${paramIndex++}`); params.push(status); }
+
+    if (fields.length === 0) return { success: true };
+
+    params.push(id);
+    const query = `UPDATE scales SET ${fields.join(', ')} WHERE id = $${paramIndex} RETURNING *;`;
+    const result = await this.dataSource.query(query, params);
+    return result[0];
+  }
+
+  async archiveScale(id: string) {
+    await this.dataSource.query("UPDATE scales SET status = 'Archived', deleted_at = NOW() WHERE id = $1;", [id]);
+    return { success: true };
+  }
+
+  // Series
+  async getSeries(adminMode = false) {
+    if (adminMode) {
+      return this.dataSource.query("SELECT * FROM series ORDER BY display_order ASC, name ASC;");
+    }
+    return this.dataSource.query("SELECT * FROM series WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;");
+  }
+
+  async createSeries(body: any) {
+    const { name, displayOrder, status } = body;
+    const result = await this.dataSource.query(`
+      INSERT INTO series (name, display_order, status)
+      VALUES ($1, $2, $3)
+      RETURNING *;
+    `, [name, displayOrder || 0, status || 'Active']);
+    return result[0];
+  }
+
+  async updateSeries(id: string, body: any) {
+    const { name, displayOrder, status } = body;
+    const fields: string[] = [];
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) { fields.push(`name = $${paramIndex++}`); params.push(name); }
+    if (displayOrder !== undefined) { fields.push(`display_order = $${paramIndex++}`); params.push(displayOrder); }
+    if (status !== undefined) { fields.push(`status = $${paramIndex++}`); params.push(status); }
+
+    if (fields.length === 0) return { success: true };
+
+    params.push(id);
+    const query = `UPDATE series SET ${fields.join(', ')} WHERE id = $${paramIndex} RETURNING *;`;
+    const result = await this.dataSource.query(query, params);
+    return result[0];
+  }
+
+  async archiveSeries(id: string) {
+    await this.dataSource.query("UPDATE series SET status = 'Archived', deleted_at = NOW() WHERE id = $1;", [id]);
     return { success: true };
   }
 

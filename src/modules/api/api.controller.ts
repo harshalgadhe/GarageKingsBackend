@@ -896,6 +896,118 @@ export class ApiController {
     res.setHeader('Content-Disposition', `inline; filename="${result.filename}"`);
     result.stream.pipe(res);
   }
+
+  // ==========================================
+  //          MASTER DATA CONTROLLERS
+  // ==========================================
+
+  // Brands
+  @Get('brands')
+  async getBrands(@Query('adminMode') adminMode?: string) {
+    return this.apiService.getBrands(adminMode === 'true');
+  }
+
+  @Post('admin/brands')
+  @UseGuards(AuthGuard('jwt'))
+  async createBrand(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.createBrand(body);
+  }
+
+  @Patch('admin/brands/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async updateBrand(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.updateBrand(id, body);
+  }
+
+  @Delete('admin/brands/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async archiveBrand(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.archiveBrand(id);
+  }
+
+  // Manufacturers
+  @Get('manufacturers')
+  async getManufacturers(@Query('adminMode') adminMode?: string) {
+    return this.apiService.getManufacturers(adminMode === 'true');
+  }
+
+  @Post('admin/manufacturers')
+  @UseGuards(AuthGuard('jwt'))
+  async createManufacturer(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.createManufacturer(body);
+  }
+
+  @Patch('admin/manufacturers/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async updateManufacturer(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.updateManufacturer(id, body);
+  }
+
+  @Delete('admin/manufacturers/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async archiveManufacturer(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.archiveManufacturer(id);
+  }
+
+  // Scales
+  @Get('scales')
+  async getScales(@Query('adminMode') adminMode?: string) {
+    return this.apiService.getScales(adminMode === 'true');
+  }
+
+  @Post('admin/scales')
+  @UseGuards(AuthGuard('jwt'))
+  async createScale(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.createScale(body);
+  }
+
+  @Patch('admin/scales/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async updateScale(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.updateScale(id, body);
+  }
+
+  @Delete('admin/scales/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async archiveScale(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.archiveScale(id);
+  }
+
+  // Series
+  @Get('series')
+  async getSeries(@Query('adminMode') adminMode?: string) {
+    return this.apiService.getSeries(adminMode === 'true');
+  }
+
+  @Post('admin/series')
+  @UseGuards(AuthGuard('jwt'))
+  async createSeries(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.createSeries(body);
+  }
+
+  @Patch('admin/series/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async updateSeries(@Param('id') id: string, @Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.updateSeries(id, body);
+  }
+
+  @Delete('admin/series/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async archiveSeries(@Param('id') id: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.archiveSeries(id);
+  }
 }
 export default ApiController;
 

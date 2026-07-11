@@ -37,7 +37,19 @@ export class AdminOrdersController {
   @Patch(':id')
   async updateOrderStatus(
     @Param('id') id: string,
-    @Body() dto: { status?: string; courierPartner?: string; trackingNumber?: string; shippingCost?: number; packagingCost?: number; dispatchDate?: string; deliveryDate?: string },
+    @Body() dto: { 
+      status?: string; 
+      courierPartner?: string; 
+      trackingNumber?: string; 
+      shippingCost?: number; 
+      packagingCost?: number; 
+      dispatchDate?: string; 
+      deliveryDate?: string;
+      totalPrice?: number;
+      advanceAmount?: number;
+      remainingAmount?: number;
+      shippingAddress?: string;
+    },
     @Request() req: any
   ) {
     this.checkAdmin(req);

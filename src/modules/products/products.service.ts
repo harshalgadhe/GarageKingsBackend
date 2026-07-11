@@ -11,38 +11,23 @@ export class ProductsService {
     const cached = localCache.get(cacheKey);
     if (cached) return cached;
 
-    const adminFields = adminMode ? `
-      p.purchase_price as "purchasePrice",
-      p.total_stock as "totalStock",
-      p.locked_stock as "lockedStock",
-      p.sold_stock as "soldStock",
-      p.supplier,
-      p.created_by as "createdBy",
-      p.updated_by as "updatedBy",
-    ` : '';
-
-    let queryStr = `
-      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
-             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             p.tags, p.category, p.selling_price as "sellingPrice",
-             ${adminFields}
-             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage",
+    const queryStr = `
+      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale,
+             p.description, p.tags, p.category, p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
-             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
-             p.casing_types as "casingTypes",
+             COALESCE(MIN(pv.selling_price), 0.00) as "sellingPrice",
+             COALESCE(MIN(pv.selling_price), 0.00) as "minPrice",
+             COALESCE(MAX(pv.selling_price), 0.00) as "maxPrice",
+             COALESCE(SUM(pv.total_stock - pv.locked_stock - pv.sold_stock), 0)::int as "availableStock",
              pi.thumbnail_url as image, p.created_at
       FROM products p
+      LEFT JOIN product_variants pv ON pv.product_id = p.id AND pv.deleted_at IS NULL
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
       WHERE p.deleted_at IS NULL
+      ${adminMode ? '' : "AND p.status = 'Published'"}
+      GROUP BY p.id, pi.thumbnail_url
+      ORDER BY p.created_at DESC;
     `;
-
-    if (!adminMode) {
-      queryStr += " AND p.status = 'Published'";
-    }
-
-    queryStr += " ORDER BY p.created_at DESC;";
 
     const rows = await this.dataSource.query(queryStr);
     localCache.set(cacheKey, rows, 10);
@@ -64,29 +49,17 @@ export class ProductsService {
     const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
     const offset = (page - 1) * limit;
 
-    const adminFields = options.adminMode ? `
-      p.purchase_price as "purchasePrice",
-      p.total_stock as "totalStock",
-      p.locked_stock as "lockedStock",
-      p.sold_stock as "soldStock",
-      p.supplier,
-      p.created_by as "createdBy",
-      p.updated_by as "updatedBy",
-    ` : '';
-
     let queryStr = `
-      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
-             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             p.tags, p.category, p.selling_price as "sellingPrice",
-             ${adminFields}
-             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage",
+      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale,
+             p.description, p.tags, p.category, p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
-             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
-             p.casing_types as "casingTypes",
+             COALESCE(MIN(pv.selling_price), 0.00) as "sellingPrice",
+             COALESCE(MIN(pv.selling_price), 0.00) as "minPrice",
+             COALESCE(MAX(pv.selling_price), 0.00) as "maxPrice",
+             COALESCE(SUM(pv.total_stock - pv.locked_stock - pv.sold_stock), 0)::int as "availableStock",
              pi.thumbnail_url as image, p.created_at
       FROM products p
+      LEFT JOIN product_variants pv ON pv.product_id = p.id AND pv.deleted_at IS NULL
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
       WHERE p.deleted_at IS NULL
     `;
@@ -116,14 +89,6 @@ export class ProductsService {
       paramIndex++;
     }
 
-    if (options.inStock) {
-      queryStr += ` AND (p.total_stock - p.locked_stock - p.sold_stock) > 0`;
-    }
-
-    if (options.preBooking) {
-      queryStr += ` AND (p.is_prebook = true OR 'Pre-Order' = ANY(p.tags) OR 'Pre Booking' = ANY(p.tags) OR (p.release_date IS NOT NULL AND p.release_date > CURRENT_DATE))`;
-    }
-
     if (options.search) {
       queryStr += ` AND (
         LOWER(p.model_name) LIKE LOWER($${paramIndex}) OR
@@ -133,6 +98,24 @@ export class ProductsService {
       params.push(`%${options.search}%`);
       paramIndex++;
     }
+
+    queryStr += ` GROUP BY p.id, pi.thumbnail_url`;
+
+    let havingClause = '';
+    if (options.inStock) {
+      havingClause += ` HAVING COALESCE(SUM(pv.total_stock - pv.locked_stock - pv.sold_stock), 0) > 0`;
+    }
+
+    if (options.preBooking) {
+      const condition = ` (p.status = 'Published' AND EXISTS (SELECT 1 FROM product_variants WHERE product_id = p.id AND sales_status = 'Preorder'))`;
+      if (havingClause) {
+        havingClause += ` AND ${condition}`;
+      } else {
+        havingClause += ` HAVING ${condition}`;
+      }
+    }
+
+    queryStr += havingClause;
 
     const countQuery = `SELECT COUNT(*)::int as total FROM (${queryStr}) as sub`;
     const countRows = await this.dataSource.query(countQuery, params);
@@ -157,31 +140,13 @@ export class ProductsService {
     const cached = localCache.get(cacheKey);
     if (cached) return cached;
 
-    const adminFields = adminMode ? `
-      p.purchase_price as "purchasePrice",
-      p.total_stock as "totalStock",
-      p.locked_stock as "lockedStock",
-      p.sold_stock as "soldStock",
-      p.supplier,
-      p.created_by as "createdBy",
-      p.updated_by as "updatedBy",
-    ` : '';
-
     const queryStr = `
-      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
-             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
-             p.tags, p.category, p.selling_price as "sellingPrice",
-             ${adminFields}
-             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage",
-             p.max_qty_per_customer as "maxQtyPerCustomer",
-             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
-             p.casing_types as "casingTypes",
-             pi.thumbnail_url as image, p.created_at
-      FROM products p
-      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
-      WHERE p.deleted_at IS NULL AND p.id = $1
+      SELECT id, brand, model_name as name, series, scale, description,
+             tags, category, status, show_on_homepage as "showOnHomepage",
+             max_qty_per_customer as "maxQtyPerCustomer",
+             created_at
+      FROM products
+      WHERE deleted_at IS NULL AND id = $1
       LIMIT 1;
     `;
 
@@ -189,13 +154,29 @@ export class ProductsService {
     if (rows.length === 0) return null;
 
     const product = rows[0];
-    const casingRows = await this.dataSource.query(`
-      SELECT DISTINCT casing_type 
-      FROM inventory_batches 
-      WHERE product_id = $1 AND quantity_available > 0
+
+    const variants = await this.dataSource.query(`
+      SELECT pv.id, pv.sku, pv.barcode, pv.name, pv.selling_price as "sellingPrice",
+             pv.customer_eta as "customerEta", pv.visibility, pv.status, pv.sales_status as "salesStatus",
+             pv.dimensions, pv.weight, pv.variant_attributes as "variantAttributes",
+             pv.total_stock as "totalStock", pv.sold_stock as "soldStock", pv.locked_stock as "lockedStock",
+             (pv.total_stock - pv.locked_stock - pv.sold_stock) as "availableStock",
+             ct.name as casing, ct.display_name as "casingDisplay"
+      FROM product_variants pv
+      JOIN casing_types ct ON ct.id = pv.casing_type_id
+      WHERE pv.product_id = $1 AND pv.deleted_at IS NULL
     `, [id]);
-    const casings = casingRows.map((r: any) => r.casing_type);
-    product.availableCasings = casings;
+
+    product.variants = variants;
+
+    // Fetch images
+    const images = await this.dataSource.query(`
+      SELECT id, variant_id as "variantId", media_type as "mediaType", url, thumbnail_url as "thumbnailUrl", alt_text as "altText", is_primary as "isPrimary"
+      FROM product_images
+      WHERE product_id = $1
+      ORDER BY display_order ASC;
+    `, [id]);
+    product.images = images;
 
     localCache.set(cacheKey, product, 10);
     return product;
