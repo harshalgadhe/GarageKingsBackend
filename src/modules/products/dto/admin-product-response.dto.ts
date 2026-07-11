@@ -26,6 +26,7 @@ export class AdminProductResponseDto {
   createdAt: string;
   updatedAt: string;
   image?: string;
+  manufacturer?: string;
   variants: VariantResponseDto[];
 
   static fromEntity(p: any): AdminProductResponseDto {
@@ -35,6 +36,7 @@ export class AdminProductResponseDto {
     dto.brand = p.brand;
     dto.series = p.series;
     dto.scale = p.scale;
+    dto.manufacturer = p.manufacturer || p.rarity_level || '';
     dto.status = p.status;
     dto.releaseDate = p.releaseDate;
     dto.createdBy = p.createdBy;

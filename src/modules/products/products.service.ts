@@ -50,7 +50,7 @@ export class ProductsService {
     const offset = (page - 1) * limit;
 
     let queryStr = `
-      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale,
+      SELECT p.id, p.brand, p.model_name as name, p.rarity_level as manufacturer, p.series, p.scale,
              p.description, p.tags, p.category, p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              COALESCE(MIN(pv.selling_price), 0.00) as "sellingPrice",
@@ -141,9 +141,10 @@ export class ProductsService {
     if (cached) return cached;
 
     const queryStr = `
-      SELECT id, brand, model_name as name, series, scale, description,
+      SELECT id, brand, model_name as name, rarity_level as manufacturer, series, scale, description,
              tags, category, status, show_on_homepage as "showOnHomepage",
-             max_qty_per_customer as "maxQtyPerCustomer",
+             max_qty_per_customer as "maxQtyPerCustomer", is_prebook as "isPrebook",
+             prebook_deposit_amount as "prebookDepositAmount", arrival_date as "arrivalDate",
              created_at
       FROM products
       WHERE deleted_at IS NULL AND id = $1
@@ -171,10 +172,9 @@ export class ProductsService {
 
     // Fetch images
     const images = await this.dataSource.query(`
-      SELECT id, variant_id as "variantId", media_type as "mediaType", url, thumbnail_url as "thumbnailUrl", alt_text as "altText", is_primary as "isPrimary"
+      SELECT id, product_id as "productId", thumbnail_url as "thumbnailUrl", full_url as "fullUrl", is_primary as "isPrimary"
       FROM product_images
-      WHERE product_id = $1
-      ORDER BY display_order ASC;
+      WHERE product_id = $1;
     `, [id]);
     product.images = images;
 

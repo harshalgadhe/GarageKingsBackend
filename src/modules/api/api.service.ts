@@ -632,7 +632,7 @@ export class ApiService implements OnModuleInit {
 
     const queryStr = `
       SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
-             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
+             p.rarity_level as lane, p.rarity_level as grade, p.rarity_level as manufacturer, p.base_price as price, p.description,
              p.tags, p.category, p.selling_price as "sellingPrice",
              ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
@@ -653,16 +653,38 @@ export class ApiService implements OnModuleInit {
     const product = rows[0];
 
     const casings = await this.dataSource.query(`
-      SELECT casing_type as "casingType", 
-             MAX(selling_price)::float as "price",
-             SUM(quantity_available)::int as "availableStock"
-      FROM inventory_batches
-      WHERE product_id = $1 AND status = 'Open' AND quantity_available > 0
-      GROUP BY casing_type
+      SELECT ct.name as "casingType", 
+             MAX(pv.selling_price)::float as "price",
+             SUM(ib.quantity_available)::int as "availableStock"
+      FROM inventory_batches ib
+      JOIN product_variants pv ON ib.variant_id = pv.id
+      JOIN casing_types ct ON pv.casing_type_id = ct.id
+      WHERE pv.product_id = $1 AND ib.status = 'Open' AND ib.quantity_available > 0
+      GROUP BY ct.name
       ORDER BY price ASC;
     `, [id]);
 
     product.availableCasings = casings;
+
+    const variants = await this.dataSource.query(`
+      SELECT pv.id, pv.sku, pv.barcode, pv.name, pv.selling_price as "sellingPrice",
+             pv.customer_eta as "customerEta", pv.visibility, pv.status, pv.sales_status as "salesStatus",
+             pv.dimensions, pv.weight, pv.variant_attributes as "variantAttributes",
+             pv.total_stock as "totalStock", pv.sold_stock as "soldStock", pv.locked_stock as "lockedStock",
+             (pv.total_stock - pv.locked_stock - pv.sold_stock) as "availableStock",
+             ct.name as casing, ct.display_name as "casingDisplay"
+      FROM product_variants pv
+      JOIN casing_types ct ON ct.id = pv.casing_type_id
+      WHERE pv.product_id = $1 AND pv.deleted_at IS NULL
+    `, [id]);
+    product.variants = variants;
+
+    const images = await this.dataSource.query(`
+      SELECT id, product_id as "productId", thumbnail_url as "thumbnailUrl", full_url as "fullUrl", is_primary as "isPrimary"
+      FROM product_images
+      WHERE product_id = $1;
+    `, [id]);
+    product.images = images;
 
     localCache.set(cacheKey, product, 10); // Cache single item for 10 seconds
     return product;
@@ -685,7 +707,7 @@ export class ApiService implements OnModuleInit {
         car.name || 'Unknown Casting',
         car.series || 'Collector Series',
         car.scale || '1:64',
-        car.lane || 'Standard Edition',
+        car.manufacturer || car.lane || 'Standard Edition',
         Number(car.price || 0),
         car.description || '',
         car.tags || [],
@@ -842,7 +864,7 @@ export class ApiService implements OnModuleInit {
           car.name || oldData.model_name,
           car.series !== undefined ? car.series : oldData.series,
           car.scale || oldData.scale,
-          car.lane || oldData.rarity_level,
+          car.manufacturer || car.lane || oldData.rarity_level,
           Number(car.price || oldData.base_price),
           car.description !== undefined ? car.description : oldData.description,
           car.tags || oldData.tags,
@@ -928,7 +950,7 @@ export class ApiService implements OnModuleInit {
           car.name || oldData.model_name,
           car.series !== undefined ? car.series : oldData.series,
           car.scale || oldData.scale,
-          car.lane || oldData.rarity_level,
+          car.manufacturer || car.lane || oldData.rarity_level,
           Number(car.price || oldData.base_price),
           car.description !== undefined ? car.description : oldData.description,
           car.tags || oldData.tags,
