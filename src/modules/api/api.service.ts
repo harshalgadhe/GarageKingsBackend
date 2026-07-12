@@ -2872,7 +2872,7 @@ export class ApiService implements OnModuleInit {
     const params: any[] = [start, end];
     let paramIndex = 3;
 
-    if (filters.cashAccountId) {
+    if (filters.cashAccountId && filters.cashAccountId !== 'all') {
       queryStr += ` AND l.cash_account_id = $${paramIndex}`;
       params.push(filters.cashAccountId);
       paramIndex++;
@@ -3225,7 +3225,7 @@ export class ApiService implements OnModuleInit {
     const getMetricsForPeriod = async (s: Date, e: Date) => {
       let filterAcc = "";
       const params: any[] = [s, e];
-      if (cashAccountId) {
+      if (cashAccountId && cashAccountId !== 'all') {
         filterAcc = " AND cash_account_id = $3";
         params.push(cashAccountId);
       }
