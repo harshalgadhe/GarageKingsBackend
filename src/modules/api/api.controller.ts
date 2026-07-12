@@ -335,6 +335,18 @@ export class ApiController {
     return product;
   }
 
+  @Get('admin/variants')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminVariants(
+    @Query('page') page: number,
+    @Query('limit') limit: number,
+    @Query('search') search: string,
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    return this.apiService.getAdminVariants({ page, limit, search });
+  }
+
   @Get('admin/products')
   @UseGuards(AuthGuard('jwt'))
   async getAdminProducts(
@@ -382,6 +394,12 @@ export class ApiController {
   @Post('products/reserve-cart')
   async reserveProductsCart(@Body() dto: any, @Request() req: any) {
     return this.apiService.reserveProductsCart(dto, req.ip, req.user.userId);
+  }
+
+  @UseGuards(AuthGuard('jwt'))
+  @Post('products/calculate-checkout')
+  async calculateCheckout(@Body() dto: any) {
+    return this.apiService.calculateCheckoutPricing(dto);
   }
 
   // ── SETTINGS REST ENDPOINTS ─────────────────────────────────────────
@@ -720,6 +738,13 @@ export class ApiController {
   async addFounderReimbursement(@Body() dto: any, @Request() req: any) {
     this.checkAdmin(req);
     return this.apiService.addFounderReimbursement(dto, req.user.email, req.ip);
+  }
+
+  @Get('admin/dashboard/aggregates')
+  @UseGuards(AuthGuard('jwt'))
+  async getDashboardAggregates(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getDashboardAggregates();
   }
 
   @Get('admin/dashboard/kpis')

@@ -509,6 +509,69 @@ export class ApiService implements OnModuleInit {
     return rows;
   }
 
+  async getAdminVariants(options: { page?: number; limit?: number; search?: string }) {
+    const page = Math.max(1, Number(options.page || 1));
+    const limit = Math.max(1, Math.min(100, Number(options.limit || 50)));
+    const offset = (page - 1) * limit;
+
+    let filterStr = "WHERE pv.deleted_at IS NULL";
+    const params = [];
+    if (options.search) {
+      filterStr += ` AND (pv.name ILIKE $1 OR pv.sku ILIKE $1 OR p.model_name ILIKE $1)`;
+      params.push(`%${options.search}%`);
+    }
+
+    const countRes = await this.dataSource.query(`
+      SELECT COUNT(DISTINCT pv.id) as count
+      FROM product_variants pv
+      JOIN products p ON p.id = pv.product_id
+      ${filterStr};
+    `, params);
+    const total = Number(countRes[0]?.count || 0);
+    const totalPages = Math.ceil(total / limit);
+
+    const queryParams = [...params];
+    const pageIndex = queryParams.length + 1;
+    queryParams.push(limit);
+    queryParams.push(offset);
+
+    const variants = await this.dataSource.query(`
+      SELECT 
+        pv.id,
+        pv.sku,
+        pv.barcode,
+        pv.name,
+        pv.selling_price as "selling_price",
+        pv.status,
+        pv.visibility,
+        pv.sales_status as "salesStatus",
+        p.model_name as "productName",
+        COALESCE(SUM(ib.quantity_available), 0)::INT as "quantity_available",
+        COALESCE(SUM(ib.quantity_reserved), 0)::INT as "quantity_reserved",
+        COALESCE(SUM(ib.quantity_sold), 0)::INT as "quantity_sold",
+        COALESCE(SUM(ib.quantity_incoming), 0)::INT as "quantity_incoming",
+        COALESCE(SUM(ib.quantity_damaged), 0)::INT as "quantity_damaged",
+        COALESCE(SUM(ib.quantity_returned), 0)::INT as "quantity_returned",
+        COALESCE(AVG(ib.purchase_price), 0.00)::NUMERIC(12,2) as "avgCost",
+        COUNT(ib.id)::INT as "batchCount",
+        COALESCE(SUM(ib.quantity_available * ib.purchase_price), 0.00)::NUMERIC(12,2) as "inventory_value"
+      FROM product_variants pv
+      JOIN products p ON p.id = pv.product_id
+      LEFT JOIN inventory_batches ib ON ib.variant_id = pv.id AND ib.status != 'Archived'
+      ${filterStr}
+      GROUP BY pv.id, p.model_name
+      ORDER BY pv.created_at DESC
+      LIMIT $${pageIndex} OFFSET $${pageIndex + 1};
+    `, queryParams);
+
+    return {
+      variants,
+      total,
+      totalPages,
+      page
+    };
+  }
+
   async getPaginatedProducts(options: {
     page?: number;
     limit?: number;
@@ -1116,6 +1179,85 @@ export class ApiService implements OnModuleInit {
     return { success: true };
   }
 
+  async calculateCheckoutPricing(dto: any) {
+    const items = dto.items || [];
+    const bookingType = dto.bookingType || 'standard';
+    const isPreOrder = bookingType === 'pre_order';
+
+    const resolvedItems = [];
+    let subtotal = 0;
+
+    for (const item of items) {
+      const id = item.productId || item.variantId;
+      if (!id) continue;
+      const qty = Math.max(1, parseInt(item.qty || item.quantity || '1', 10));
+
+      const rows = await this.dataSource.query(`
+        SELECT pv.id as "variantId", 
+               pv.selling_price as "sellingPrice", 
+               pv.sku, 
+               pv.name as "variantName", 
+               p.id as "productId",
+               p.model_name as "productName",
+               p.brand, 
+               p.rarity_level as "manufacturer", 
+               ct.name as "casing",
+               p.prebook_deposit_amount as "prebookDepositAmount"
+        FROM product_variants pv 
+        JOIN products p ON p.id = pv.product_id 
+        JOIN casing_types ct ON ct.id = pv.casing_type_id 
+        WHERE (pv.id = $1 OR pv.product_id = $1) AND pv.deleted_at IS NULL 
+        ORDER BY pv.created_at ASC 
+        LIMIT 1;
+      `, [id]);
+
+      if (rows.length > 0) {
+        const row = rows[0];
+        const itemPrice = Number(row.sellingPrice || 0);
+        subtotal += itemPrice * qty;
+        resolvedItems.push({
+          productId: row.productId,
+          variantId: row.variantId,
+          name: row.productName,
+          variantName: row.variantName,
+          sku: row.sku,
+          brand: row.brand,
+          casing: row.casing,
+          manufacturer: row.manufacturer,
+          price: itemPrice,
+          prebookDepositAmount: row.prebookDepositAmount,
+          qty
+        });
+      }
+    }
+
+    const settings = await this.getGlobalSettings();
+    const shippingFee = isPreOrder ? 0 : (settings.shippingConfig?.defaultFee || 200);
+    const totalPrice = subtotal + shippingFee;
+
+    let advanceAmount = totalPrice;
+    let remainingAmount = 0;
+
+    if (isPreOrder) {
+      let minAdvance = 0;
+      for (const item of resolvedItems) {
+        minAdvance += Number(item.prebookDepositAmount || 0) * item.qty;
+      }
+      const preferredAdvance = dto.advanceAmount !== undefined ? Number(dto.advanceAmount) : minAdvance;
+      advanceAmount = Math.min(totalPrice, Math.max(minAdvance, preferredAdvance));
+      remainingAmount = totalPrice - advanceAmount;
+    }
+
+    return {
+      subtotal,
+      shippingFee,
+      totalPrice,
+      advanceAmount,
+      remainingAmount,
+      items: resolvedItems
+    };
+  }
+
   async restoreProduct(id: string, updaterEmail: string, ipAddress: string) {
     await this.dataSource.query("UPDATE products SET deleted_at = NULL, updated_at = NOW() WHERE id = $1;", [id]);
     localCache.del('products_list_true');
@@ -1146,12 +1288,31 @@ export class ApiService implements OnModuleInit {
       };
     }
 
+    // 2. Perform Backend Price & Shipping calculations
+    const pricing = await this.calculateCheckoutPricing({
+      items: [{ productId, qty: requestedQty }],
+      bookingType,
+      advanceAmount
+    });
+
+    if (pricing.items.length === 0) {
+      throw new BadRequestException("Target casting does not exist or has been archived.");
+    }
+
+    const resolvedItem = pricing.items[0];
+    const unitPrice = resolvedItem.price;
+    const fullPrice = pricing.totalPrice;
+    const advPaid = pricing.advanceAmount;
+    const remaining = pricing.remainingAmount;
+    const shippingCost = pricing.shippingFee;
+    const variantId = resolvedItem.variantId;
+
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      // 2. Row-level lock target product to prevent race condition double-buys
+      // 3. Row-level lock target product to prevent race condition double-buys
       const prodRows = await queryRunner.query(`
         SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
         FROM products 
@@ -1164,7 +1325,6 @@ export class ApiService implements OnModuleInit {
       }
 
       const p = prodRows[0];
-      // Accurate available stock = total - locked (pending orders) - sold
       const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
 
       if (available <= 0) {
@@ -1192,7 +1352,7 @@ export class ApiService implements OnModuleInit {
         }
       }
 
-      // 3. Get/create customer record
+      // 4. Get/create customer record
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
@@ -1202,10 +1362,9 @@ export class ApiService implements OnModuleInit {
       `, [name, phone, instagram, address, email.trim().toLowerCase()]);
       const customerId = custRes[0].id;
 
-      // 4. Resolve user ID — prefer authenticated user, fall back to email upsert for guest checkout
+      // 5. Resolve user ID
       let userId: string;
       if (authenticatedUserId) {
-        // Authenticated user: use their verified user ID directly, no upsert needed
         userId = authenticatedUserId;
       } else {
         const userRes = await queryRunner.query(`
@@ -1217,26 +1376,22 @@ export class ApiService implements OnModuleInit {
         userId = userRes[0].id;
       }
 
-      // 5. Create parent Pending order record with idempotency
-      const unitPrice = Number(dto.price || 0);
-      const fullPrice = unitPrice * requestedQty;
-      const advPaid = isPreOrder ? Math.min(Number(advanceAmount || 0), fullPrice) : fullPrice;
-      const remaining = isPreOrder ? fullPrice - advPaid : 0;
+      // 6. Create parent Pending order record with shipping_cost
       const orderStatus = isPreOrder ? 'Pre-Order' : 'Pending';
       const orderRes = await queryRunner.query(`
-        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at, idempotency_key)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8)
+        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
         RETURNING id;
-      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, isPreOrder ? 'pre_order' : 'standard', advPaid, remaining, idempotencyKey]);
+      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, bookingType, advPaid, remaining, shippingCost, idempotencyKey]);
       const orderId = orderRes[0].id;
 
-      // 6. Create order item with actual requested qty
+      // 7. Create order item with snapshots and correct variant_id
       await queryRunner.query(`
-        INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-        VALUES ($1, $2, $3, $4);
-      `, [orderId, productId, requestedQty, unitPrice]);
+        INSERT INTO order_items (order_id, variant_id, product_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+      `, [orderId, variantId, productId, requestedQty, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
 
-      // 7. Lock the stock (increment locked_stock)
+      // 8. Lock the stock (increment locked_stock)
       await queryRunner.query(`
         UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
       `, [requestedQty, productId]);
@@ -1254,7 +1409,7 @@ export class ApiService implements OnModuleInit {
       };
 
       // Set idempotency cache
-      localCache.set(`idem_${idempotencyKey}`, responseObj, 3600); // Lock key cache for 1 hour
+      localCache.set(`idem_${idempotencyKey}`, responseObj, 3600);
 
       await this.writeAuditLog(
         'ORDER_CREATED',
@@ -1298,12 +1453,35 @@ export class ApiService implements OnModuleInit {
       };
     }
 
+    // 2. Sort items alphabetically by productId to prevent transactional deadlocks
+    const sortedItems = [...items].sort((a, b) => {
+      const idA = a.productId || a.variantId || '';
+      const idB = b.productId || b.variantId || '';
+      return idA.localeCompare(idB);
+    });
+
+    // 3. Resolve pricing and shipping charges purely on backend
+    const pricing = await this.calculateCheckoutPricing({
+      items: sortedItems,
+      bookingType,
+      advanceAmount
+    });
+
+    if (pricing.items.length === 0) {
+      throw new BadRequestException("No valid products resolved for cart checkout.");
+    }
+
+    const fullPrice = pricing.totalPrice;
+    const advPaid = pricing.advanceAmount;
+    const remaining = pricing.remainingAmount;
+    const shippingCost = pricing.shippingFee;
+
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      // 2. Get/create customer record
+      // 4. Get/create customer record
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
@@ -1313,7 +1491,7 @@ export class ApiService implements OnModuleInit {
       `, [name, phone, instagram, address, email.trim().toLowerCase()]);
       const customerId = custRes[0].id;
 
-      // 3. Resolve user ID — prefer authenticated user, fall back to email upsert for guest checkout
+      // 5. Resolve user ID
       let userId: string;
       if (authenticatedUserId) {
         userId = authenticatedUserId;
@@ -1327,42 +1505,29 @@ export class ApiService implements OnModuleInit {
         userId = userRes[0].id;
       }
 
-      // Compute total price of the aggregated cart
-      let totalPrice = 0;
-      for (const item of items) {
-        totalPrice += Number(item.price || 0);
-      }
-
-      // 4. Create parent Pending order record with idempotency
-      const advPaid = isPreOrder ? Math.min(Number(advanceAmount || 0), totalPrice) : totalPrice;
-      const remaining = isPreOrder ? totalPrice - advPaid : 0;
+      // 6. Create parent Pending order record with shipping_cost
       const orderStatus = isPreOrder ? 'Pre-Order' : 'Pending';
       const orderRes = await queryRunner.query(`
-        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at, idempotency_key)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8)
+        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
         RETURNING id;
-      `, [userId, totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, isPreOrder ? 'pre_order' : 'standard', advPaid, remaining, idempotencyKey]);
+      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, bookingType, advPaid, remaining, shippingCost, idempotencyKey]);
       const orderId = orderRes[0].id;
 
-      // Calculate quantities requested for each product in the cart
-      const requestedQuantities: Record<string, number> = {};
-      for (const item of items) {
-        requestedQuantities[item.productId] = (requestedQuantities[item.productId] || 0) + 1;
+      // Group resolved items for stock locking
+      const requestedQuantities = {};
+      const resolvedMap = {};
+      for (const resolved of pricing.items) {
+        requestedQuantities[resolved.productId] = (requestedQuantities[resolved.productId] || 0) + resolved.qty;
+        resolvedMap[resolved.productId] = resolved;
       }
 
-      // Build a map of unique products to their price for processing
-      const uniqueProductPrices: Record<string, number> = {};
-      for (const item of items) {
-        if (!(item.productId in uniqueProductPrices)) {
-          uniqueProductPrices[item.productId] = Number(item.price || 0);
-        }
-      }
-
-      // Process each unique product: validate stock, insert order_item, lock stock
+      // 7. Validate stock, lock stock, and create order items with snapshots
       for (const [productId, qtyNeeded] of Object.entries(requestedQuantities)) {
-        const unitPrice = uniqueProductPrices[productId] || 0;
+        const resolvedItem = resolvedMap[productId];
+        const unitPrice = resolvedItem.price;
 
-        // Row-level lock target product
+        // Row-level lock target product in alphabetical order (prevents deadlocks)
         const prodRows = await queryRunner.query(`
           SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
           FROM products 
@@ -1375,14 +1540,13 @@ export class ApiService implements OnModuleInit {
         }
 
         const p = prodRows[0];
-        // Accurate available stock = total - locked (pending orders) - sold
         const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
 
         if (available <= 0) {
           throw new BadRequestException(`Casting "${p.name}" is sold out.`);
         }
 
-        if (qtyNeeded > available) {
+        if (Number(qtyNeeded) > available) {
           throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${qtyNeeded}.`);
         }
 
@@ -1398,16 +1562,16 @@ export class ApiService implements OnModuleInit {
               AND o.status NOT IN ('Cancelled', 'Expired');
           `, [productId, email.trim().toLowerCase()]);
           const existingCount = Number(existingCountRes[0].total);
-          if (existingCount + qtyNeeded > p.max_qty_per_customer) {
-            throw new BadRequestException(`Purchase limit exceeded for "${p.name}". You are trying to order ${qtyNeeded} item(s), but you have already ordered/reserved ${existingCount}. Maximum allowed per customer: ${p.max_qty_per_customer}.`);
+          if (existingCount + Number(qtyNeeded) > p.max_qty_per_customer) {
+            throw new BadRequestException(`Purchase limit exceeded for "${p.name}". You have already ordered/reserved ${existingCount} items.`);
           }
         }
 
-        // Create order item with correct qty
+        // Create order item with snapshots and correct variant_id
         await queryRunner.query(`
-          INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-          VALUES ($1, $2, $3, $4);
-        `, [orderId, productId, qtyNeeded, unitPrice]);
+          INSERT INTO order_items (order_id, variant_id, product_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+        `, [orderId, resolvedItem.variantId, productId, qtyNeeded, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
 
         // Lock the stock
         await queryRunner.query(`
@@ -1779,11 +1943,35 @@ export class ApiService implements OnModuleInit {
       ORDER BY o.created_at DESC;
     `, [email.trim().toLowerCase()]);
   }
+  validateOrderTransition(currentStatus: string, nextStatus: string) {
+    if (currentStatus === nextStatus) return;
+
+    const validTransitions: Record<string, string[]> = {
+      'Pending': ['Verification Pending', 'Confirmed', 'Cancelled'],
+      'Pre-Order': ['Awaiting Stock', 'Cancelled'],
+      'Awaiting Stock': ['Verification Pending', 'Confirmed', 'Cancelled'],
+      'Verification Pending': ['Confirmed', 'Cancelled'],
+      'Confirmed': ['Paid', 'Shipped', 'Cancelled'],
+      'Paid': ['Shipped', 'Cancelled'],
+      'Shipped': ['Delivered', 'Cancelled'],
+      'Delivered': [], // End state
+      'Cancelled': []  // End state
+    };
+
+    const allowed = validTransitions[currentStatus] || [];
+    if (!allowed.includes(nextStatus)) {
+      throw new BadRequestException(`Illegal order state transition from "${currentStatus}" to "${nextStatus}".`);
+    }
+  }
+
   async adminConfirmOrder(orderId: string, adminEmail: string, ipAddress: string) {
     const oldRes = await this.dataSource.query("SELECT status, booking_type FROM orders WHERE id = $1", [orderId]);
     if (oldRes.length === 0) {
       throw new Error("Order not found.");
     }
+    
+    this.validateOrderTransition(oldRes[0].status, 'Confirmed');
+
     if (oldRes[0].status === 'Confirmed' || oldRes[0].status === 'Pre-Order') {
       return { success: true };
     }
@@ -1966,7 +2154,12 @@ export class ApiService implements OnModuleInit {
   }
   async adminUpdateOrderStatus(orderId: string, fields: any, adminEmail: string, ipAddress: string) {
     const oldRes = await this.dataSource.query("SELECT * FROM orders WHERE id = $1", [orderId]);
+    if (oldRes.length === 0) throw new BadRequestException('Order not found.');
     const old = oldRes[0];
+
+    if (fields.status) {
+      this.validateOrderTransition(old.status, fields.status);
+    }
 
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
@@ -2720,6 +2913,115 @@ export class ApiService implements OnModuleInit {
     }
   }
 
+  async getDashboardAggregates() {
+    const settings = await this.getGlobalSettings();
+    const threshold = settings.lowStockThreshold || 3;
+
+    const availableRes = await this.dataSource.query('SELECT COALESCE(SUM(quantity_available), 0)::int as total FROM inventory_batches WHERE status != \'Archived\';');
+    const availableInventory = availableRes[0].total;
+
+    const incomingRes = await this.dataSource.query('SELECT COALESCE(SUM(quantity_incoming), 0)::int as total FROM inventory_batches WHERE status != \'Archived\';');
+    const incomingInventory = incomingRes[0].total;
+
+    const poRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM supplier_purchases WHERE status NOT IN (\'Draft\', \'Cancelled\', \'Completed\');');
+    const totalPurchaseOrders = poRes[0].total;
+
+    const valRes = await this.dataSource.query('SELECT COALESCE(SUM(quantity_available * purchase_price), 0.00)::float as total FROM inventory_batches WHERE status != \'Archived\';');
+    const totalInventoryValue = valRes[0].total;
+
+    const lowStockRes = await this.dataSource.query(`
+      WITH variant_stock AS (
+        SELECT pv.id, COALESCE(SUM(ib.quantity_available), 0) as stock
+        FROM product_variants pv
+        LEFT JOIN inventory_batches ib ON ib.variant_id = pv.id AND ib.status != 'Archived'
+        WHERE pv.deleted_at IS NULL
+        GROUP BY pv.id
+      )
+      SELECT COUNT(*)::int as total FROM variant_stock WHERE stock <= $1;
+    `, [threshold]);
+    const lowStockAlerts = lowStockRes[0].total;
+
+    const preorderRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM orders WHERE booking_type = \'pre_order\' AND status NOT IN (\'Cancelled\', \'Expired\', \'Delivered\');');
+    const preorderCount = preorderRes[0].total;
+
+    const noSkuRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (sku IS NULL OR sku = \'\');');
+    const productsWithoutSKU = noSkuRes[0].total;
+
+    const noPriceRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (selling_price IS NULL OR selling_price <= 0);');
+    const productsWithoutPrice = noPriceRes[0].total;
+
+    // Gross profits & average margins
+    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
+    const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0,0,0,0);
+
+    const revTodayRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE type IN ('Customer Payment', 'Pre-order Advance', 'Pre-order Remaining Payment')
+        AND status = 'Completed'
+        AND date BETWEEN $1 AND $2
+    `, [todayStart, todayEnd]);
+    const revToday = revTodayRes[0].total;
+
+    const cogsTodayRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(a.quantity * a.purchase_price), 0)::float as total
+      FROM order_inventory_allocations a
+      JOIN order_items oi ON oi.id = a.order_item_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+        AND o.created_at BETWEEN $1 AND $2
+    `, [todayStart, todayEnd]);
+    const cogsToday = cogsTodayRes[0].total;
+    const todayGrossProfit = revToday - cogsToday;
+
+    const revMonthRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE type IN ('Customer Payment', 'Pre-order Advance', 'Pre-order Remaining Payment')
+        AND status = 'Completed'
+        AND date BETWEEN $1 AND $2
+    `, [monthStart, todayEnd]);
+    const revMonth = revMonthRes[0].total;
+
+    const cogsMonthRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(a.quantity * a.purchase_price), 0)::float as total
+      FROM order_inventory_allocations a
+      JOIN order_items oi ON oi.id = a.order_item_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+        AND o.created_at BETWEEN $1 AND $2
+    `, [monthStart, todayEnd]);
+    const cogsMonth = cogsMonthRes[0].total;
+    const monthlyGrossProfit = revMonth - cogsMonth;
+
+    const marginRes = await this.dataSource.query(`
+      WITH variant_costs AS (
+        SELECT pv.id, pv.selling_price, COALESCE(AVG(ib.purchase_price), 0.00) as avg_cost
+        FROM product_variants pv
+        LEFT JOIN inventory_batches ib ON ib.variant_id = pv.id AND ib.status != 'Archived'
+        WHERE pv.deleted_at IS NULL
+        GROUP BY pv.id
+      )
+      SELECT COALESCE(AVG((selling_price - avg_cost) / selling_price) * 100, 0.00)::float as avg_margin
+      FROM variant_costs
+      WHERE selling_price > 0 AND avg_cost > 0;
+    `);
+    const averageMargin = marginRes[0].avg_margin;
+
+    return {
+      availableInventory,
+      incomingInventory,
+      totalPurchaseOrders,
+      totalInventoryValue,
+      lowStockAlerts,
+      preorderCount,
+      productsWithoutSKU,
+      productsWithoutPrice,
+      todayGrossProfit,
+      monthlyGrossProfit,
+      averageMargin
+    };
+  }
+
   async getFinanceMetrics(timeRange = 'Lifetime', cashAccountId?: string) {
     const { start, end } = this.getDateFilter(timeRange);
     const prev = this.getPreviousPeriod(timeRange);
@@ -2849,12 +3151,70 @@ export class ApiService implements OnModuleInit {
     `);
     const pendingPayments = pendingPayRes[0].total;
 
+    // Today's Revenue and COGS
+    const revTodayRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE type IN ('Customer Payment', 'Pre-order Advance', 'Pre-order Remaining Payment')
+        AND status = 'Completed'
+        AND date BETWEEN $1 AND $2
+    `, [todayStart, todayEnd]);
+    const revToday = revTodayRes[0].total;
+
+    const cogsTodayRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(a.quantity * a.purchase_price), 0)::float as total
+      FROM order_inventory_allocations a
+      JOIN order_items oi ON oi.id = a.order_item_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+        AND o.created_at BETWEEN $1 AND $2
+    `, [todayStart, todayEnd]);
+    const cogsToday = cogsTodayRes[0].total;
+    const todayGrossProfit = revToday - cogsToday;
+
+    // Monthly Revenue and COGS
+    const revMonthRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(amount), 0)::float as total FROM cash_ledger
+      WHERE type IN ('Customer Payment', 'Pre-order Advance', 'Pre-order Remaining Payment')
+        AND status = 'Completed'
+        AND date BETWEEN $1 AND $2
+    `, [monthStart, todayEnd]);
+    const revMonth = revMonthRes[0].total;
+
+    const cogsMonthRes = await this.dataSource.query(`
+      SELECT COALESCE(SUM(a.quantity * a.purchase_price), 0)::float as total
+      FROM order_inventory_allocations a
+      JOIN order_items oi ON oi.id = a.order_item_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE o.status IN ('Confirmed', 'Shipped', 'Delivered')
+        AND o.created_at BETWEEN $1 AND $2
+    `, [monthStart, todayEnd]);
+    const cogsMonth = cogsMonthRes[0].total;
+    const monthlyGrossProfit = revMonth - cogsMonth;
+
+    // Average Margin across variants
+    const marginRes = await this.dataSource.query(`
+      WITH variant_costs AS (
+        SELECT pv.id, pv.selling_price, COALESCE(AVG(ib.purchase_price), 0.00) as avg_cost
+        FROM product_variants pv
+        LEFT JOIN inventory_batches ib ON ib.variant_id = pv.id AND ib.status != 'Archived'
+        WHERE pv.deleted_at IS NULL
+        GROUP BY pv.id
+      )
+      SELECT COALESCE(AVG((selling_price - avg_cost) / selling_price) * 100, 0.00)::float as avg_margin
+      FROM variant_costs
+      WHERE selling_price > 0 AND avg_cost > 0;
+    `);
+    const averageMargin = marginRes[0].avg_margin;
+
     return {
       ...currentMetrics,
       profit: currentMetrics.netProfit,
       pendingPayments,
       inventoryValue: inventoryAssetValue,
       currentCashBalance,
+      todayGrossProfit,
+      monthlyGrossProfit,
+      averageMargin,
       cashInToday,
       cashOutToday,
       cashInThisMonth: cashInMonth,
@@ -3224,7 +3584,7 @@ export class ApiService implements OnModuleInit {
   // ── SETTINGS Endpoints ─────────────────────────────────────────────
   async getGlobalSettings() {
     const rows = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
-    return rows.length > 0 ? rows[0].value : { 
+    const defaultSettings = { 
       showPrices: true,
       instagramUrl: 'https://www.instagram.com/garagekingsindia/',
       companyUpiId: 'garagekings@upi',
@@ -3232,7 +3592,17 @@ export class ApiService implements OnModuleInit {
       partnerNames: ['Harshal', 'Anutosh', 'Sanchit', 'Anish'],
       splits: { 'Harshal': 25, 'Anutosh': 25, 'Sanchit': 25, 'Anish': 25 },
       lowStockThreshold: 3,
-      reservationDuration: 15
+      reservationDuration: 15,
+      shippingConfig: {
+        defaultFee: 200,
+        freeShippingThreshold: null,
+        regions: [{ code: 'IN', flatRate: 200 }]
+      }
+    };
+    if (rows.length === 0) return defaultSettings;
+    return {
+      ...defaultSettings,
+      ...rows[0].value
     };
   }
 
@@ -3564,9 +3934,19 @@ export class ApiService implements OnModuleInit {
       throw new Error('Valid batchId and quantityChange are required');
     }
     
+    // Map frontend adjustment types to backend types
+    let resolvedType = type;
+    if (type === 'Adjusted') {
+      resolvedType = change > 0 ? 'ADJUST_ADD' : 'ADJUST_REMOVE';
+    } else if (type === 'Returned') {
+      resolvedType = 'ADJUST_ADD';
+    } else if (type === 'Damaged') {
+      resolvedType = 'MARK_DAMAGED';
+    }
+
     const allowedTypes = ['ADJUST_ADD', 'ADJUST_REMOVE', 'MARK_DAMAGED'];
-    if (!allowedTypes.includes(type)) {
-      throw new Error(`Adjustment type must be one of: ${allowedTypes.join(', ')}`);
+    if (!allowedTypes.includes(resolvedType)) {
+      throw new Error(`Adjustment type must resolve to one of: ${allowedTypes.join(', ')}`);
     }
 
     const queryRunner = this.dataSource.createQueryRunner();
@@ -3581,15 +3961,17 @@ export class ApiService implements OnModuleInit {
       let newAvail = Number(b.quantity_available);
       let newDamaged = Number(b.quantity_damaged);
 
-      if (type === 'ADJUST_ADD') {
-        newAvail += change;
-      } else if (type === 'ADJUST_REMOVE') {
-        if (newAvail < change) throw new Error('Insufficient available stock in batch to remove');
-        newAvail -= change;
-      } else if (type === 'MARK_DAMAGED') {
-        if (newAvail < change) throw new Error('Insufficient available stock in batch to mark as damaged');
-        newAvail -= change;
-        newDamaged += change;
+      const changeAbs = Math.abs(change);
+
+      if (resolvedType === 'ADJUST_ADD') {
+        newAvail += changeAbs;
+      } else if (resolvedType === 'ADJUST_REMOVE') {
+        if (newAvail < changeAbs) throw new Error('Insufficient available stock in batch to remove');
+        newAvail -= changeAbs;
+      } else if (resolvedType === 'MARK_DAMAGED') {
+        if (newAvail < changeAbs) throw new Error('Insufficient available stock in batch to mark as damaged');
+        newAvail -= changeAbs;
+        newDamaged += changeAbs;
       }
 
       // 1. Update batch quantities
@@ -3602,16 +3984,34 @@ export class ApiService implements OnModuleInit {
         WHERE id = $3;
       `, [newAvail, newDamaged, batchId]);
 
-      // 2. Insert ledger movement entry
-      const ledgerQtyChange = (type === 'ADJUST_ADD') ? change : -change;
+      // 2. Insert ledger movement entry with product_id and variant_id
+      const ledgerQtyChange = (resolvedType === 'ADJUST_ADD') ? changeAbs : -changeAbs;
       await queryRunner.query(`
-        INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
-      `, [b.product_id, batchId, type, ledgerQtyChange, Number(b.purchase_price), Number(b.selling_price), reason || `Manual adjustment type ${type}`, adminEmail]);
+        INSERT INTO inventory_ledger (product_id, variant_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+      `, [b.product_id, b.variant_id, batchId, resolvedType, ledgerQtyChange, Number(b.purchase_price), Number(b.selling_price), reason || `Manual adjustment type ${type}`, adminEmail]);
 
-      // 3. Update products and inventory caches
+      // 3. Post matching financial write-off to the cash_ledger if stock is written off
+      if (resolvedType === 'ADJUST_REMOVE' || resolvedType === 'MARK_DAMAGED') {
+        const financialLoss = changeAbs * Number(b.purchase_price);
+        if (financialLoss > 0) {
+          const cashLedgerType = (resolvedType === 'MARK_DAMAGED') ? 'Inventory Damage' : 'Inventory Write-off';
+          await queryRunner.query(`
+            INSERT INTO cash_ledger (amount, type, status, source_type, source_id, reason, created_by, date)
+            VALUES ($1, $2, 'Completed', 'Inventory Batch', $3, $4, $5, CURRENT_DATE);
+          `, [
+            -financialLoss,
+            cashLedgerType,
+            batchId,
+            `Write-off of ${changeAbs} unit(s) due to: ${reason || 'Manual Adjustment'}`,
+            adminEmail
+          ]);
+        }
+      }
+
+      // 4. Update products and inventory caches
       const diffAvailable = ledgerQtyChange;
-      const diffDamaged = (type === 'MARK_DAMAGED') ? change : 0;
+      const diffDamaged = (resolvedType === 'MARK_DAMAGED') ? changeAbs : 0;
 
       await queryRunner.query(`
         UPDATE products
