@@ -2986,7 +2986,14 @@ export class ApiService implements OnModuleInit {
     `, [threshold]);
     const lowStockAlerts = lowStockRes[0].total;
 
-    const preorderRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM orders WHERE booking_type = \'pre_order\' AND status NOT IN (\'Cancelled\', \'Delivered\');');
+    const preorderRes = await this.dataSource.query(`
+      SELECT COUNT(pv.id)::int as total 
+      FROM product_variants pv 
+      JOIN products p ON p.id = pv.product_id 
+      WHERE p.is_prebook = true 
+        AND pv.deleted_at IS NULL 
+        AND p.deleted_at IS NULL;
+    `);
     const preorderCount = preorderRes[0].total;
 
     const noSkuRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (sku IS NULL OR sku = \'\');');
