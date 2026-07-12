@@ -855,8 +855,15 @@ export class ApiController {
 
   // Brands
   @Get('brands')
-  async getBrands(@Query('adminMode') adminMode?: string) {
-    return this.apiService.getBrands(adminMode === 'true');
+  async getBrands() {
+    return this.apiService.getBrands(false);
+  }
+
+  @Get('admin/brands')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminBrands(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getBrands(true);
   }
 
   @Post('admin/brands')
@@ -882,8 +889,15 @@ export class ApiController {
 
   // Manufacturers
   @Get('manufacturers')
-  async getManufacturers(@Query('adminMode') adminMode?: string) {
-    return this.apiService.getManufacturers(adminMode === 'true');
+  async getManufacturers() {
+    return this.apiService.getManufacturers(false);
+  }
+
+  @Get('admin/manufacturers')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminManufacturers(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getManufacturers(true);
   }
 
   @Post('admin/manufacturers')
@@ -909,8 +923,15 @@ export class ApiController {
 
   // Scales
   @Get('scales')
-  async getScales(@Query('adminMode') adminMode?: string) {
-    return this.apiService.getScales(adminMode === 'true');
+  async getScales() {
+    return this.apiService.getScales(false);
+  }
+
+  @Get('admin/scales')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminScales(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getScales(true);
   }
 
   @Post('admin/scales')
@@ -936,8 +957,15 @@ export class ApiController {
 
   // Series
   @Get('series')
-  async getSeries(@Query('adminMode') adminMode?: string) {
-    return this.apiService.getSeries(adminMode === 'true');
+  async getSeries() {
+    return this.apiService.getSeries(false);
+  }
+
+  @Get('admin/series')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminSeries(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getSeries(true);
   }
 
   @Post('admin/series')
