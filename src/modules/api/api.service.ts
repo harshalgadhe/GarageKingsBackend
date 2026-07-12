@@ -1395,12 +1395,16 @@ export class ApiService implements OnModuleInit {
       }
 
       // 6. Create parent Pending order record with shipping_cost
-      const orderStatus = isPreOrder ? 'Pre-Order' : 'Pending';
+      const hasPrebookItem = pricing.items.some(item => item.isPrebook);
+      const actualBookingType = (bookingType === 'pre_order' || hasPrebookItem) ? 'pre_order' : 'standard';
+      const actualIsPreOrder = actualBookingType === 'pre_order';
+      const orderStatus = actualIsPreOrder ? 'Pre-Order' : 'Pending';
+
       const orderRes = await queryRunner.query(`
         INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
         RETURNING id;
-      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, bookingType, advPaid, remaining, shippingCost, idempotencyKey]);
+      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, actualBookingType, advPaid, remaining, shippingCost, idempotencyKey]);
       const orderId = orderRes[0].id;
 
       // 7. Create order item with snapshots and correct variant_id
@@ -1524,12 +1528,16 @@ export class ApiService implements OnModuleInit {
       }
 
       // 6. Create parent Pending order record with shipping_cost
-      const orderStatus = isPreOrder ? 'Pre-Order' : 'Pending';
+      const hasPrebookItem = pricing.items.some(item => item.isPrebook);
+      const actualBookingType = (bookingType === 'pre_order' || hasPrebookItem) ? 'pre_order' : 'standard';
+      const actualIsPreOrder = actualBookingType === 'pre_order';
+      const orderStatus = actualIsPreOrder ? 'Pre-Order' : 'Pending';
+
       const orderRes = await queryRunner.query(`
         INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
         RETURNING id;
-      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, bookingType, advPaid, remaining, shippingCost, idempotencyKey]);
+      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, actualBookingType, advPaid, remaining, shippingCost, idempotencyKey]);
       const orderId = orderRes[0].id;
 
       // Group resolved items for stock locking
