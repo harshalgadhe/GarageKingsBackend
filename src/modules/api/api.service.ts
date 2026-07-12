@@ -549,7 +549,22 @@ export class ApiService implements OnModuleInit {
         COALESCE(SUM(ib.quantity_available), 0)::INT as "quantity_available",
         COALESCE(SUM(ib.quantity_reserved), 0)::INT as "quantity_reserved",
         COALESCE(SUM(ib.quantity_sold), 0)::INT as "quantity_sold",
-        COALESCE(SUM(ib.quantity_incoming), 0)::INT as "quantity_incoming",
+        (
+          SELECT COALESCE(GREATEST(0, SUM(spi.quantity) - COALESCE(
+            (
+              SELECT SUM(ib_rec.quantity_received)
+              FROM inventory_batches ib_rec
+              JOIN supplier_purchases sp_rec ON sp_rec.id = ib_rec.supplier_purchase_id
+              WHERE sp_rec.status NOT IN ('Draft', 'Cancelled', 'Completed')
+                AND ib_rec.status != 'Archived'
+                AND ib_rec.variant_id = pv.id
+            ), 0
+          )), 0)::INT
+          FROM supplier_purchase_items spi
+          JOIN supplier_purchases sp ON sp.id = spi.supplier_purchase_id
+          WHERE spi.variant_id = pv.id
+            AND sp.status NOT IN ('Draft', 'Cancelled', 'Completed')
+        ) as "quantity_incoming",
         COALESCE(SUM(ib.quantity_damaged), 0)::INT as "quantity_damaged",
         COALESCE(SUM(ib.quantity_returned), 0)::INT as "quantity_returned",
         COALESCE(AVG(ib.purchase_price), 0.00)::NUMERIC(12,2) as "avgCost",
@@ -2920,7 +2935,24 @@ export class ApiService implements OnModuleInit {
     const availableRes = await this.dataSource.query('SELECT COALESCE(SUM(quantity_available), 0)::int as total FROM inventory_batches WHERE status != \'Archived\';');
     const availableInventory = availableRes[0].total;
 
-    const incomingRes = await this.dataSource.query('SELECT COALESCE(SUM(quantity_incoming), 0)::int as total FROM inventory_batches WHERE status != \'Archived\';');
+    const incomingRes = await this.dataSource.query(`
+      SELECT COALESCE(GREATEST(0, 
+        (
+          SELECT SUM(spi.quantity)
+          FROM supplier_purchase_items spi
+          JOIN supplier_purchases sp ON sp.id = spi.supplier_purchase_id
+          WHERE sp.status NOT IN ('Draft', 'Cancelled', 'Completed')
+        ) - COALESCE(
+          (
+            SELECT SUM(ib_rec.quantity_received)
+            FROM inventory_batches ib_rec
+            JOIN supplier_purchases sp_rec ON sp_rec.id = ib_rec.supplier_purchase_id
+            WHERE sp_rec.status NOT IN ('Draft', 'Cancelled', 'Completed')
+              AND ib_rec.status != 'Archived'
+          ), 0
+        )
+      ), 0)::int as total;
+    `);
     const incomingInventory = incomingRes[0].total;
 
     const poRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM supplier_purchases WHERE status NOT IN (\'Draft\', \'Cancelled\', \'Completed\');');
@@ -2941,7 +2973,7 @@ export class ApiService implements OnModuleInit {
     `, [threshold]);
     const lowStockAlerts = lowStockRes[0].total;
 
-    const preorderRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM orders WHERE booking_type = \'pre_order\' AND status NOT IN (\'Cancelled\', \'Expired\', \'Delivered\');');
+    const preorderRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM orders WHERE booking_type = \'pre_order\' AND status NOT IN (\'Cancelled\', \'Delivered\');');
     const preorderCount = preorderRes[0].total;
 
     const noSkuRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (sku IS NULL OR sku = \'\');');
