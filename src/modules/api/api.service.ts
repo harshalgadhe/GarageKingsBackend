@@ -995,9 +995,9 @@ export class ApiService implements OnModuleInit {
             `, [newAvail, batchId]);
             
             await queryRunner.query(`
-              INSERT INTO inventory_ledger (product_id, batch_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
-            `, [id, batchId, type, diff, Number(batch.purchase_price), Number(batch.selling_price), `Product edit stock adjustment from ${oldData.total_stock} to ${newStock}`, updaterEmail]);
+              INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, reason, performed_by)
+              VALUES ($1, $2, $3, $4, $5, $6, $7);
+            `, [batch.variant_id, batchId, type, diff, Number(batch.purchase_price), `Product edit stock adjustment from ${oldData.total_stock} to ${newStock}`, updaterEmail]);
             
             await queryRunner.query(`
               UPDATE products
@@ -1918,7 +1918,8 @@ export class ApiService implements OnModuleInit {
              p.model_name as "productName", p.brand as "productBrand", oi.price_at_purchase as "priceAtPurchase", oi.qty
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
-      JOIN products p ON p.id = oi.product_id
+      JOIN product_variants pv ON pv.id = oi.variant_id
+      JOIN products p ON p.id = pv.product_id
       JOIN users u ON u.id = o.user_id
       LEFT JOIN customers c ON c.email = u.email
       WHERE o.id = ANY($1)
@@ -1952,7 +1953,8 @@ export class ApiService implements OnModuleInit {
              o.screenshot_url as "screenshotUrl"
       FROM orders o
       JOIN order_items oi ON oi.order_id = o.id
-      JOIN products p ON p.id = oi.product_id
+      JOIN product_variants pv ON pv.id = oi.variant_id
+      JOIN products p ON p.id = pv.product_id
       JOIN users u ON u.id = o.user_id
       WHERE u.email = $1 AND o.deleted_at IS NULL
       ORDER BY o.created_at DESC;
@@ -3060,7 +3062,7 @@ export class ApiService implements OnModuleInit {
       SELECT 
         pv.id,
         pv.sku,
-        pv.casing_type as "casing",
+        ct.display_name as "casing",
         pv.selling_price as "sellingPrice",
         p.model_name as "productName",
         COALESCE(SUM(ib.quantity_available), 0)::INT as "availableStock",
@@ -3072,9 +3074,10 @@ export class ApiService implements OnModuleInit {
         COALESCE(SUM(ib.quantity_available * ib.purchase_price), 0.00)::NUMERIC(12,2) as "inventoryValue"
       FROM product_variants pv
       JOIN products p ON p.id = pv.product_id
+      LEFT JOIN casing_types ct ON ct.id = pv.casing_type_id
       LEFT JOIN inventory_batches ib ON ib.variant_id = pv.id AND ib.status != 'Archived'
       WHERE pv.id = $1
-      GROUP BY pv.id, p.model_name;
+      GROUP BY pv.id, p.model_name, ct.display_name;
     `, [variantId]);
 
     if (summaryRes.length === 0) {
@@ -3131,7 +3134,7 @@ export class ApiService implements OnModuleInit {
         ib.quantity_received,
         ib.quantity_available,
         s.name as "supplierName",
-        spr.receipt_code as "receiptNumber"
+        spr.receipt_number as "receiptNumber"
       FROM inventory_batches ib
       LEFT JOIN suppliers s ON s.id = ib.supplier_id
       LEFT JOIN supplier_purchase_receipts spr ON spr.id = ib.purchase_receipt_id
@@ -3147,7 +3150,6 @@ export class ApiService implements OnModuleInit {
         il.type,
         il.quantity_changed,
         il.purchase_price,
-        il.selling_price,
         il.performed_by,
         il.reason,
         il.order_id as "orderId"
@@ -3160,12 +3162,13 @@ export class ApiService implements OnModuleInit {
     const reservations = await this.dataSource.query(`
       SELECT 
         oi.id,
-        oi.quantity,
-        o.email as "customerEmail",
+        oi.qty as "quantity",
+        u.email as "customerEmail",
         o.status,
         o.created_at + INTERVAL '24 hours' as "expires_at"
       FROM order_items oi
       JOIN orders o ON o.id = oi.order_id
+      JOIN users u ON u.id = o.user_id
       WHERE oi.variant_id = $1
         AND o.status IN ('Pending', 'Verification Pending', 'Confirmed', 'Reserved')
       ORDER BY o.created_at DESC;
@@ -3177,7 +3180,7 @@ export class ApiService implements OnModuleInit {
         a.id,
         a.quantity,
         a.purchase_price,
-        oi.price as "selling_price",
+        oi.price_at_purchase as "selling_price",
         o.id as "orderId"
       FROM order_inventory_allocations a
       JOIN order_items oi ON oi.id = a.order_item_id
@@ -4118,6 +4121,91 @@ export class ApiService implements OnModuleInit {
     }
   }
 
+  async updateInventoryBatch(batchId: string, dto: { purchasePrice?: number; quantityAvailable?: number; quantityReceived?: number; supplierId?: string }, updaterEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const batchRes = await queryRunner.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE;", [batchId]);
+      if (batchRes.length === 0) throw new Error("Batch not found");
+      const oldBatch = batchRes[0];
+
+      const purchasePrice = dto.purchasePrice !== undefined ? Number(dto.purchasePrice) : Number(oldBatch.purchase_price);
+      const quantityAvailable = dto.quantityAvailable !== undefined ? Number(dto.quantityAvailable) : Number(oldBatch.quantity_available);
+      const quantityReceived = dto.quantityReceived !== undefined ? Number(dto.quantityReceived) : Number(oldBatch.quantity_received);
+      const supplierId = dto.supplierId !== undefined ? dto.supplierId : oldBatch.supplier_id;
+
+      await queryRunner.query(`
+        UPDATE inventory_batches
+        SET purchase_price = $1,
+            quantity_available = $2,
+            quantity_received = $3,
+            supplier_id = $4,
+            updated_at = NOW()
+        WHERE id = $5;
+      `, [purchasePrice, quantityAvailable, quantityReceived, supplierId, batchId]);
+
+      // Calculate quantity diff for ledger/cache adjustment
+      const diff = quantityAvailable - Number(oldBatch.quantity_available);
+      if (diff !== 0) {
+        await queryRunner.query(`
+          INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, reason, performed_by)
+          VALUES ($1, $2, $3, $4, $5, $6, $7);
+        `, [
+          oldBatch.variant_id,
+          batchId,
+          diff > 0 ? 'ADJUST_ADD' : 'ADJUST_REMOVE',
+          diff,
+          purchasePrice,
+          `Batch edit manual adjustment from ${oldBatch.quantity_available} to ${quantityAvailable}`,
+          updaterEmail
+        ]);
+
+        // Fetch product ID from product_variants
+        const varRes = await queryRunner.query("SELECT product_id FROM product_variants WHERE id = $1;", [oldBatch.variant_id]);
+        if (varRes.length > 0) {
+          const productId = varRes[0].product_id;
+          // Update cache products
+          await queryRunner.query(`
+            UPDATE products
+            SET total_stock = total_stock + $1,
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [diff, productId]);
+
+          // Update legacy inventory
+          await queryRunner.query(`
+            UPDATE inventory
+            SET quantity_available = quantity_available + $1,
+                updated_at = NOW()
+            WHERE product_id = $2;
+          `, [diff, productId]);
+        }
+      }
+
+      await queryRunner.commitTransaction();
+      localCache.del('products_list_true');
+      localCache.del('products_list_false');
+
+      await this.writeAuditLog(
+        'UPDATE_BATCH',
+        'inventory_batches',
+        batchId,
+        updaterEmail,
+        ipAddress,
+        oldBatch,
+        { purchasePrice, quantityAvailable, quantityReceived, supplierId }
+      );
+
+      return { success: true };
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   async adjustBatchInventory(batchId: string, quantityChange: number, type: string, reason: string, adminEmail: string, ipAddress: string) {
     const change = Number(quantityChange);
     if (!batchId || !change || isNaN(change)) {
@@ -4249,17 +4337,19 @@ export class ApiService implements OnModuleInit {
       // 1. Check if inventory cache matches batch totals
       const batchSums = await this.dataSource.query(`
         SELECT 
-          product_id,
-          SUM(quantity_available)::int as sum_available,
-          SUM(quantity_reserved)::int as sum_reserved,
-          SUM(quantity_sold)::int as sum_sold,
-          SUM(quantity_returned)::int as sum_returned,
-          SUM(quantity_damaged)::int as sum_damaged
-        FROM inventory_batches
-        GROUP BY product_id
+          pv.product_id,
+          SUM(ib.quantity_available)::int as sum_available,
+          SUM(ib.quantity_reserved)::int as sum_reserved,
+          SUM(ib.quantity_sold)::int as sum_sold,
+          SUM(ib.quantity_returned)::int as sum_returned,
+          SUM(ib.quantity_damaged)::int as sum_damaged
+        FROM inventory_batches ib
+        JOIN product_variants pv ON pv.id = ib.variant_id
+        GROUP BY pv.product_id
       `);
       
       for (const bs of batchSums) {
+        if (!bs.product_id) continue;
         const inv = await this.dataSource.query("SELECT * FROM inventory WHERE product_id = $1", [bs.product_id]);
         if (inv.length === 0) {
           mismatches.push(`Product ID ${bs.product_id}: Inventory cache row missing.`);
@@ -4284,15 +4374,32 @@ export class ApiService implements OnModuleInit {
         GROUP BY batch_id
       `);
       
+      const historicalBatchesRes = await this.dataSource.query(`
+        SELECT DISTINCT batch_id FROM inventory_ledger 
+        WHERE reason LIKE '%Historical%' AND batch_id IS NOT NULL;
+      `);
+      const historicalBatchIds = new Set(historicalBatchesRes.map(row => row.batch_id));
+      
+      const allBatchesRes = await this.dataSource.query(`
+        SELECT id, quantity_received, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged 
+        FROM inventory_batches;
+      `);
+      const batchMap = {};
+      allBatchesRes.forEach(b => batchMap[b.id] = b);
+      
       for (const ls of ledgerSums) {
-        const batch = await this.dataSource.query("SELECT id, quantity_received, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged FROM inventory_batches WHERE id = $1", [ls.batch_id]);
-        if (batch.length === 0) {
+        if (historicalBatchIds.has(ls.batch_id)) {
+          continue;
+        }
+        
+        const b = batchMap[ls.batch_id];
+        if (!b) {
           mismatches.push(`Batch ID ${ls.batch_id}: Batch missing but exists in ledger.`);
           continue;
         }
-        const b = batch[0];
-        if (b.quantity_available !== ls.total_change) {
-          mismatches.push(`Batch ID ${ls.batch_id}: Ledger mismatch. Batch Available:${b.quantity_available} vs Ledger Total Change:${ls.total_change}.`);
+
+        if (Number(b.quantity_available) + Number(b.quantity_reserved) !== ls.total_change) {
+          mismatches.push(`Batch ID ${ls.batch_id}: Ledger mismatch. Batch Available:${b.quantity_available} (Res:${b.quantity_reserved}) vs Ledger Total Change:${ls.total_change}.`);
         }
       }
       

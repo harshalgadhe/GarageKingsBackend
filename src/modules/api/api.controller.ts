@@ -449,36 +449,7 @@ export class ApiController {
     return this.apiService.updateCustomerProfile(req.user.email, dto);
   }
 
-  @Get('admin/orders')
-  @UseGuards(AuthGuard('jwt'))
-  async getAdminOrders(
-    @Query('page') page: number,
-    @Query('limit') limit: number,
-    @Query('search') search: string,
-    @Query('status') status: string,
-    @Request() req: any
-  ) {
-    this.checkAdmin(req);
-    if (page || limit || search || status) {
-      return this.apiService.getPaginatedAdminOrders({ page, limit, search, status });
-    }
-    return this.apiService.getAdminOrders();
-  }
 
-
-  @Patch('admin/orders/:id')
-  @UseGuards(AuthGuard('jwt'))
-  async updateOrderStatus(
-    @Param('id') id: string,
-    @Body() dto: { status?: string; courierPartner?: string; trackingNumber?: string; shippingCost?: number; packagingCost?: number; dispatchDate?: string; deliveryDate?: string },
-    @Request() req: any
-  ) {
-    this.checkAdmin(req);
-    if (dto.status === 'Confirmed') {
-      return this.apiService.adminConfirmOrder(id, req.user.email, req.ip);
-    }
-    return this.apiService.adminUpdateOrderStatus(id, dto, req.user.email, req.ip);
-  }
 
   @Post('orders/:id/screenshot')
   @UseGuards(AuthGuard('jwt'))
@@ -518,46 +489,7 @@ export class ApiController {
     return this.apiService.customerSubmitRemainingPayment(orderId, file.buffer, extension, req.user.userId, req.ip);
   }
 
-  @Get('admin/orders/:id/screenshot')
-  @UseGuards(AuthGuard('jwt'))
-  async getScreenshot(@Param('id') orderId: string, @Request() req: any, @Res() res: ExpressResponse) {
-    this.checkAdmin(req);
-    const result = await this.apiService.getPrivateScreenshotStream(orderId);
-    if (!result) {
-      throw new NotFoundException('Screenshot not found for this order.');
-    }
-    res.setHeader('Content-Type', 'image/jpeg'); // Standard default, browser handles webp/png inline mostly
-    result.stream.pipe(res);
-  }
 
-  // ── PRE-ORDER: COLLECT REMAINING PAYMENT ──────────────────────────
-  @Post('admin/orders/:id/collect-remaining')
-  @UseGuards(AuthGuard('jwt'))
-  @UseInterceptors(FileInterceptor('file'))
-  async collectRemainingPayment(
-    @Param('id') orderId: string,
-    @UploadedFile() file: any,
-    @Request() req: any
-  ) {
-    this.checkAdmin(req);
-    if (!file) {
-      throw new BadRequestException('No payment screenshot provided.');
-    }
-    const signature = validateFileSignature(file.buffer);
-    if (!signature.isValid) {
-      throw new BadRequestException('Invalid file signature. Only JPG, PNG, and WebP images are allowed.');
-    }
-    const extension = signature.mime.split('/').pop() || 'webp';
-    return this.apiService.collectRemainingPayment(orderId, file.buffer, extension, req.user.email, req.ip);
-  }
-
-  // ── FORMAL RECEIPT GENERATION ─────────────────────────────────────
-  @Get('admin/orders/:id/receipt')
-  @UseGuards(AuthGuard('jwt'))
-  async getOrderReceipt(@Param('id') orderId: string, @Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.generateReceiptForOrder(orderId);
-  }
 
   // ── PUBLIC IMAGE UPLOADS AND STREAMING ────────────────────────────
   @Post('images/upload')
@@ -651,6 +583,17 @@ export class ApiController {
   async getProductBatches(@Param('productId') productId: string, @Request() req: any) {
     this.checkAdmin(req);
     return this.apiService.getProductBatches(productId);
+  }
+
+  @Patch('admin/inventory/batches/:id')
+  @UseGuards(AuthGuard('jwt'))
+  async updateInventoryBatch(
+    @Param('id') id: string,
+    @Body() dto: { purchasePrice?: number; quantityAvailable?: number; quantityReceived?: number; supplierId?: string },
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    return this.apiService.updateInventoryBatch(id, dto, req.user.email, req.ip);
   }
 
   @Post('admin/inventory/adjust')
