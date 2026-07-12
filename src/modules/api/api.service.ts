@@ -37,7 +37,7 @@ export class ApiService implements OnModuleInit {
     `);
 
     // Alter order_status enum values if they don't exist
-    for (const val of ['Verification Pending', 'Confirmed', 'Reserved', 'Pre-Order', 'Awaiting Stock']) {
+    for (const val of ['Verification Pending', 'Confirmed', 'Reserved', 'Pre-Order', 'Awaiting Stock', 'Expired']) {
       try {
         await this.dataSource.query(`ALTER TYPE order_status ADD VALUE IF NOT EXISTS '${val}'`);
       } catch (err: any) {
