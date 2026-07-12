@@ -25,10 +25,19 @@ export class ObservabilityController {
 
   @Post('telemetry/log')
   async logFrontendError(@Body() body: any, @Request() req: any) {
+    let decodedStack = body.stack || '';
+    if (decodedStack && !decodedStack.includes('\n') && decodedStack.length % 4 === 0) {
+      try {
+        decodedStack = Buffer.from(decodedStack, 'base64').toString('utf8');
+      } catch (e) {
+        // Fallback to original
+      }
+    }
+
     await this.telemetryService.logError({
       errorType: 'Frontend',
       message: body.message,
-      stackTrace: body.stack,
+      stackTrace: decodedStack,
       url: body.url,
       browser: body.userAgent,
       userEmail: body.userEmail,
