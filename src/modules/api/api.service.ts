@@ -3054,6 +3054,164 @@ export class ApiService implements OnModuleInit {
     };
   }
 
+  async getInventoryVariantDetails(variantId: string) {
+    // 1. Fetch variant and product summary
+    const summaryRes = await this.dataSource.query(`
+      SELECT 
+        pv.id,
+        pv.sku,
+        pv.casing_type as "casing",
+        pv.selling_price as "sellingPrice",
+        p.model_name as "productName",
+        COALESCE(SUM(ib.quantity_available), 0)::INT as "availableStock",
+        COALESCE(SUM(ib.quantity_reserved), 0)::INT as "reservedStock",
+        COALESCE(SUM(ib.quantity_sold), 0)::INT as "soldStock",
+        COALESCE(SUM(ib.quantity_damaged), 0)::INT as "damagedStock",
+        COALESCE(SUM(ib.quantity_returned), 0)::INT as "returnedStock",
+        COALESCE(AVG(ib.purchase_price), 0.00)::NUMERIC(12,2) as "averagePurchaseCost",
+        COALESCE(SUM(ib.quantity_available * ib.purchase_price), 0.00)::NUMERIC(12,2) as "inventoryValue"
+      FROM product_variants pv
+      JOIN products p ON p.id = pv.product_id
+      LEFT JOIN inventory_batches ib ON ib.variant_id = pv.id AND ib.status != 'Archived'
+      WHERE pv.id = $1
+      GROUP BY pv.id, p.model_name;
+    `, [variantId]);
+
+    if (summaryRes.length === 0) {
+      throw new Error("Variant not found");
+    }
+
+    const summary = summaryRes[0];
+    summary.averagePurchaseCost = Number(summary.averagePurchaseCost || 0);
+    summary.sellingPrice = Number(summary.sellingPrice || 0);
+    summary.inventoryValue = Number(summary.inventoryValue || 0);
+    summary.availableStock = Number(summary.availableStock || 0);
+    summary.reservedStock = Number(summary.reservedStock || 0);
+    summary.soldStock = Number(summary.soldStock || 0);
+    summary.damagedStock = Number(summary.damagedStock || 0);
+    summary.returnedStock = Number(summary.returnedStock || 0);
+
+    // Calculate margins
+    if (summary.sellingPrice > 0) {
+      summary.marginPercent = ((summary.sellingPrice - summary.averagePurchaseCost) / summary.sellingPrice) * 100;
+    } else {
+      summary.marginPercent = 0.00;
+    }
+
+    // Calculate incomingStock
+    const incomingStockRes = await this.dataSource.query(`
+      SELECT COALESCE(GREATEST(0, 
+        (
+          SELECT SUM(spi.quantity)
+          FROM supplier_purchase_items spi
+          JOIN supplier_purchases sp ON sp.id = spi.supplier_purchase_id
+          WHERE spi.variant_id = $1
+            AND sp.status NOT IN ('Draft', 'Cancelled', 'Completed')
+        ) - COALESCE(
+          (
+            SELECT SUM(ib_rec.quantity_received)
+            FROM inventory_batches ib_rec
+            JOIN supplier_purchases sp_rec ON sp_rec.id = ib_rec.supplier_purchase_id
+            WHERE ib_rec.variant_id = $1
+              AND sp_rec.status NOT IN ('Draft', 'Cancelled', 'Completed')
+              AND ib_rec.status != 'Archived'
+          ), 0
+        )
+      ), 0)::int as total;
+    `, [variantId]);
+    summary.incomingStock = incomingStockRes[0].total;
+    summary.totalStock = summary.availableStock + summary.reservedStock + summary.soldStock + summary.damagedStock + summary.returnedStock;
+
+    // 2. Fetch active batches
+    const batches = await this.dataSource.query(`
+      SELECT 
+        ib.id,
+        ib.received_at,
+        ib.purchase_price,
+        ib.quantity_received,
+        ib.quantity_available,
+        s.name as "supplierName",
+        spr.receipt_code as "receiptNumber"
+      FROM inventory_batches ib
+      LEFT JOIN suppliers s ON s.id = ib.supplier_id
+      LEFT JOIN supplier_purchase_receipts spr ON spr.id = ib.purchase_receipt_id
+      WHERE ib.variant_id = $1 AND ib.status != 'Archived'
+      ORDER BY ib.received_at DESC;
+    `, [variantId]);
+
+    // 3. Fetch append-only ledger logs
+    const ledger = await this.dataSource.query(`
+      SELECT 
+        il.id,
+        il.created_at,
+        il.type,
+        il.quantity_changed,
+        il.purchase_price,
+        il.selling_price,
+        il.performed_by,
+        il.reason,
+        il.order_id as "orderId"
+      FROM inventory_ledger il
+      WHERE il.variant_id = $1
+      ORDER BY il.created_at DESC;
+    `, [variantId]);
+
+    // 4. Fetch active reservations (from order_items of pending/confirmed orders)
+    const reservations = await this.dataSource.query(`
+      SELECT 
+        oi.id,
+        oi.quantity,
+        o.email as "customerEmail",
+        o.status,
+        o.created_at + INTERVAL '24 hours' as "expires_at"
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      WHERE oi.variant_id = $1
+        AND o.status IN ('Pending', 'Verification Pending', 'Confirmed', 'Reserved')
+      ORDER BY o.created_at DESC;
+    `, [variantId]);
+
+    // 5. Fetch allocations
+    const allocations = await this.dataSource.query(`
+      SELECT 
+        a.id,
+        a.quantity,
+        a.purchase_price,
+        oi.price as "selling_price",
+        o.id as "orderId"
+      FROM order_inventory_allocations a
+      JOIN order_items oi ON oi.id = a.order_item_id
+      JOIN orders o ON o.id = oi.order_id
+      WHERE oi.variant_id = $1
+      ORDER BY o.created_at DESC;
+    `, [variantId]);
+
+    // 6. Fetch purchases
+    const purchases = await this.dataSource.query(`
+      SELECT 
+        spi.id,
+        spi.quantity,
+        spi.purchase_price,
+        sp.purchase_date as "purchaseDate",
+        sp.status as "purchaseStatus",
+        s.name as "supplierName"
+      FROM supplier_purchase_items spi
+      JOIN supplier_purchases sp ON sp.id = spi.supplier_purchase_id
+      LEFT JOIN suppliers s ON s.id = sp.supplier_id
+      WHERE spi.variant_id = $1
+      ORDER BY sp.purchase_date DESC;
+    `, [variantId]);
+
+    return {
+      summary,
+      batches,
+      ledger,
+      reservations,
+      allocations,
+      purchases
+    };
+  }
+
   async getFinanceMetrics(timeRange = 'Lifetime', cashAccountId?: string) {
     const { start, end } = this.getDateFilter(timeRange);
     const prev = this.getPreviousPeriod(timeRange);

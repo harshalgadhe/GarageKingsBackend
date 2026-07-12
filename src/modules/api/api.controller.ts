@@ -347,6 +347,13 @@ export class ApiController {
     return this.apiService.getAdminVariants({ page, limit, search });
   }
 
+  @Get('admin/inventory/variants/:variantId/details')
+  @UseGuards(AuthGuard('jwt'))
+  async getInventoryVariantDetails(@Param('variantId') variantId: string, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getInventoryVariantDetails(variantId);
+  }
+
   @Get('admin/products')
   @UseGuards(AuthGuard('jwt'))
   async getAdminProducts(
@@ -770,29 +777,6 @@ export class ApiController {
     return this.apiService.getAuditLogs();
   }
 
-  // ── ALERTS AND SYSTEM NOTIFICATIONS ───────────────────────────────
-  @Get('admin/notifications')
-  @UseGuards(AuthGuard('jwt'))
-  async getNotifications(@Request() req: any, @Query('limit') limit?: string, @Query('offset') offset?: string) {
-    this.checkAdmin(req);
-    const limitNum = limit ? parseInt(limit, 10) : 10;
-    const offsetNum = offset ? parseInt(offset, 10) : 0;
-    return this.apiService.getSystemNotifications(limitNum, offsetNum);
-  }
-
-  @Post('admin/notifications/read')
-  @UseGuards(AuthGuard('jwt'))
-  async markNotificationsRead(@Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.markNotificationsRead();
-  }
-
-  @Delete('admin/notifications/:id')
-  @UseGuards(AuthGuard('jwt'))
-  async deleteNotification(@Param('id') id: string, @Request() req: any) {
-    this.checkAdmin(req);
-    return this.apiService.deleteSystemNotification(id);
-  }
 
   // ── CMS HOMEPAGE SECTIONS VISIBILITY ──────────────────────────────
   @Get('admin/homepage-cms')
