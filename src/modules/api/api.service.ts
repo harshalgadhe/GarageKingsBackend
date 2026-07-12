@@ -1217,7 +1217,8 @@ export class ApiService implements OnModuleInit {
                p.brand, 
                p.rarity_level as "manufacturer", 
                ct.name as "casing",
-               p.prebook_deposit_amount as "prebookDepositAmount"
+               p.prebook_deposit_amount as "prebookDepositAmount",
+               p.is_prebook as "isPrebook"
         FROM product_variants pv 
         JOIN products p ON p.id = pv.product_id 
         JOIN casing_types ct ON ct.id = pv.casing_type_id 
@@ -1241,13 +1242,15 @@ export class ApiService implements OnModuleInit {
           manufacturer: row.manufacturer,
           price: itemPrice,
           prebookDepositAmount: row.prebookDepositAmount,
+          isPrebook: row.isPrebook === true || row.isPrebook === 1,
           qty
         });
       }
     }
 
+    const hasPrebookItem = resolvedItems.some(item => item.isPrebook);
     const settings = await this.getGlobalSettings();
-    const shippingFee = isPreOrder ? 0 : (settings.shippingConfig?.defaultFee || 200);
+    const shippingFee = (isPreOrder || hasPrebookItem) ? 0 : (settings.shippingConfig?.defaultFee || 200);
     const totalPrice = subtotal + shippingFee;
 
     let advanceAmount = totalPrice;
