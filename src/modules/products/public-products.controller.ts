@@ -10,6 +10,7 @@ export class PublicProductsController {
   async getProducts(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
     @Query('brand') brand?: string,
     @Query('scale') scale?: string,
     @Query('tag') tag?: string,
@@ -20,6 +21,7 @@ export class PublicProductsController {
     const result = await this.productsService.getPaginatedProducts({
       page: page ? parseInt(page, 10) : undefined,
       limit: limit ? parseInt(limit, 10) : undefined,
+      offset: offset ? parseInt(offset, 10) : undefined,
       brand,
       scale,
       tag,

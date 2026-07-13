@@ -37,6 +37,7 @@ export class ProductsService {
   async getPaginatedProducts(options: {
     page?: number;
     limit?: number;
+    offset?: number;
     brand?: string;
     scale?: string;
     tag?: string;
@@ -47,7 +48,7 @@ export class ProductsService {
   }) {
     const page = Math.max(1, Number(options.page || 1));
     const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
-    const offset = (page - 1) * limit;
+    const offset = (options as any).offset !== undefined ? Number((options as any).offset) : (page - 1) * limit;
 
     let queryStr = `
       SELECT p.id, p.brand, p.model_name as name, p.rarity_level as manufacturer, p.series, p.scale,

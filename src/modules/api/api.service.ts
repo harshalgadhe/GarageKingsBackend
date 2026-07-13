@@ -590,6 +590,7 @@ export class ApiService implements OnModuleInit {
   async getPaginatedProducts(options: {
     page?: number;
     limit?: number;
+    offset?: number;
     brand?: string;
     scale?: string;
     tag?: string;
@@ -600,7 +601,7 @@ export class ApiService implements OnModuleInit {
   }) {
     const page = Math.max(1, Number(options.page || 1));
     const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
-    const offset = (page - 1) * limit;
+    const offset = options.offset !== undefined ? Number(options.offset) : (page - 1) * limit;
 
     const adminFields = options.adminMode ? `
       p.purchase_price as "purchasePrice",
