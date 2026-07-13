@@ -1248,31 +1248,59 @@ export class ApiService implements OnModuleInit {
       }
     }
 
-    const hasPrebookItem = resolvedItems.some(item => item.isPrebook);
     const settings = await this.getGlobalSettings();
-    const shippingFee = (isPreOrder || hasPrebookItem) ? 0 : (settings.shippingConfig?.defaultFee || 200);
-    const totalPrice = subtotal + shippingFee;
+    const defaultShippingFee = settings.shippingConfig?.defaultFee || 200;
 
-    let advanceAmount = totalPrice;
-    let remainingAmount = 0;
+    const groups = [];
+    const standardItems = resolvedItems.filter(item => !item.isPrebook);
+    const prebookItems = resolvedItems.filter(item => item.isPrebook);
 
-    if (isPreOrder) {
-      let minAdvance = 0;
-      for (const item of resolvedItems) {
-        minAdvance += Number(item.prebookDepositAmount || 0) * item.qty;
-      }
-      const preferredAdvance = dto.advanceAmount !== undefined ? Number(dto.advanceAmount) : minAdvance;
-      advanceAmount = Math.min(totalPrice, Math.max(minAdvance, preferredAdvance));
-      remainingAmount = totalPrice - advanceAmount;
+    // 1. Standard items group (all standard items in one order)
+    if (standardItems.length > 0) {
+      const gSubtotal = standardItems.reduce((sum, item) => sum + item.price * item.qty, 0);
+      const gShipping = defaultShippingFee;
+      const gTotal = gSubtotal + gShipping;
+      groups.push({
+        bookingType: 'standard',
+        items: standardItems,
+        subtotal: gSubtotal,
+        shippingFee: gShipping,
+        totalPrice: gTotal,
+        advanceAmount: gTotal,
+        remainingAmount: 0
+      });
     }
 
+    // 2. Pre-order groups (each pre-booking item gets its own separate order)
+    for (const item of prebookItems) {
+      const gSubtotal = item.price * item.qty;
+      const gShipping = 0; // ₹0 shipping at checkout for pre-order
+      const gTotal = gSubtotal + gShipping;
+      groups.push({
+        bookingType: 'pre_order',
+        items: [item],
+        subtotal: gSubtotal,
+        shippingFee: gShipping,
+        totalPrice: gTotal,
+        advanceAmount: gTotal, // 100% upfront pay since toggle is removed
+        remainingAmount: 0
+      });
+    }
+
+    const grandSubtotal = groups.reduce((sum, g) => sum + g.subtotal, 0);
+    const grandShipping = groups.reduce((sum, g) => sum + g.shippingFee, 0);
+    const grandTotal = groups.reduce((sum, g) => sum + g.totalPrice, 0);
+    const grandAdvance = groups.reduce((sum, g) => sum + g.advanceAmount, 0);
+    const grandRemaining = groups.reduce((sum, g) => sum + g.remainingAmount, 0);
+
     return {
-      subtotal,
-      shippingFee,
-      totalPrice,
-      advanceAmount,
-      remainingAmount,
-      items: resolvedItems
+      subtotal: grandSubtotal,
+      shippingFee: grandShipping,
+      totalPrice: grandTotal,
+      advanceAmount: grandAdvance,
+      remainingAmount: grandRemaining,
+      items: resolvedItems,
+      groups
     };
   }
 
@@ -1527,82 +1555,92 @@ export class ApiService implements OnModuleInit {
         userId = userRes[0].id;
       }
 
-      // 6. Create parent Pending order record with shipping_cost
-      const hasPrebookItem = pricing.items.some(item => item.isPrebook);
-      const actualBookingType = (bookingType === 'pre_order' || hasPrebookItem) ? 'pre_order' : 'standard';
-      const actualIsPreOrder = actualBookingType === 'pre_order';
-      const orderStatus = actualIsPreOrder ? 'Pre-Order' : 'Pending';
+      // 6. Create parent order records for each group
+      const createdOrderIds = [];
+      let firstOrderId = null;
 
-      const orderRes = await queryRunner.query(`
-        INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
-        RETURNING id;
-      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, actualBookingType, advPaid, remaining, shippingCost, idempotencyKey]);
-      const orderId = orderRes[0].id;
+      for (let i = 0; i < pricing.groups.length; i++) {
+        const group = pricing.groups[i];
+        const groupIsPreOrder = group.bookingType === 'pre_order';
+        const orderStatus = groupIsPreOrder ? 'Pre-Order' : 'Pending';
+        
+        // Suffix idempotencyKey with _i to keep unique constraint satisfied
+        const groupIdempotencyKey = `${idempotencyKey}_${i}`;
 
-      // Group resolved items for stock locking
-      const requestedQuantities = {};
-      const resolvedMap = {};
-      for (const resolved of pricing.items) {
-        requestedQuantities[resolved.productId] = (requestedQuantities[resolved.productId] || 0) + resolved.qty;
-        resolvedMap[resolved.productId] = resolved;
-      }
+        const orderRes = await queryRunner.query(`
+          INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
+          RETURNING id;
+        `, [userId, group.totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, group.bookingType, group.advanceAmount, group.remainingAmount, group.shippingFee, groupIdempotencyKey]);
+        
+        const orderId = orderRes[0].id;
+        createdOrderIds.push(orderId);
+        if (!firstOrderId) firstOrderId = orderId;
 
-      // 7. Validate stock, lock stock, and create order items with snapshots
-      for (const [productId, qtyNeeded] of Object.entries(requestedQuantities)) {
-        const resolvedItem = resolvedMap[productId];
-        const unitPrice = resolvedItem.price;
-
-        // Row-level lock target product in alphabetical order (prevents deadlocks)
-        const prodRows = await queryRunner.query(`
-          SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
-          FROM products 
-          WHERE id = $1 AND deleted_at IS NULL 
-          FOR UPDATE;
-        `, [productId]);
-
-        if (prodRows.length === 0) {
-          throw new BadRequestException("Target die-cast grail does not exist or has been archived.");
+        // Group resolved items for stock locking
+        const requestedQuantities = {};
+        const resolvedMap = {};
+        for (const resolved of group.items) {
+          requestedQuantities[resolved.productId] = (requestedQuantities[resolved.productId] || 0) + resolved.qty;
+          resolvedMap[resolved.productId] = resolved;
         }
 
-        const p = prodRows[0];
-        const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+        // 7. Validate stock, lock stock, and create order items with snapshots
+        for (const [productId, qtyNeeded] of Object.entries(requestedQuantities)) {
+          const resolvedItem = resolvedMap[productId];
+          const unitPrice = resolvedItem.price;
 
-        if (available <= 0) {
-          throw new BadRequestException(`Casting "${p.name}" is sold out.`);
-        }
+          // Row-level lock target product in alphabetical order (prevents deadlocks)
+          const prodRows = await queryRunner.query(`
+            SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
+            FROM products 
+            WHERE id = $1 AND deleted_at IS NULL 
+            FOR UPDATE;
+          `, [productId]);
 
-        if (Number(qtyNeeded) > available) {
-          throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${qtyNeeded}.`);
-        }
-
-        // Check customer purchase limit
-        if (p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
-          const existingCountRes = await queryRunner.query(`
-            SELECT COALESCE(SUM(oi.qty), 0) as total
-            FROM order_items oi
-            JOIN orders o ON o.id = oi.order_id
-            JOIN users u ON u.id = o.user_id
-            WHERE oi.product_id = $1 
-              AND u.email = $2 
-              AND o.status NOT IN ('Cancelled', 'Expired');
-          `, [productId, email.trim().toLowerCase()]);
-          const existingCount = Number(existingCountRes[0].total);
-          if (existingCount + Number(qtyNeeded) > p.max_qty_per_customer) {
-            throw new BadRequestException(`Purchase limit exceeded for "${p.name}". You have already ordered/reserved ${existingCount} items.`);
+          if (prodRows.length === 0) {
+            throw new BadRequestException("Target die-cast grail does not exist or has been archived.");
           }
+
+          const p = prodRows[0];
+          const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+
+          if (available <= 0) {
+            throw new BadRequestException(`Casting "${p.name}" is sold out.`);
+          }
+
+          if (Number(qtyNeeded) > available) {
+            throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${qtyNeeded}.`);
+          }
+
+          // Check customer purchase limit
+          if (p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
+            const existingCountRes = await queryRunner.query(`
+              SELECT COALESCE(SUM(oi.qty), 0) as total
+              FROM order_items oi
+              JOIN orders o ON o.id = oi.order_id
+              JOIN users u ON u.id = o.user_id
+              WHERE oi.product_id = $1 
+                AND u.email = $2 
+                AND o.status NOT IN ('Cancelled', 'Expired');
+            `, [productId, email.trim().toLowerCase()]);
+            const existingCount = Number(existingCountRes[0].total);
+            if (existingCount + Number(qtyNeeded) > p.max_qty_per_customer) {
+              throw new BadRequestException(`Purchase limit exceeded for "${p.name}". You have already ordered/reserved ${existingCount} items.`);
+            }
+          }
+
+          // Create order item with snapshots and correct variant_id
+          await queryRunner.query(`
+            INSERT INTO order_items (order_id, variant_id, product_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
+          `, [orderId, resolvedItem.variantId, productId, qtyNeeded, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
+
+          // Lock the stock
+          await queryRunner.query(`
+            UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
+          `, [qtyNeeded, productId]);
         }
-
-        // Create order item with snapshots and correct variant_id
-        await queryRunner.query(`
-          INSERT INTO order_items (order_id, variant_id, product_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
-        `, [orderId, resolvedItem.variantId, productId, qtyNeeded, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
-
-        // Lock the stock
-        await queryRunner.query(`
-          UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
-        `, [qtyNeeded, productId]);
       }
 
       await queryRunner.commitTransaction();
@@ -1611,10 +1649,11 @@ export class ApiService implements OnModuleInit {
 
       const responseObj = {
         success: true,
-        orderId,
-        bookingType: isPreOrder ? 'pre_order' : 'standard',
-        advanceAmount: advPaid,
-        remainingAmount: remaining
+        orderId: firstOrderId,
+        orderIds: createdOrderIds,
+        bookingType: pricing.groups.some(g => g.bookingType === 'pre_order') ? 'pre_order' : 'standard',
+        advanceAmount: pricing.advanceAmount,
+        remainingAmount: pricing.remainingAmount
       };
 
       // Set idempotency cache
@@ -1623,7 +1662,7 @@ export class ApiService implements OnModuleInit {
       await this.writeAuditLog(
         'ORDER_CREATED_CART',
         'orders',
-        orderId,
+        firstOrderId,
         email,
         ipAddress,
         null,
@@ -1642,7 +1681,7 @@ export class ApiService implements OnModuleInit {
   // ── UPI SCREENSHOT UPLOAD SECURE STRATEGY ──────────────────────────
   async saveScreenshotReceipt(orderId: string, fileBuffer: Buffer, fileExtension: string, userId: string, ipAddress: string) {
     const orderRows = await this.dataSource.query(
-      "SELECT id, user_id, status FROM orders WHERE id = $1 AND deleted_at IS NULL",
+      "SELECT id, user_id, status, idempotency_key FROM orders WHERE id = $1 AND deleted_at IS NULL",
       [orderId]
     );
     if (orderRows.length === 0) throw new BadRequestException('Order not found.');
@@ -1673,30 +1712,46 @@ export class ApiService implements OnModuleInit {
       fs.writeFileSync(filePath, fileBuffer);
     }
 
-    // Update order status to Verification Pending and store filename
-    await this.dataSource.query(`
-      UPDATE orders 
-      SET status = 'Verification Pending', screenshot_url = $1, updated_at = NOW()
-      WHERE id = $2;
-    `, [fileName, orderId]);
+    // Find ALL sibling orders created in the same transaction split
+    let siblingOrderIds = [orderId];
+    if (order.idempotency_key && order.idempotency_key.includes('_')) {
+      const parts = order.idempotency_key.split('_');
+      if (parts.length > 0) {
+        const prefix = parts[0] + '_';
+        const siblings = await this.dataSource.query(
+          "SELECT id FROM orders WHERE idempotency_key LIKE $1 AND user_id = $2 AND deleted_at IS NULL",
+          [`${prefix}%`, order.user_id]
+        );
+        siblingOrderIds = siblings.map(s => s.id);
+      }
+    }
 
-    // Send admin notification alert
-    await this.createSystemNotification(
-      'Payment Uploaded',
-      `Order ${orderId.slice(0, 8)} uploaded a transaction receipt. Pending verification.`,
-      'payment',
-      orderId
-    );
+    // Update order status to Verification Pending and store filename for ALL siblings
+    for (const oid of siblingOrderIds) {
+      await this.dataSource.query(`
+        UPDATE orders 
+        SET status = 'Verification Pending', screenshot_url = $1, updated_at = NOW()
+        WHERE id = $2;
+      `, [fileName, oid]);
 
-    await this.writeAuditLog(
-      'UPLOAD_RECEIPT',
-      'orders',
-      orderId,
-      'Customer',
-      ipAddress,
-      { status: 'Reserved' },
-      { status: 'Verification Pending', file: fileName }
-    );
+      // Send admin notification alert
+      await this.createSystemNotification(
+        'Payment Uploaded',
+        `Order ${oid.slice(0, 8)} uploaded a transaction receipt. Pending verification.`,
+        'payment',
+        oid
+      );
+
+      await this.writeAuditLog(
+        'UPLOAD_RECEIPT',
+        'orders',
+        oid,
+        'Customer',
+        ipAddress,
+        { status: 'Reserved' },
+        { status: 'Verification Pending', file: fileName }
+      );
+    }
 
     return { success: true };
   }
