@@ -613,17 +613,18 @@ export class ApiService implements OnModuleInit {
       p.updated_by as "updatedBy",
     ` : '';
 
+    const descField = options.adminMode ? 'p.description, p.sku, p.casing_types as "casingTypes", p.base_price as price, p.rarity_level as lane,' : '';
     let queryStr = `
-      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale, p.sku, 
-             p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
+      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale,
+             p.rarity_level as grade,
              p.tags, p.category, p.selling_price as "sellingPrice",
+             ${descField}
              ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
              p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
              p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
-             p.casing_types as "casingTypes",
              pi.thumbnail_url as image, p.created_at
       FROM products p
       LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true

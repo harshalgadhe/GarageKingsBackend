@@ -52,7 +52,7 @@ export class ProductsService {
 
     let queryStr = `
       SELECT p.id, p.brand, p.model_name as name, p.rarity_level as manufacturer, p.series, p.scale,
-             p.description, p.tags, p.category, p.status, p.show_on_homepage as "showOnHomepage",
+             p.tags, p.category, p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              COALESCE(MIN(pv.selling_price), 0.00) as "sellingPrice",
              COALESCE(MIN(pv.selling_price), 0.00) as "minPrice",
