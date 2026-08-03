@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
@@ -305,6 +305,9 @@ export class ApiController {
   // ── PRODUCTS REST ENDPOINTS ─────────────────────────────────────────
   @Get('products')
   async getProducts(
+    @Request() req: any,
+    @Res({ passthrough: true }) res: ExpressResponse,
+    @Headers('user-agent') userAgent?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
@@ -315,7 +318,7 @@ export class ApiController {
     @Query('inStock') inStock?: string,
     @Query('preBooking') preBooking?: string
   ) {
-    return this.apiService.getPaginatedProducts({
+    const data = await this.apiService.getPaginatedProducts({
       page: page ? parseInt(page, 10) : undefined,
       limit: limit ? parseInt(limit, 10) : undefined,
       offset: offset ? parseInt(offset, 10) : undefined,
@@ -324,8 +327,22 @@ export class ApiController {
       tag,
       search,
       inStock: inStock === 'true',
-      preBooking: preBooking === 'true'
+      preBooking: preBooking === 'true',
+      userAgent
     });
+
+    const jsonStr = JSON.stringify(data);
+    const hash = crypto.createHash('sha256').update(jsonStr).digest('hex');
+    const etag = `W/"${hash}"`;
+
+    res.setHeader('Cache-Control', 'public, max-age=10');
+    res.setHeader('ETag', etag);
+
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304);
+      return;
+    }
+    return data;
   }
 
   @Get('products/:id')
@@ -414,7 +431,14 @@ export class ApiController {
   // ── SETTINGS REST ENDPOINTS ─────────────────────────────────────────
   @Get('settings')
   async getSettings() {
-    return this.apiService.getGlobalSettings();
+    const raw = await this.apiService.getGlobalSettings();
+    return {
+      showPrices: raw.showPrices,
+      instagramUrl: raw.instagramUrl,
+      companyUpiId: raw.companyUpiId,
+      upiQrImage: raw.upiQrImage,
+      partnerNames: raw.partnerNames
+    };
   }
 
   @Post('settings')
@@ -449,6 +473,59 @@ export class ApiController {
   @UseGuards(AuthGuard('jwt'))
   async updateMyProfile(@Body() dto: any, @Request() req: any) {
     return this.apiService.updateCustomerProfile(req.user.email, dto);
+  }
+
+  @Get('cart')
+  @UseGuards(AuthGuard('jwt'))
+  async getCart(@Request() req: any) {
+    return this.apiService.getUserCart(req.user.userId);
+  }
+
+  @Post('cart')
+  @UseGuards(AuthGuard('jwt'))
+  async upsertCartItem(
+    @Body() dto: { variantId: string; quantity: number; mode: 'add' | 'set'; productName?: string; imageUrl?: string; price?: number; brand?: string },
+    @Request() req: any
+  ) {
+    if (!dto.variantId) {
+      throw new BadRequestException("Variant ID is required.");
+    }
+    return this.apiService.upsertCartItem(
+      req.user.userId,
+      dto.variantId,
+      dto.quantity,
+      dto.mode || 'set',
+      {
+        productName: dto.productName,
+        imageUrl: dto.imageUrl,
+        price: dto.price,
+        brand: dto.brand
+      }
+    );
+  }
+
+  @Delete('cart/:variantId')
+  @UseGuards(AuthGuard('jwt'))
+  async deleteCartItem(@Param('variantId') variantId: string, @Request() req: any) {
+    return this.apiService.deleteCartItem(req.user.userId, variantId);
+  }
+
+  @Post('cart/merge')
+  @UseGuards(AuthGuard('jwt'))
+  async mergeCart(
+    @Body() dto: { items: Array<{ variantId: string; quantity: number; productName?: string; imageUrl?: string; price?: number; brand?: string }> },
+    @Request() req: any
+  ) {
+    if (!dto.items || !Array.isArray(dto.items)) {
+      throw new BadRequestException("Items array is required for merging.");
+    }
+    return this.apiService.mergeCart(req.user.userId, dto.items);
+  }
+
+  @Delete('cart')
+  @UseGuards(AuthGuard('jwt'))
+  async clearCart(@Request() req: any) {
+    return this.apiService.clearUserCartDb(req.user.userId);
   }
 
 
@@ -608,8 +685,12 @@ export class ApiController {
 
   @Post('admin/inventory/reconcile')
   @UseGuards(AuthGuard('jwt'))
-  async triggerReconciliation(@Request() req: any) {
+  async triggerReconciliation(@Body() body: any, @Request() req: any) {
     this.checkAdmin(req);
+    const { variantId, actualCount, reason } = body;
+    if (variantId !== undefined && actualCount !== undefined) {
+      return this.apiService.reconcileVariantInventory(variantId, Number(actualCount), reason, req.user.email, req.ip);
+    }
     return this.apiService.runInventoryReconciliation(req.user.email);
   }
 

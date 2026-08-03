@@ -1,6 +1,8 @@
-import { Controller, Get, Param, Query, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Param, Query, NotFoundException, Headers, Req, Res } from '@nestjs/common';
 import { ProductsService } from './products.service.js';
 import { PublicProductResponseDto } from './dto/public-product-response.dto.js';
+import { Response as ExpressResponse, Request as ExpressRequest } from 'express';
+import crypto from 'crypto';
 
 @Controller('api/v1/public/products')
 export class PublicProductsController {
@@ -8,6 +10,9 @@ export class PublicProductsController {
 
   @Get()
   async getProducts(
+    @Req() req: ExpressRequest,
+    @Res({ passthrough: true }) res: ExpressResponse,
+    @Headers('user-agent') userAgent?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
@@ -28,16 +33,31 @@ export class PublicProductsController {
       search,
       inStock: inStock === 'true',
       preBooking: preBooking === 'true',
-      adminMode: false
+      adminMode: false,
+      userAgent
     });
 
-    return {
+    const payload = {
       products: result.products.map(p => PublicProductResponseDto.fromEntity(p)),
       total: result.total,
       page: result.page,
       limit: result.limit,
       totalPages: result.totalPages
     };
+
+    const jsonStr = JSON.stringify(payload);
+    const hash = crypto.createHash('sha256').update(jsonStr).digest('hex');
+    const etag = `W/"${hash}"`;
+
+    res.setHeader('Cache-Control', 'public, max-age=10');
+    res.setHeader('ETag', etag);
+
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304);
+      return;
+    }
+
+    return payload;
   }
 
   @Get(':id')

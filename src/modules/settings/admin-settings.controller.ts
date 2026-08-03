@@ -1,4 +1,4 @@
-import { Controller, Post, Body, Request, UseGuards, UnauthorizedException } from '@nestjs/common';
+import { Controller, Get, Post, Body, Request, UseGuards, UnauthorizedException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from '../api/api.service.js';
 
@@ -12,6 +12,12 @@ export class AdminSettingsController {
     if (role !== 'Owner' && role !== 'Admin') {
       throw new UnauthorizedException('Administrative privileges required.');
     }
+  }
+
+  @Get()
+  async getSettings(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getGlobalSettings();
   }
 
   @Post()

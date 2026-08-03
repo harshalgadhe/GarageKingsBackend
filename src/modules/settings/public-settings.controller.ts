@@ -7,7 +7,14 @@ export class PublicSettingsController {
 
   @Get()
   async getSettings() {
-    return this.apiService.getGlobalSettings();
+    const raw = await this.apiService.getGlobalSettings();
+    return {
+      showPrices: raw.showPrices,
+      instagramUrl: raw.instagramUrl,
+      companyUpiId: raw.companyUpiId,
+      upiQrImage: raw.upiQrImage,
+      partnerNames: raw.partnerNames
+    };
   }
 }
 export default PublicSettingsController;

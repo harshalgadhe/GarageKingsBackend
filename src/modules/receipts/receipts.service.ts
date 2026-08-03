@@ -119,49 +119,43 @@ export class ReceiptsService implements OnModuleInit {
 
       // 4. Process line items: check stock, insert order_items, decrement inventory
       for (const item of dto.items) {
-        if (!item.productId) {
-          throw new Error(`Product ID is required for item: ${item.description}`);
+        if (item.productId) {
+          // Insert e-commerce order item
+          await queryRunner.query(`
+            INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
+            VALUES ($1, $2, $3, $4);
+          `, [orderId, item.productId, parseInt(item.qty.toString(), 10), Number(item.amount)]);
+
+          // Row-level lock and verify product stock
+          const prodRows = await queryRunner.query(`
+            SELECT id, model_name as name, total_stock, sold_stock, locked_stock
+            FROM products 
+            WHERE id = $1 AND deleted_at IS NULL 
+            FOR UPDATE;
+          `, [item.productId]);
+
+          if (prodRows.length > 0) {
+            const p = prodRows[0];
+            const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+            if (available >= Number(item.qty)) {
+              // Increment sold_stock in products table
+              await queryRunner.query(`
+                UPDATE products 
+                SET sold_stock = sold_stock + $1,
+                    updated_at = NOW() 
+                WHERE id = $2;
+              `, [Number(item.qty), item.productId]);
+
+              // Update quantity_available in inventory table to match sold deduction
+              await queryRunner.query(`
+                UPDATE inventory 
+                SET quantity_available = GREATEST(0, quantity_available - $1),
+                    updated_at = NOW()
+                WHERE product_id = $2;
+              `, [Number(item.qty), item.productId]);
+            }
+          }
         }
-
-        // Insert e-commerce order item
-        await queryRunner.query(`
-          INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-          VALUES ($1, $2, $3, $4);
-        `, [orderId, item.productId, parseInt(item.qty.toString(), 10), Number(item.amount)]);
-
-        // Row-level lock and verify product stock
-        const prodRows = await queryRunner.query(`
-          SELECT id, model_name as name, total_stock, sold_stock, locked_stock
-          FROM products 
-          WHERE id = $1 AND deleted_at IS NULL 
-          FOR UPDATE;
-        `, [item.productId]);
-
-        if (prodRows.length === 0) {
-          throw new Error(`Casting with product ID "${item.productId}" does not exist or has been de-listed.`);
-        }
-
-        const p = prodRows[0];
-        const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
-        if (available < Number(item.qty)) {
-          throw new Error(`Casting "${p.name}" is sold out. Available: ${available}, requested: ${item.qty}.`);
-        }
-
-        // Increment sold_stock in products table
-        await queryRunner.query(`
-          UPDATE products 
-          SET sold_stock = sold_stock + $1,
-              updated_at = NOW() 
-          WHERE id = $2;
-        `, [Number(item.qty), item.productId]);
-
-        // Update quantity_available in inventory table to match sold deduction
-        await queryRunner.query(`
-          UPDATE inventory 
-          SET quantity_available = quantity_available - $1,
-              updated_at = NOW()
-          WHERE product_id = $2;
-        `, [Number(item.qty), item.productId]);
       }
 
       // 5. Insert receipt row metadata linked to order_id
@@ -245,26 +239,44 @@ export class ReceiptsService implements OnModuleInit {
     }
   }
 
-  async getReceipts() {
+  async getReceiptById(id: string) {
     try {
-      const receipts = await this.dataSource.query(`
+      const rows = await this.dataSource.query(`
         SELECT r.*, 
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone, 
                COALESCE(r.customer_address, c.address) as customer_address,
                COALESCE(r.customer_instagram, c.instagram) as customer_instagram
         FROM receipts r
-        JOIN customers c ON r.customer_id = c.id
+        LEFT JOIN customers c ON r.customer_id = c.id
+        WHERE r.id = $1
+        LIMIT 1;
+      `, [id]);
+
+      if (rows.length === 0) return null;
+      const receipt = rows[0];
+
+      receipt.items = await this.dataSource.query(`
+        SELECT * FROM receipt_items WHERE receipt_id = $1 ORDER BY id ASC;
+      `, [id]);
+
+      return receipt;
+    } catch (error: any) {
+      console.error('getReceiptById failed:', error);
+      throw new InternalServerErrorException(error.message || 'Failed to retrieve receipt.');
+    }
+  }
+
+  async getReceipts() {
+    try {
+      const receipts = await this.dataSource.query(`
+        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.created_at,
+               COALESCE(r.customer_name, c.full_name) as customer_name, 
+               COALESCE(r.customer_phone, c.phone) as customer_phone
+        FROM receipts r
+        LEFT JOIN customers c ON r.customer_id = c.id
         ORDER BY r.created_at DESC;
       `);
-      
-      // Fetch line items for each receipt
-      for (const r of receipts) {
-        r.items = await this.dataSource.query(`
-          SELECT * FROM receipt_items WHERE receipt_id = $1;
-        `, [r.id]);
-      }
-      
       return receipts;
     } catch (error: any) {
       console.error('getReceipts failed:', error);
@@ -275,12 +287,12 @@ export class ReceiptsService implements OnModuleInit {
   async getPaginatedReceipts(options: { page?: number; limit?: number; search?: string }) {
     try {
       const page = Math.max(1, Number(options.page || 1));
-      const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
+      const limit = Math.max(1, Math.min(2000, Number(options.limit || 50)));
       const offset = (page - 1) * limit;
 
       let queryStr = `
         FROM receipts r
-        JOIN customers c ON r.customer_id = c.id
+        LEFT JOIN customers c ON r.customer_id = c.id
         WHERE 1=1
       `;
 
@@ -291,7 +303,8 @@ export class ReceiptsService implements OnModuleInit {
         queryStr += ` AND (
           LOWER(r.receipt_number) LIKE LOWER($${paramIndex}) OR
           LOWER(c.full_name) LIKE LOWER($${paramIndex}) OR
-          LOWER(c.phone) LIKE LOWER($${paramIndex})
+          LOWER(c.phone) LIKE LOWER($${paramIndex}) OR
+          LOWER(r.customer_name) LIKE LOWER($${paramIndex})
         )`;
         params.push(`%${options.search}%`);
         paramIndex++;
@@ -302,22 +315,14 @@ export class ReceiptsService implements OnModuleInit {
       const total = countRes[0]?.total || 0;
 
       const selectQuery = `
-        SELECT r.*, 
+        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
-               COALESCE(r.customer_phone, c.phone) as customer_phone, 
-               COALESCE(r.customer_address, c.address) as customer_address,
-               COALESCE(r.customer_instagram, c.instagram) as customer_instagram
+               COALESCE(r.customer_phone, c.phone) as customer_phone
         ${queryStr}
         ORDER BY r.created_at DESC
         LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
       `;
       const rows = await this.dataSource.query(selectQuery, [...params, limit, offset]);
-
-      for (const r of rows) {
-        r.items = await this.dataSource.query(`
-          SELECT * FROM receipt_items WHERE receipt_id = $1;
-        `, [r.id]);
-      }
 
       return {
         receipts: rows,

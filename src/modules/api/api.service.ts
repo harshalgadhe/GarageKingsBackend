@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, UnauthorizedException, BadRequestException } from '@nestjs/common';
+import { Injectable, OnModuleInit, UnauthorizedException, BadRequestException, HttpException, HttpStatus, ForbiddenException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -15,6 +15,7 @@ const privateUploadDir = isLambda
 
 @Injectable()
 export class ApiService implements OnModuleInit {
+  private lastCleanupAt = 0;
   constructor(private readonly dataSource: DataSource) {}
 
   async onModuleInit() {
@@ -37,7 +38,7 @@ export class ApiService implements OnModuleInit {
     `);
 
     // Alter order_status enum values if they don't exist
-    for (const val of ['Verification Pending', 'Confirmed', 'Reserved', 'Pre-Order', 'Awaiting Stock', 'Expired']) {
+    for (const val of ['Verification Pending', 'Confirmed', 'Reserved', 'Pre-Order', 'Awaiting Stock', 'Expired', 'Awaiting Screenshot', 'Awaiting Confirmation', 'Packed', 'Shipped', 'Delivered', 'Cancelled', 'Rejected']) {
       try {
         await this.dataSource.query(`ALTER TYPE order_status ADD VALUE IF NOT EXISTS '${val}'`);
       } catch (err: any) {
@@ -70,6 +71,7 @@ export class ApiService implements OnModuleInit {
       ALTER TABLE products ADD COLUMN IF NOT EXISTS updated_by VARCHAR(255);
       ALTER TABLE products ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
       ALTER TABLE products ADD COLUMN IF NOT EXISTS max_qty_per_customer INT DEFAULT NULL;
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
 
       -- 3. Orders alterations
       ALTER TABLE orders ADD COLUMN IF NOT EXISTS screenshot_url TEXT;
@@ -354,6 +356,85 @@ export class ApiService implements OnModuleInit {
       runNightlyReconcile();
       setInterval(runNightlyReconcile, 24 * 60 * 60 * 1000);
     }, msUntilTarget);
+
+    // DDL migrations for cart, versioning, idempotency, payment receipts and audit event trails
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS carts (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS cart_items (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          cart_id UUID NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
+          variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+          quantity INT NOT NULL CHECK (quantity > 0),
+          product_name_snapshot VARCHAR(255),
+          image_snapshot VARCHAR(512),
+          price_snapshot NUMERIC(12,2),
+          brand_snapshot VARCHAR(100),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          deleted_at TIMESTAMP WITH TIME ZONE,
+          UNIQUE(cart_id, variant_id)
+      );
+
+      ALTER TABLE product_variants ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
+
+      CREATE TABLE IF NOT EXISTS idempotency_keys (
+          key VARCHAR(255) PRIMARY KEY,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          endpoint VARCHAR(255) NOT NULL,
+          resource_type VARCHAR(100) NOT NULL,
+          resource_id UUID NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS order_payment_receipts (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          screenshot_url VARCHAR(255) NOT NULL,
+          file_hash VARCHAR(64) UNIQUE NOT NULL,
+          status VARCHAR(50) DEFAULT 'Pending',
+          uploaded_by UUID NOT NULL REFERENCES users(id),
+          uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS order_events (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          event_type VARCHAR(100) NOT NULL,
+          previous_status VARCHAR(50),
+          new_status VARCHAR(50),
+          details TEXT,
+          performed_by VARCHAR(255),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS payment_events (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+          event_type VARCHAR(100) NOT NULL,
+          receipt_id UUID REFERENCES order_payment_receipts(id) ON DELETE SET NULL,
+          details TEXT,
+          performed_by VARCHAR(255),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS reconciliations (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+          system_count INT NOT NULL,
+          actual_count INT NOT NULL,
+          variance INT NOT NULL,
+          notes TEXT,
+          created_by VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
   }
 
   // ── AUDIT LOGGING SYSTEM (IMMUTABLE LOGS) ──────────────────────────
@@ -598,78 +679,82 @@ export class ApiService implements OnModuleInit {
     inStock?: boolean;
     preBooking?: boolean;
     adminMode?: boolean;
+    userAgent?: string;
   }) {
+    const rowsSettings = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
+    const settings = rowsSettings.length > 0 ? rowsSettings[0].value : {};
+    const isMobile = options.userAgent ? /mobi|android|iphone|ipad|phone/i.test(options.userAgent) : false;
+    const defaultPageSize = isMobile 
+      ? (settings.marketplaceMobileInitialPageSize || 5) 
+      : (settings.marketplaceDesktopInitialPageSize || 12);
+
+    const maxLimit = options.adminMode ? 100 : 50;
+    const limit = Math.max(1, Math.min(maxLimit, Number(options.limit || defaultPageSize)));
     const page = Math.max(1, Number(options.page || 1));
-    const limit = Math.max(1, Math.min(100, Number(options.limit || 12)));
     const offset = options.offset !== undefined ? Number(options.offset) : (page - 1) * limit;
 
-    const adminFields = options.adminMode ? `
-      p.purchase_price as "purchasePrice",
-      p.total_stock as "totalStock",
-      p.locked_stock as "lockedStock",
-      p.sold_stock as "soldStock",
-      p.supplier,
-      p.created_by as "createdBy",
-      p.updated_by as "updatedBy",
-    ` : '';
+    const selectFields = options.adminMode
+      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
+         COALESCE(selling_price, base_price, 0.00) as price,
+         COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
+         COALESCE(stock, total_stock, 0)::int as "availableStock",
+         is_prebook as "isPrebook",
+         COALESCE(customer_eta, arrival_date) as "customerEta",
+         COALESCE(image, (SELECT thumbnail_url FROM product_images WHERE product_id = products.id LIMIT 1)) as image,
+         created_at`
+      : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
+         COALESCE(selling_price, base_price, 0.00) as price,
+         COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
+         (COALESCE(stock, total_stock, 0) <= 0) as "isSoldOut",
+         is_prebook as "isPrebook",
+         COALESCE(customer_eta, arrival_date) as "customerEta",
+         COALESCE(image, (SELECT thumbnail_url FROM product_images WHERE product_id = products.id LIMIT 1)) as image,
+         created_at`;
 
-    const descField = options.adminMode ? 'p.description, p.sku, p.casing_types as "casingTypes", p.base_price as price, p.rarity_level as lane,' : '';
     let queryStr = `
-      SELECT p.id, p.brand, p.model_name as name, p.series, p.scale,
-             p.rarity_level as grade,
-             p.tags, p.category, p.selling_price as "sellingPrice",
-             ${descField}
-             ${adminFields}
-             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
-             p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage",
-             p.max_qty_per_customer as "maxQtyPerCustomer",
-             p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
-             pi.thumbnail_url as image, p.created_at
-      FROM products p
-      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
-      WHERE p.deleted_at IS NULL
+      SELECT ${selectFields}
+      FROM products
+      WHERE deleted_at IS NULL
     `;
 
     if (!options.adminMode) {
-      queryStr += ` AND p.status = 'Published'`;
+      queryStr += ` AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
     }
-
 
     const params: any[] = [];
     let paramIndex = 1;
 
     if (options.brand) {
-      queryStr += ` AND LOWER(p.brand) = LOWER($${paramIndex})`;
+      queryStr += ` AND LOWER(brand) = LOWER($${paramIndex})`;
       params.push(options.brand);
       paramIndex++;
     }
 
     if (options.scale) {
-      queryStr += ` AND p.scale = $${paramIndex}`;
+      queryStr += ` AND scale = $${paramIndex}`;
       params.push(options.scale);
       paramIndex++;
     }
 
     if (options.tag) {
-      queryStr += ` AND $${paramIndex} = ANY(p.tags)`;
+      queryStr += ` AND $${paramIndex} = ANY(subtags)`;
       params.push(options.tag);
       paramIndex++;
     }
 
     if (options.inStock) {
-      queryStr += ` AND (p.total_stock - p.locked_stock - p.sold_stock) > 0`;
+      queryStr += ` AND COALESCE(stock, total_stock, 0) > 0`;
     }
 
     if (options.preBooking) {
-      queryStr += ` AND (p.is_prebook = true OR 'Pre-Order' = ANY(p.tags) OR 'Pre Booking' = ANY(p.tags) OR (p.release_date IS NOT NULL AND p.release_date > CURRENT_DATE))`;
+      queryStr += ` AND (is_prebook = true OR status = 'Pre-Order')`;
     }
 
     if (options.search) {
       queryStr += ` AND (
-        LOWER(p.model_name) LIKE LOWER($${paramIndex}) OR
-        LOWER(p.brand) LIKE LOWER($${paramIndex}) OR
-        LOWER(p.series) LIKE LOWER($${paramIndex})
+        LOWER(model_name) LIKE LOWER($${paramIndex}) OR
+        LOWER(brand) LIKE LOWER($${paramIndex}) OR
+        LOWER(series) LIKE LOWER($${paramIndex})
       )`;
       params.push(`%${options.search}%`);
       paramIndex++;
@@ -681,7 +766,7 @@ export class ApiService implements OnModuleInit {
     const total = parseInt(countRows[0]?.total || '0', 10);
 
     // Add ordering and pagination
-    queryStr += ` ORDER BY p.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    queryStr += ` ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     params.push(limit, offset);
 
     const rows = await this.dataSource.query(queryStr, params);
@@ -762,8 +847,13 @@ export class ApiService implements OnModuleInit {
     const images = await this.dataSource.query(`
       SELECT id, product_id as "productId", thumbnail_url as "thumbnailUrl", full_url as "fullUrl", is_primary as "isPrimary"
       FROM product_images
-      WHERE product_id = $1;
+      WHERE product_id = $1
+      ORDER BY is_primary DESC, id ASC;
     `, [id]);
+    product.images = images.map(img => img.fullUrl || img.thumbnailUrl).filter(Boolean);
+    if (product.images.length > 0 && !product.image) {
+      product.image = product.images[0];
+    }
     product.images = images;
 
     localCache.set(cacheKey, product, 10); // Cache single item for 10 seconds
@@ -777,41 +867,63 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
+      const imageList = Array.isArray(car.images) && car.images.length > 0
+        ? car.images.filter(Boolean)
+        : (car.image ? [car.image] : []);
+
+      const primaryImg = car.image || imageList[0] || null;
+      const initialStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock || 10)));
+      const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount || 0));
+      const priceVal = Number(car.price || car.sellingPrice || 0);
+
       const prodRes = await queryRunner.query(`
-        INSERT INTO products (sku, brand, model_name, series, scale, rarity_level, base_price, description, tags, category, purchase_price, selling_price, total_stock, supplier, arrival_date, release_date, status, show_on_homepage, created_by, max_qty_per_customer, is_prebook, prebook_deposit_amount, casing_types)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, 0, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        INSERT INTO products (
+          sku, brand, model_name, series, scale, casing, base_price, selling_price, price,
+          po_amount, prebook_deposit_amount, stock, total_stock, available_stock, is_prebook, status,
+          customer_eta, arrival_date, release_date, tag, subtags, tags, description, image, images,
+          supplier, created_by, category
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
         RETURNING id;
       `, [
         sku,
-        car.brand || 'MINI GT',
+        car.brand || 'Mini GT',
         car.name || 'Unknown Casting',
         car.series || 'Collector Series',
         car.scale || '1:64',
-        car.manufacturer || car.lane || 'Standard Edition',
-        Number(car.price || 0),
+        car.casing || car.casingType || 'Box',
+        priceVal,
+        priceVal,
+        priceVal,
+        poDeposit,
+        poDeposit,
+        initialStock,
+        initialStock,
+        initialStock,
+        Boolean(car.isPrebook),
+        car.status || (car.isPrebook ? 'Pre-Order' : 'Published'),
+        car.customerEta || car.arrivalDate || car.releaseDate || null,
+        car.arrivalDate || car.customerEta || null,
+        car.releaseDate || car.customerEta || null,
+        car.tag || car.grade || car.lane || null,
+        car.subtags || car.tags || [],
+        car.tags || car.subtags || [],
         car.description || '',
-        car.tags || [],
-        car.category || 'JDM',
-        Number(car.price || 0),
+        primaryImg,
+        imageList,
         car.supplier || '',
-        car.arrivalDate || null,
-        car.releaseDate || null,
-        car.status || 'Published',
-        car.showOnHomepage !== false,
         creatorEmail,
-        car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : null,
-        car.isPrebook === true,
-        car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : null,
-        car.casingTypes || ['box']
+        car.category || 'JDM'
       ]);
-
       const productId = prodRes[0].id;
 
-      if (car.image) {
+      for (let idx = 0; idx < imageList.length; idx++) {
+        const imgUrl = imageList[idx];
+        const isPrimary = idx === 0;
         await queryRunner.query(`
           INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
-          VALUES ($1, $2, $3, $4, true);
-        `, [productId, car.image, car.image, car.image]);
+          VALUES ($1, $2, $3, $4, $5);
+        `, [productId, imgUrl, imgUrl, imgUrl, isPrimary]);
       }
 
       await queryRunner.query(`
@@ -875,15 +987,18 @@ export class ApiService implements OnModuleInit {
         ]);
       }
 
-      const initialStock = Number(car.totalStock || 0);
-      if (initialStock > 0) {
+      const targetVariantRes = await queryRunner.query("SELECT id FROM product_variants WHERE product_id = $1 ORDER BY created_at ASC LIMIT 1;", [productId]);
+      const targetVariantId = targetVariantRes[0]?.id;
+
+      const batchStock = Number(car.totalStock || car.availableStock || 0);
+      if (batchStock > 0 && targetVariantId) {
         await this.receiveInventoryBatchTx(
           queryRunner,
-          productId,
+          targetVariantId,
           car.supplier || 'Default Supplier',
           Number(car.purchasePrice || 0),
           Number(car.price || 0),
-          initialStock,
+          batchStock,
           creatorEmail,
           ipAddress
         );
@@ -918,267 +1033,69 @@ export class ApiService implements OnModuleInit {
     const oldRes = await this.dataSource.query("SELECT * FROM products WHERE id = $1", [id]);
     const oldData = oldRes[0];
 
+    if (oldData && car.version !== undefined && car.version !== null && Number(oldData.version) !== Number(car.version)) {
+      throw new BadRequestException("This product has been modified by another administrator. Please refresh and try again.");
+    }
+
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      const batchCountRes = await queryRunner.query(`
-        SELECT COUNT(*)::int as count 
-        FROM inventory_batches ib
-        JOIN product_variants pv ON ib.variant_id = pv.id
-        WHERE pv.product_id = $1;
-      `, [id]);
-      const hasBatches = batchCountRes[0].count > 0;
+      const imageList = Array.isArray(car.images) && car.images.length > 0
+        ? car.images.filter(Boolean)
+        : (car.image ? [car.image] : (oldData.images || []));
 
-      if (hasBatches) {
-        // Update product attributes including prices and metadata
-        await queryRunner.query(`
-          UPDATE products 
-          SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
-              category = $9, purchase_price = $10, selling_price = $11, status = $12, show_on_homepage = $13, updated_by = $14, 
-              max_qty_per_customer = $15, is_prebook = $16, prebook_deposit_amount = $17, availability_state = $18, casing_types = $19, updated_at = NOW()
-          WHERE id = $20;
-        `, [
-          car.brand || oldData.brand,
-          car.name || oldData.model_name,
-          car.series !== undefined ? car.series : oldData.series,
-          car.scale || oldData.scale,
-          car.manufacturer || car.lane || oldData.rarity_level,
-          Number(car.price || oldData.base_price),
-          car.description !== undefined ? car.description : oldData.description,
-          car.tags || oldData.tags,
-          car.category || oldData.category,
-          Number(car.purchasePrice || oldData.purchase_price),
-          Number(car.price || oldData.selling_price),
-          car.status || oldData.status,
-          car.showOnHomepage !== false,
-          updaterEmail,
-          car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : oldData.max_qty_per_customer,
-          car.isPrebook === true,
-          car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : oldData.prebook_deposit_amount,
-          car.availabilityState || oldData.availability_state || 'Available',
-          car.casingTypes || oldData.casing_types || ['box'],
-          id
-        ]);
-        
-        // Handle stock level changes dynamically via ledger/batches
-        const newStock = car.totalStock !== undefined ? Number(car.totalStock) : Number(oldData.total_stock);
-        const diff = newStock - Number(oldData.total_stock);
-        if (diff !== 0) {
-          const latestBatchRes = await queryRunner.query(`
-            SELECT ib.* 
-            FROM inventory_batches ib
-            JOIN product_variants pv ON ib.variant_id = pv.id
-            WHERE pv.product_id = $1 
-            ORDER BY ib.received_at DESC, ib.id DESC 
-            LIMIT 1;
-          `, [id]);
-          
-          if (latestBatchRes.length > 0) {
-            const batch = latestBatchRes[0];
-            const batchId = batch.id;
-            const type = diff > 0 ? 'ADJUST_ADD' : 'ADJUST_REMOVE';
-            const absDiff = Math.abs(diff);
-            
-            let newAvail = Number(batch.quantity_available);
-            if (type === 'ADJUST_ADD') {
-              newAvail += absDiff;
-            } else {
-              newAvail = Math.max(0, newAvail - absDiff);
-            }
-            
-            await queryRunner.query(`
-              UPDATE inventory_batches
-              SET quantity_available = $1,
-                  status = CASE WHEN $1 = 0 AND quantity_reserved = 0 THEN 'Fully Consumed'::VARCHAR ELSE status END,
-                  updated_at = NOW()
-              WHERE id = $2;
-            `, [newAvail, batchId]);
-            
-            await queryRunner.query(`
-              INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, reason, performed_by)
-              VALUES ($1, $2, $3, $4, $5, $6, $7);
-            `, [batch.variant_id, batchId, type, diff, Number(batch.purchase_price), `Product edit stock adjustment from ${oldData.total_stock} to ${newStock}`, updaterEmail]);
-            
-            await queryRunner.query(`
-              UPDATE products
-              SET total_stock = total_stock + $1,
-                  updated_at = NOW()
-              WHERE id = $2;
-            `, [diff, id]);
+      const primaryImg = car.image || imageList[0] || oldData.image || null;
+      const finalStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock !== undefined ? car.totalStock : (oldData.stock || 10))));
+      const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount !== undefined ? car.prebookDepositAmount : (oldData.po_amount || 0)));
+      const priceVal = Number(car.price !== undefined ? car.price : (car.sellingPrice !== undefined ? car.sellingPrice : (oldData.price || 0)));
 
-            await queryRunner.query(`
-              UPDATE inventory
-              SET quantity_available = quantity_available + $1,
-                  updated_at = NOW()
-              WHERE product_id = $2;
-            `, [diff, id]);
-          }
-        }
-      } else {
-        // No batches exist yet: allow updating everything, and create default batch if totalStock changes
-        await queryRunner.query(`
-          UPDATE products 
-          SET brand = $1, model_name = $2, series = $3, scale = $4, rarity_level = $5, base_price = $6, description = $7, tags = $8,
-              category = $9, purchase_price = $10, selling_price = $11, total_stock = $12, supplier = $13,
-              arrival_date = $14, release_date = $15, status = $16, show_on_homepage = $17, updated_by = $18, 
-              max_qty_per_customer = $19, is_prebook = $20, prebook_deposit_amount = $21, availability_state = $22, casing_types = $23, updated_at = NOW()
-          WHERE id = $24;
-        `, [
-          car.brand || oldData.brand,
-          car.name || oldData.model_name,
-          car.series !== undefined ? car.series : oldData.series,
-          car.scale || oldData.scale,
-          car.manufacturer || car.lane || oldData.rarity_level,
-          Number(car.price || oldData.base_price),
-          car.description !== undefined ? car.description : oldData.description,
-          car.tags || oldData.tags,
-          car.category || oldData.category,
-          Number(car.purchasePrice || oldData.purchase_price),
-          Number(car.price || oldData.selling_price),
-          Number(car.totalStock || oldData.total_stock),
-          car.supplier || oldData.supplier,
-          car.arrivalDate || oldData.arrival_date,
-          car.releaseDate || oldData.release_date,
-          car.status || oldData.status,
-          car.showOnHomepage !== false,
-          updaterEmail,
-          car.maxQtyPerCustomer !== undefined && car.maxQtyPerCustomer !== null && car.maxQtyPerCustomer !== '' ? Number(car.maxQtyPerCustomer) : oldData.max_qty_per_customer,
-          car.isPrebook === true,
-          car.prebookDepositAmount !== undefined && car.prebookDepositAmount !== null && car.prebookDepositAmount !== '' ? Number(car.prebookDepositAmount) : oldData.prebook_deposit_amount,
-          car.availabilityState || oldData.availability_state || 'Available',
-          car.casingTypes || oldData.casing_types || ['box'],
-          id
-        ]);
-
-        const initialStock = Number(car.totalStock || 0);
-        if (initialStock > 0) {
-          await this.receiveInventoryBatchTx(
-            queryRunner,
-            id,
-            car.supplier || 'Default Supplier',
-            Number(car.purchasePrice || 0),
-            Number(car.price || 0),
-            initialStock,
-            updaterEmail,
-            ipAddress
-          );
-        }
-      }
-
-      // Resolve casing type mapping and upsert variants
-      const casingTypesRes = await queryRunner.query("SELECT id, name FROM casing_types;");
-      const casingMap = {};
-      for (const ct of casingTypesRes) {
-        casingMap[ct.name.toUpperCase()] = ct.id;
-      }
-
-      if (car.variants && car.variants.length > 0) {
-        // Fetch current variants for this product
-        const existingVariants = await queryRunner.query("SELECT id, sku FROM product_variants WHERE product_id = $1 AND deleted_at IS NULL;", [id]);
-        const existingMap = {};
-        for (const ev of existingVariants) {
-          existingMap[ev.id] = ev;
-        }
-
-        const incomingIds = [];
-        for (const v of car.variants) {
-          const casingTypeId = casingMap[v.casing.toUpperCase()] || casingTypesRes[0]?.id;
-          if (!casingTypeId) {
-            throw new Error(`Casing type "${v.casing}" not registered in database.`);
-          }
-
-          if (v.id && existingMap[v.id]) {
-            // Update existing variant
-            incomingIds.push(v.id);
-            await queryRunner.query(`
-              UPDATE product_variants
-              SET casing_type_id = $1, sku = $2, barcode = $3, name = $4, selling_price = $5, customer_eta = $6,
-                  visibility = $7, status = $8, sales_status = $9, dimensions = $10, weight = $11, variant_attributes = $12, 
-                  updated_by = $13, updated_at = NOW()
-              WHERE id = $14;
-            `, [
-              casingTypeId,
-              v.sku.trim(),
-              v.barcode || null,
-              v.name || `${car.name || oldData.model_name} (${v.casing})`,
-              Number(v.price || 0),
-              v.customerEta || null,
-              v.isVisible !== false ? 'Visible' : 'Hidden',
-              v.status || 'Active',
-              v.salesStatus || 'Available',
-              v.dimensions || null,
-              v.weight ? Number(v.weight) : null,
-              v.variantAttributes ? JSON.stringify(v.variantAttributes) : '{}',
-              updaterEmail,
-              v.id
-            ]);
-          } else {
-            // Insert new variant
-            const newVarRes = await queryRunner.query(`
-              INSERT INTO product_variants (
-                product_id, casing_type_id, sku, barcode, name, selling_price, customer_eta, 
-                visibility, status, sales_status, dimensions, weight, variant_attributes, created_by
-              )
-              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-              RETURNING id;
-            `, [
-              id,
-              casingTypeId,
-              v.sku.trim(),
-              v.barcode || null,
-              v.name || `${car.name || oldData.model_name} (${v.casing})`,
-              Number(v.price || 0),
-              v.customerEta || null,
-              v.isVisible !== false ? 'Visible' : 'Hidden',
-              v.status || 'Active',
-              v.salesStatus || 'Available',
-              v.dimensions || null,
-              v.weight ? Number(v.weight) : null,
-              v.variantAttributes ? JSON.stringify(v.variantAttributes) : '{}',
-              updaterEmail
-            ]);
-            incomingIds.push(newVarRes[0].id);
-          }
-        }
-
-        // Soft delete any old variants that were not in the incoming payload
-        for (const ev of existingVariants) {
-          if (!incomingIds.includes(ev.id)) {
-            await queryRunner.query("UPDATE product_variants SET deleted_at = NOW(), status = 'Archived' WHERE id = $1;", [ev.id]);
-          }
-        }
-      }
-
-      const invRows = await queryRunner.query("SELECT quantity_available, quantity_reserved FROM inventory WHERE product_id = $1;", [id]);
-      const currentAvailable = invRows[0]?.quantity_available || 0;
-
-      // Trigger low stock notifications
-      if (currentAvailable <= 3) {
-        await this.createSystemNotification(
-          'Low Stock Alert',
-          `Casting "${car.name || oldData.model_name}" has critical stock count: ${currentAvailable}`,
-          'low_stock'
-        );
-      }
-
+      await queryRunner.query(`
+        UPDATE products 
+        SET sku = $1, brand = $2, model_name = $3, series = $4, scale = $5, casing = $6,
+            base_price = $7, selling_price = $8, price = $9, po_amount = $10, prebook_deposit_amount = $11,
+            stock = $12, total_stock = $13, is_prebook = $14, status = $15, customer_eta = $16,
+            arrival_date = $17, release_date = $18, tag = $19, subtags = $20, tags = $21,
+            description = $22, image = $23, images = $24, supplier = $25, updated_by = $26, updated_at = NOW()
+        WHERE id = $27;
+      `, [
+        car.sku || oldData.sku,
+        car.brand || oldData.brand,
+        car.name || oldData.model_name,
+        car.series !== undefined ? car.series : oldData.series,
+        car.scale || oldData.scale,
+        car.casing || car.casingType || oldData.casing || 'Box',
+        priceVal,
+        priceVal,
+        priceVal,
+        poDeposit,
+        poDeposit,
+        finalStock,
+        finalStock,
+        car.isPrebook !== undefined ? Boolean(car.isPrebook) : oldData.is_prebook,
+        car.status || oldData.status,
+        car.customerEta !== undefined ? car.customerEta : (car.arrivalDate !== undefined ? car.arrivalDate : oldData.customer_eta),
+        car.arrivalDate !== undefined ? car.arrivalDate : oldData.arrival_date,
+        car.releaseDate !== undefined ? car.releaseDate : oldData.release_date,
+        car.tag || car.grade || car.lane || oldData.tag,
+        car.subtags || car.tags || oldData.subtags || [],
+        car.tags || car.subtags || oldData.tags || [],
+        car.description !== undefined ? car.description : oldData.description,
+        primaryImg,
+        imageList,
+        car.supplier || oldData.supplier,
+        updaterEmail,
+        id
+      ]);
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
       localCache.del('products_list_false');
+      localCache.del(`product_${id}_true`);
+      localCache.del(`product_${id}_false`);
 
-      // Log audit trace
-      await this.writeAuditLog(
-        'UPDATE_PRODUCT',
-        'products',
-        id,
-        updaterEmail,
-        ipAddress,
-        oldData,
-        car
-      );
-
-      return { success: true };
+      await this.writeAuditLog('UPDATE_PRODUCT', 'products', id, updaterEmail, ipAddress, oldData, car);
+      return this.getProduct(id, true);
     } catch (err) {
       await queryRunner.rollbackTransaction();
       throw err;
@@ -1196,7 +1113,7 @@ export class ApiService implements OnModuleInit {
     return { success: true };
   }
 
-  async calculateCheckoutPricing(dto: any) {
+async calculateCheckoutPricing(dto: any) {
     const items = dto.items || [];
     const bookingType = dto.bookingType || 'standard';
     const isPreOrder = bookingType === 'pre_order';
@@ -1214,6 +1131,7 @@ export class ApiService implements OnModuleInit {
                pv.selling_price as "sellingPrice", 
                pv.sku, 
                pv.name as "variantName", 
+               pv.version as "version",
                p.id as "productId",
                p.model_name as "productName",
                p.brand, 
@@ -1245,6 +1163,7 @@ export class ApiService implements OnModuleInit {
           price: itemPrice,
           prebookDepositAmount: row.prebookDepositAmount,
           isPrebook: row.isPrebook === true || row.isPrebook === 1,
+          version: Number(row.version || 1),
           qty
         });
       }
@@ -1302,6 +1221,7 @@ export class ApiService implements OnModuleInit {
       advanceAmount: grandAdvance,
       remainingAmount: grandRemaining,
       items: resolvedItems,
+      inventoryVersions: resolvedItems.map(item => ({ id: item.variantId, version: item.version })),
       groups
     };
   }
@@ -1314,29 +1234,80 @@ export class ApiService implements OnModuleInit {
     return { success: true };
   }
 
+  // ── IDEMPOTENCY LOCK SERVICE METHODS ────────────────────────────────
+  async checkIdempotency(key: string, userId: string): Promise<any | null> {
+    if (!key) return null;
+    const rows = await this.dataSource.query(
+      "SELECT resource_type, resource_id FROM idempotency_keys WHERE key = $1 AND user_id = $2 LIMIT 1;",
+      [key, userId]
+    );
+    if (rows.length === 0) return null;
+
+    const { resource_type, resource_id } = rows[0];
+    if (resource_type === 'Order') {
+      const orderRows = await this.dataSource.query(
+        'SELECT id, booking_type as "bookingType", advance_amount as "advanceAmount", remaining_amount as "remainingAmount" FROM orders WHERE id = $1',
+        [resource_id]
+      );
+      if (orderRows.length > 0) {
+        return {
+          success: true,
+          orderId: orderRows[0].id,
+          bookingType: orderRows[0].bookingType,
+          advanceAmount: Number(orderRows[0].advanceAmount),
+          remainingAmount: Number(orderRows[0].remainingAmount),
+          idempotentCached: true
+        };
+      }
+    }
+    return null;
+  }
+
+  async saveIdempotency(key: string, userId: string, endpoint: string, resourceType: string, resourceId: string, queryRunner: any) {
+    if (!key) return;
+    await queryRunner.query(`
+      INSERT INTO idempotency_keys (key, user_id, endpoint, resource_type, resource_id, expires_at)
+      VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '24 hours')
+      ON CONFLICT (key) DO NOTHING;
+    `, [key, userId, endpoint, resourceType, resourceId]);
+  }
+
   // ── ATOMIC TRANSACTIONAL STOCK LOCKING (RESERVATIONS - DIRECT ORDER TRANSITION) ──
-  async reserveProduct(dto: any, ipAddress: string, authenticatedUserId?: string) {
-    const { productId, email, name, instagram, phone, address, idempotencyKey, bookingType, advanceAmount } = dto;
+  async reserveProduct(dto: any, ipAddress: string, authenticatedUserId: string) {
+    this.triggerLazyCleanup();
+
+    const { productId, name, instagram, phone, address, idempotencyKey, bookingType, advanceAmount } = dto;
     const requestedQty = Math.max(1, Math.min(10, parseInt(dto.qty || dto.quantity || '1', 10)));
     const isPreOrder = bookingType === 'pre_order';
 
-    if (!idempotencyKey) {
-      throw new Error("Idempotency key is required to create order safely.");
+    if (!authenticatedUserId) {
+      throw new UnauthorizedException("Authentication is required to perform checkout.");
     }
 
-    // 1. Enforce Idempotency Lock Check
-    const cachedRes = localCache.get(`idem_${idempotencyKey}`);
-    if (cachedRes) return cachedRes;
+    // A. Resolve User details safely (No JWT Spoofing)
+    const userRows = await this.dataSource.query("SELECT email FROM users WHERE id = $1", [authenticatedUserId]);
+    if (userRows.length === 0) {
+      throw new UnauthorizedException("Authenticated session user not found.");
+    }
+    const email = userRows[0].email;
 
-    const dbIdem = await this.dataSource.query("SELECT id FROM orders WHERE idempotency_key = $1", [idempotencyKey]);
-    if (dbIdem.length > 0) {
-      return {
-        success: true,
-        orderId: dbIdem[0].id
-      };
+    // B. Stateless DB Rate Limiting: max 3 requests per 10 seconds per user
+    const rateCheck = await this.dataSource.query(`
+      SELECT COUNT(*) as count FROM orders 
+      WHERE user_id = $1 AND created_at > NOW() - INTERVAL '10 seconds';
+    `, [authenticatedUserId]);
+    if (Number(rateCheck[0].count) >= 3) {
+      throw new HttpException({
+        statusCode: 429,
+        message: "Too many checkout attempts. Please wait a few seconds and try again."
+      }, HttpStatus.TOO_MANY_REQUESTS);
     }
 
-    // 2. Perform Backend Price & Shipping calculations
+    // C. Check Idempotency Key
+    const cacheRes = await this.checkIdempotency(idempotencyKey, authenticatedUserId);
+    if (cacheRes) return cacheRes;
+
+    // D. Perform Backend Price & Shipping calculations
     const pricing = await this.calculateCheckoutPricing({
       items: [{ productId, qty: requestedQty }],
       bookingType,
@@ -1355,52 +1326,70 @@ export class ApiService implements OnModuleInit {
     const shippingCost = pricing.shippingFee;
     const variantId = resolvedItem.variantId;
 
+    // Process Version locks
+    const clientVersions = dto.inventoryVersions || [];
+    const clientVersionMap = new Map(clientVersions.map((cv: any) => [cv.id, Number(cv.version)]));
+
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      // 3. Row-level lock target product to prevent race condition double-buys
-      const prodRows = await queryRunner.query(`
-        SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
-        FROM products 
+      // E. Row-level lock variant and batches (FOR UPDATE)
+      const varRows = await queryRunner.query(`
+        SELECT id, product_id, total_stock, locked_stock, sold_stock, version 
+        FROM product_variants 
         WHERE id = $1 AND deleted_at IS NULL 
         FOR UPDATE;
-      `, [productId]);
+      `, [variantId]);
 
-      if (prodRows.length === 0) {
-        throw new BadRequestException("Target die-cast grail does not exist or has been archived.");
+      if (varRows.length === 0) {
+        throw new BadRequestException("Target casting variant does not exist or has been archived.");
       }
 
-      const p = prodRows[0];
-      const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+      const pv = varRows[0];
+      const available = Number(pv.total_stock) - Number(pv.locked_stock || 0) - Number(pv.sold_stock);
 
       if (available <= 0) {
-        throw new BadRequestException(`Casting "${p.name}" is sold out.`);
+        throw new BadRequestException(`Casting "${resolvedItem.name}" is sold out.`);
       }
 
       if (requestedQty > available) {
-        throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${requestedQty}.`);
+        throw new BadRequestException(`Only ${available} unit(s) of "${resolvedItem.name}" are available. You requested ${requestedQty}.`);
       }
 
+      // F. Version comparison check
+      const clientVersion = clientVersionMap.get(variantId);
+      if (clientVersion !== undefined && Number(pv.version) !== Number(clientVersion)) {
+        throw new BadRequestException("Inventory changed while you were checking out. Please review your order.");
+      }
+
+      // Lock matching batches row-level
+      await queryRunner.query(`
+        SELECT id FROM inventory_batches 
+        WHERE variant_id = $1 
+        FOR UPDATE;
+      `, [variantId]);
+
       // Check customer purchase limit
-      if (p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
+      const prodRows = await queryRunner.query("SELECT max_qty_per_customer FROM products WHERE id = $1 FOR UPDATE;", [productId]);
+      const p = prodRows[0];
+      if (p && p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
         const existingCountRes = await queryRunner.query(`
           SELECT COALESCE(SUM(oi.qty), 0) as total
           FROM order_items oi
           JOIN orders o ON o.id = oi.order_id
-          JOIN users u ON u.id = o.user_id
           WHERE oi.product_id = $1 
-            AND u.email = $2 
+            AND o.user_id = $2 
             AND o.status NOT IN ('Cancelled', 'Expired');
-        `, [productId, email.trim().toLowerCase()]);
+        `, [productId, authenticatedUserId]);
         const existingCount = Number(existingCountRes[0].total);
         if (existingCount + requestedQty > p.max_qty_per_customer) {
-          throw new BadRequestException(`Purchase limit exceeded. You have already ordered/reserved ${existingCount} item(s) of this product. Maximum allowed per customer: ${p.max_qty_per_customer}.`);
+          throw new BadRequestException(`Purchase limit exceeded. You have already ordered/reserved ${existingCount} items. Max limit: ${p.max_qty_per_customer}.`);
         }
       }
 
-      // 4. Get/create customer record
+      // G. Get/create customer record
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
@@ -1410,43 +1399,56 @@ export class ApiService implements OnModuleInit {
       `, [name, phone, instagram, address, email.trim().toLowerCase()]);
       const customerId = custRes[0].id;
 
-      // 5. Resolve user ID
-      let userId: string;
-      if (authenticatedUserId) {
-        userId = authenticatedUserId;
-      } else {
-        const userRes = await queryRunner.query(`
-          INSERT INTO users (email, cognito_sub)
-          VALUES ($1, $2)
-          ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-          RETURNING id;
-        `, [email.trim().toLowerCase(), `guest_${customerId}`]);
-        userId = userRes[0].id;
-      }
-
-      // 6. Create parent Pending order record with shipping_cost
-      const hasPrebookItem = pricing.items.some(item => item.isPrebook);
-      const actualBookingType = (bookingType === 'pre_order' || hasPrebookItem) ? 'pre_order' : 'standard';
-      const actualIsPreOrder = actualBookingType === 'pre_order';
-      const orderStatus = actualIsPreOrder ? 'Pre-Order' : 'Pending';
+      // H. Create parent Pending order record
+      const actualBookingType = (bookingType === 'pre_order' || resolvedItem.isPrebook) ? 'pre_order' : 'standard';
+      const orderStatus = (actualBookingType === 'pre_order') ? 'Pre-Order' : 'Pending';
 
       const orderRes = await queryRunner.query(`
         INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
         RETURNING id;
-      `, [userId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, actualBookingType, advPaid, remaining, shippingCost, idempotencyKey]);
+      `, [authenticatedUserId, fullPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, actualBookingType, advPaid, remaining, shippingCost, idempotencyKey]);
       const orderId = orderRes[0].id;
 
-      // 7. Create order item with snapshots and correct variant_id
+      // I. Create Order Event record
+      await queryRunner.query(`
+        INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+        VALUES ($1, 'ORDER_CREATED', NULL, $2, 'Order created by customer checkout', $3);
+      `, [orderId, orderStatus, email]);
+
+      // J. Create order item with snapshots
       await queryRunner.query(`
         INSERT INTO order_items (order_id, variant_id, product_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
       `, [orderId, variantId, productId, requestedQty, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
 
-      // 8. Lock the stock (increment locked_stock)
+      // K. Lock stock (increment variant locked_stock and increment variant version)
       await queryRunner.query(`
-        UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
-      `, [requestedQty, productId]);
+        UPDATE product_variants 
+        SET locked_stock = COALESCE(locked_stock, 0) + $1,
+            version = version + 1,
+            updated_at = NOW() 
+        WHERE id = $2;
+      `, [requestedQty, variantId]);
+
+      // L. Sync parent products aggregate cache
+      await queryRunner.query(`
+        UPDATE products p
+        SET total_stock = (SELECT COALESCE(SUM(total_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+            locked_stock = (SELECT COALESCE(SUM(locked_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+            sold_stock = (SELECT COALESCE(SUM(sold_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+            updated_at = NOW()
+        WHERE p.id = $1;
+      `, [productId]);
+
+      // M. Record in inventory ledger
+      await queryRunner.query(`
+        INSERT INTO inventory_ledger (variant_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+        VALUES ($1, $2, 'RESERVE', $3, 0.00, $4, 'Stock reserved via standard checkout', $5);
+      `, [variantId, orderId, requestedQty, unitPrice, email]);
+
+      // N. Save Idempotency Key record
+      await this.saveIdempotency(idempotencyKey, authenticatedUserId, 'products/reserve', 'Order', orderId, queryRunner);
 
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -1455,23 +1457,10 @@ export class ApiService implements OnModuleInit {
       const responseObj = {
         success: true,
         orderId,
-        bookingType: isPreOrder ? 'pre_order' : 'standard',
+        bookingType: actualBookingType,
         advanceAmount: advPaid,
         remainingAmount: remaining
       };
-
-      // Set idempotency cache
-      localCache.set(`idem_${idempotencyKey}`, responseObj, 3600);
-
-      await this.writeAuditLog(
-        'ORDER_CREATED',
-        'orders',
-        orderId,
-        email,
-        ipAddress,
-        null,
-        responseObj
-      );
 
       return responseObj;
     } catch (err) {
@@ -1482,37 +1471,49 @@ export class ApiService implements OnModuleInit {
     }
   }
 
-  async reserveProductsCart(dto: any, ipAddress: string, authenticatedUserId?: string) {
-    const { items, email, name, instagram, phone, address, idempotencyKey, bookingType, advanceAmount } = dto;
-    const isPreOrder = bookingType === 'pre_order';
+  async reserveProductsCart(dto: any, ipAddress: string, authenticatedUserId: string) {
+    this.triggerLazyCleanup();
 
-    if (!idempotencyKey) {
-      throw new BadRequestException("Idempotency key is required to create order safely.");
+    const { items, name, instagram, phone, address, idempotencyKey, bookingType, advanceAmount } = dto;
+
+    if (!authenticatedUserId) {
+      throw new UnauthorizedException("Authentication is required to perform checkout.");
     }
     if (!items || !Array.isArray(items) || items.length === 0) {
       throw new BadRequestException("Cart items are required to checkout.");
     }
 
-    // 1. Enforce Idempotency Lock Check
-    const cachedRes = localCache.get(`idem_${idempotencyKey}`);
-    if (cachedRes) return cachedRes;
+    // A. Resolve User details safely (No JWT Spoofing)
+    const userRows = await this.dataSource.query("SELECT email FROM users WHERE id = $1", [authenticatedUserId]);
+    if (userRows.length === 0) {
+      throw new UnauthorizedException("Authenticated session user not found.");
+    }
+    const email = userRows[0].email;
 
-    const dbIdem = await this.dataSource.query("SELECT id FROM orders WHERE idempotency_key = $1", [idempotencyKey]);
-    if (dbIdem.length > 0) {
-      return {
-        success: true,
-        orderId: dbIdem[0].id
-      };
+    // B. Stateless DB Rate Limiting: max 3 requests per 10 seconds per user
+    const rateCheck = await this.dataSource.query(`
+      SELECT COUNT(*) as count FROM orders 
+      WHERE user_id = $1 AND created_at > NOW() - INTERVAL '10 seconds';
+    `, [authenticatedUserId]);
+    if (Number(rateCheck[0].count) >= 3) {
+      throw new HttpException({
+        statusCode: 429,
+        message: "Too many checkout attempts. Please wait a few seconds and try again."
+      }, HttpStatus.TOO_MANY_REQUESTS);
     }
 
-    // 2. Sort items alphabetically by productId to prevent transactional deadlocks
+    // C. Check Idempotency Key
+    const cacheRes = await this.checkIdempotency(idempotencyKey, authenticatedUserId);
+    if (cacheRes) return cacheRes;
+
+    // D. Sort items alphabetically by variantId to prevent transactional deadlocks
     const sortedItems = [...items].sort((a, b) => {
-      const idA = a.productId || a.variantId || '';
-      const idB = b.productId || b.variantId || '';
+      const idA = a.variantId || '';
+      const idB = b.variantId || '';
       return idA.localeCompare(idB);
     });
 
-    // 3. Resolve pricing and shipping charges purely on backend
+    // E. Resolve pricing and shipping charges purely on backend
     const pricing = await this.calculateCheckoutPricing({
       items: sortedItems,
       bookingType,
@@ -1523,17 +1524,16 @@ export class ApiService implements OnModuleInit {
       throw new BadRequestException("No valid products resolved for cart checkout.");
     }
 
-    const fullPrice = pricing.totalPrice;
-    const advPaid = pricing.advanceAmount;
-    const remaining = pricing.remainingAmount;
-    const shippingCost = pricing.shippingFee;
+    const firstGroupType = pricing.groups.some(g => g.bookingType === 'pre_order') ? 'pre_order' : 'standard';
+    const clientVersions = dto.inventoryVersions || [];
+    const clientVersionMap = new Map(clientVersions.map((cv: any) => [cv.id, Number(cv.version)]));
 
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      // 4. Get/create customer record
+      // F. Get/create customer record
       const custRes = await queryRunner.query(`
         INSERT INTO customers (full_name, phone, instagram, address, email, city)
         VALUES ($1, $2, $3, $4, $5, 'Unknown')
@@ -1543,21 +1543,7 @@ export class ApiService implements OnModuleInit {
       `, [name, phone, instagram, address, email.trim().toLowerCase()]);
       const customerId = custRes[0].id;
 
-      // 5. Resolve user ID
-      let userId: string;
-      if (authenticatedUserId) {
-        userId = authenticatedUserId;
-      } else {
-        const userRes = await queryRunner.query(`
-          INSERT INTO users (email, cognito_sub)
-          VALUES ($1, $2)
-          ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-          RETURNING id;
-        `, [email.trim().toLowerCase(), `guest_${customerId}`]);
-        userId = userRes[0].id;
-      }
-
-      // 6. Create parent order records for each group
+      // G. Create parent order records for each group
       const createdOrderIds = [];
       let firstOrderId = null;
 
@@ -1573,77 +1559,121 @@ export class ApiService implements OnModuleInit {
           INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, shipping_cost, created_at, updated_at, idempotency_key)
           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9)
           RETURNING id;
-        `, [userId, group.totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, group.bookingType, group.advanceAmount, group.remainingAmount, group.shippingFee, groupIdempotencyKey]);
+        `, [authenticatedUserId, group.totalPrice, `${address} | Insta: ${instagram} | Phone: ${phone}`, orderStatus, group.bookingType, group.advanceAmount, group.remainingAmount, group.shippingFee, groupIdempotencyKey]);
         
         const orderId = orderRes[0].id;
         createdOrderIds.push(orderId);
         if (!firstOrderId) firstOrderId = orderId;
 
-        // Group resolved items for stock locking
-        const requestedQuantities = {};
-        const resolvedMap = {};
-        for (const resolved of group.items) {
-          requestedQuantities[resolved.productId] = (requestedQuantities[resolved.productId] || 0) + resolved.qty;
-          resolvedMap[resolved.productId] = resolved;
-        }
+        // H. Create Order Event record
+        await queryRunner.query(`
+          INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+          VALUES ($1, 'ORDER_CREATED', NULL, $2, 'Order created by cart checkout', $3);
+        `, [orderId, orderStatus, email]);
 
-        // 7. Validate stock, lock stock, and create order items with snapshots
-        for (const [productId, qtyNeeded] of Object.entries(requestedQuantities)) {
-          const resolvedItem = resolvedMap[productId];
+        // I. Validate stock, lock stock, version control and create order items
+        for (const resolvedItem of group.items) {
+          const variantId = resolvedItem.variantId;
+          const productId = resolvedItem.productId;
+          const qtyNeeded = resolvedItem.qty;
           const unitPrice = resolvedItem.price;
 
-          // Row-level lock target product in alphabetical order (prevents deadlocks)
-          const prodRows = await queryRunner.query(`
-            SELECT id, model_name as name, total_stock, locked_stock, sold_stock, max_qty_per_customer 
-            FROM products 
+          // Row-level lock variant and batches (FOR UPDATE)
+          const varRows = await queryRunner.query(`
+            SELECT id, product_id, total_stock, locked_stock, sold_stock, version 
+            FROM product_variants 
             WHERE id = $1 AND deleted_at IS NULL 
             FOR UPDATE;
-          `, [productId]);
+          `, [variantId]);
 
-          if (prodRows.length === 0) {
-            throw new BadRequestException("Target die-cast grail does not exist or has been archived.");
+          if (varRows.length === 0) {
+            throw new BadRequestException(`Casting variant for "${resolvedItem.name}" does not exist or has been archived.`);
           }
 
-          const p = prodRows[0];
-          const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+          const pv = varRows[0];
+          const available = Number(pv.total_stock) - Number(pv.locked_stock || 0) - Number(pv.sold_stock);
 
           if (available <= 0) {
-            throw new BadRequestException(`Casting "${p.name}" is sold out.`);
+            throw new BadRequestException(`Casting "${resolvedItem.name}" is sold out.`);
           }
 
-          if (Number(qtyNeeded) > available) {
-            throw new BadRequestException(`Only ${available} unit(s) of "${p.name}" are available. You requested ${qtyNeeded}.`);
+          if (qtyNeeded > available) {
+            throw new BadRequestException(`Only ${available} unit(s) of "${resolvedItem.name}" are available. You requested ${qtyNeeded}.`);
           }
+
+          // F. Version comparison check
+          const clientVersion = clientVersionMap.get(variantId);
+          if (clientVersion !== undefined && Number(pv.version) !== Number(clientVersion)) {
+            throw new BadRequestException(`Inventory changed while you were checking out for "${resolvedItem.name}". Please review your order.`);
+          }
+
+          // Lock matching batches row-level
+          await queryRunner.query(`
+            SELECT id FROM inventory_batches 
+            WHERE variant_id = $1 
+            FOR UPDATE;
+          `, [variantId]);
 
           // Check customer purchase limit
-          if (p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
+          const prodRows = await queryRunner.query("SELECT max_qty_per_customer FROM products WHERE id = $1 FOR UPDATE;", [productId]);
+          const p = prodRows[0];
+          if (p && p.max_qty_per_customer !== null && p.max_qty_per_customer > 0) {
             const existingCountRes = await queryRunner.query(`
               SELECT COALESCE(SUM(oi.qty), 0) as total
               FROM order_items oi
               JOIN orders o ON o.id = oi.order_id
-              JOIN users u ON u.id = o.user_id
               WHERE oi.product_id = $1 
-                AND u.email = $2 
+                AND o.user_id = $2 
                 AND o.status NOT IN ('Cancelled', 'Expired');
-            `, [productId, email.trim().toLowerCase()]);
+            `, [productId, authenticatedUserId]);
             const existingCount = Number(existingCountRes[0].total);
-            if (existingCount + Number(qtyNeeded) > p.max_qty_per_customer) {
-              throw new BadRequestException(`Purchase limit exceeded for "${p.name}". You have already ordered/reserved ${existingCount} items.`);
+            if (existingCount + qtyNeeded > p.max_qty_per_customer) {
+              throw new BadRequestException(`Purchase limit exceeded for "${resolvedItem.name}". You have already ordered/reserved ${existingCount} items.`);
             }
           }
 
-          // Create order item with snapshots and correct variant_id
+          // Create order item with snapshots
           await queryRunner.query(`
             INSERT INTO order_items (order_id, variant_id, product_id, qty, price_at_purchase, variant_name_snapshot, sku_snapshot, brand_snapshot, casing_snapshot, manufacturer_snapshot)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
-          `, [orderId, resolvedItem.variantId, productId, qtyNeeded, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
+          `, [orderId, variantId, productId, qtyNeeded, unitPrice, resolvedItem.variantName, resolvedItem.sku, resolvedItem.brand, resolvedItem.casing, resolvedItem.manufacturer]);
 
-          // Lock the stock
+          // Lock stock (increment variant locked_stock and increment version)
           await queryRunner.query(`
-            UPDATE products SET locked_stock = COALESCE(locked_stock, 0) + $1, updated_at = NOW() WHERE id = $2;
-          `, [qtyNeeded, productId]);
+            UPDATE product_variants 
+            SET locked_stock = COALESCE(locked_stock, 0) + $1,
+                version = version + 1,
+                updated_at = NOW() 
+            WHERE id = $2;
+          `, [qtyNeeded, variantId]);
+
+          // Sync parent products aggregate cache
+          await queryRunner.query(`
+            UPDATE products p
+            SET total_stock = (SELECT COALESCE(SUM(total_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+                locked_stock = (SELECT COALESCE(SUM(locked_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+                sold_stock = (SELECT COALESCE(SUM(sold_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+                updated_at = NOW()
+            WHERE p.id = $1;
+          `, [productId]);
+
+          // Record in inventory ledger
+          await queryRunner.query(`
+            INSERT INTO inventory_ledger (variant_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+            VALUES ($1, $2, 'RESERVE', $3, 0.00, $4, 'Stock reserved via cart checkout', $5);
+          `, [variantId, orderId, qtyNeeded, unitPrice, email]);
         }
       }
+
+      // J. Clear the database cart for the user inside the transaction
+      await queryRunner.query(`
+        UPDATE cart_items 
+        SET deleted_at = NOW(), updated_at = NOW() 
+        WHERE cart_id = (SELECT id FROM carts WHERE user_id = $1) AND deleted_at IS NULL;
+      `, [authenticatedUserId]);
+
+      // K. Save Idempotency Key mapping
+      await this.saveIdempotency(idempotencyKey, authenticatedUserId, 'products/reserve-cart', 'Order', firstOrderId, queryRunner);
 
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -1653,23 +1683,10 @@ export class ApiService implements OnModuleInit {
         success: true,
         orderId: firstOrderId,
         orderIds: createdOrderIds,
-        bookingType: pricing.groups.some(g => g.bookingType === 'pre_order') ? 'pre_order' : 'standard',
+        bookingType: firstGroupType,
         advanceAmount: pricing.advanceAmount,
         remainingAmount: pricing.remainingAmount
       };
-
-      // Set idempotency cache
-      localCache.set(`idem_${idempotencyKey}`, responseObj, 3600);
-
-      await this.writeAuditLog(
-        'ORDER_CREATED_CART',
-        'orders',
-        firstOrderId,
-        email,
-        ipAddress,
-        null,
-        responseObj
-      );
 
       return responseObj;
     } catch (err) {
@@ -1682,18 +1699,47 @@ export class ApiService implements OnModuleInit {
 
   // ── UPI SCREENSHOT UPLOAD SECURE STRATEGY ──────────────────────────
   async saveScreenshotReceipt(orderId: string, fileBuffer: Buffer, fileExtension: string, userId: string, ipAddress: string) {
+    // 1. Fetch target order details
     const orderRows = await this.dataSource.query(
       "SELECT id, user_id, status, idempotency_key FROM orders WHERE id = $1 AND deleted_at IS NULL",
       [orderId]
     );
     if (orderRows.length === 0) throw new BadRequestException('Order not found.');
     const order = orderRows[0];
+
+    // Check ownership
     if (order.user_id !== userId) {
       throw new UnauthorizedException('You do not have permission to upload screenshot for this order.');
     }
 
-    const fileName = `${crypto.randomUUID()}.${fileExtension}`;
+    // 2. Protect against expired/cancelled uploads
+    if (order.status === 'Expired' || order.status === 'Cancelled' || order.status === 'Rejected') {
+      throw new BadRequestException(`This order is already ${order.status.toLowerCase()}. You cannot upload payment receipts anymore.`);
+    }
+
+    // 3. File validation: extensions & max size (5MB)
+    const allowedExts = ['jpg', 'jpeg', 'png', 'webp'];
+    const ext = fileExtension.toLowerCase();
+    if (!allowedExts.includes(ext)) {
+      throw new BadRequestException("Invalid receipt file type. Only JPG, JPEG, PNG, and WebP images are allowed.");
+    }
+    if (fileBuffer.length > 5 * 1024 * 1024) {
+      throw new BadRequestException("Receipt image size must not exceed 5MB.");
+    }
+
+    // 4. SHA256 receipt buffer deduplication (prevent duplicate uploads on retries)
+    const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    const existingReceipts = await this.dataSource.query(
+      "SELECT id FROM order_payment_receipts WHERE file_hash = $1 LIMIT 1;",
+      [fileHash]
+    );
+    if (existingReceipts.length > 0) {
+      return { success: true, message: 'Receipt already uploaded previously.', receiptId: existingReceipts[0].id };
+    }
+
+    const fileName = `${crypto.randomUUID()}.${ext}`;
     
+    // 5. Save receipt file (S3 or local filesystem)
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
@@ -1702,9 +1748,8 @@ export class ApiService implements OnModuleInit {
           Bucket: process.env.S3_ASSETS_BUCKET,
           Key: `uploads/${fileName}`,
           Body: fileBuffer,
-          ContentType: `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
+          ContentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`
         }));
-        console.log(`[S3] Successfully uploaded screenshot ${fileName} to bucket ${process.env.S3_ASSETS_BUCKET}`);
       } catch (err: any) {
         console.error(`[S3] Failed to upload screenshot to S3: ${err.message}`);
         throw err;
@@ -1714,7 +1759,11 @@ export class ApiService implements OnModuleInit {
       fs.writeFileSync(filePath, fileBuffer);
     }
 
-    // Find ALL sibling orders created in the same transaction split
+    // Resolve user email
+    const userRows = await this.dataSource.query("SELECT email FROM users WHERE id = $1", [userId]);
+    const userEmail = userRows[0]?.email || 'User';
+
+    // 6. Find ALL sibling orders created in the same transaction split
     let siblingOrderIds = [orderId];
     if (order.idempotency_key && order.idempotency_key.includes('_')) {
       const parts = order.idempotency_key.split('_');
@@ -1728,34 +1777,62 @@ export class ApiService implements OnModuleInit {
       }
     }
 
-    // Update order status to Verification Pending and store filename for ALL siblings
-    for (const oid of siblingOrderIds) {
-      await this.dataSource.query(`
-        UPDATE orders 
-        SET status = 'Verification Pending', screenshot_url = $1, updated_at = NOW()
-        WHERE id = $2;
-      `, [fileName, oid]);
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-      // Send admin notification alert
-      await this.createSystemNotification(
-        'Payment Uploaded',
-        `Order ${oid.slice(0, 8)} uploaded a transaction receipt. Pending verification.`,
-        'payment',
-        oid
-      );
+    try {
+      // 7. Update status, store receipts and write event trails
+      for (const oid of siblingOrderIds) {
+        // A. Insert receipt record
+        const receiptRes = await queryRunner.query(`
+          INSERT INTO order_payment_receipts (order_id, screenshot_url, file_hash, status, uploaded_by)
+          VALUES ($1, $2, $3, 'Pending', $4)
+          RETURNING id;
+        `, [oid, fileName, fileHash, userId]);
+        const receiptId = receiptRes[0].id;
 
-      await this.writeAuditLog(
-        'UPLOAD_RECEIPT',
-        'orders',
-        oid,
-        'Customer',
-        ipAddress,
-        { status: 'Reserved' },
-        { status: 'Verification Pending', file: fileName }
-      );
+        // B. Fetch previous order status
+        const statusCheck = await queryRunner.query("SELECT status FROM orders WHERE id = $1 FOR UPDATE;", [oid]);
+        const previousStatus = statusCheck[0]?.status || 'Pending';
+
+        // C. Update order status to Awaiting Confirmation
+        await queryRunner.query(`
+          UPDATE orders 
+          SET status = 'Awaiting Confirmation', screenshot_url = $1, updated_at = NOW()
+          WHERE id = $2;
+        `, [fileName, oid]);
+
+        // D. Insert Payment Event record
+        await queryRunner.query(`
+          INSERT INTO payment_events (order_id, event_type, receipt_id, details, performed_by)
+          VALUES ($1, 'RECEIPT_UPLOADED', $2, 'Uploaded payment confirmation receipt screenshot', $3);
+        `, [oid, receiptId, userEmail]);
+
+        // E. Insert Order Event record
+        await queryRunner.query(`
+          INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+          VALUES ($1, 'STATUS_CHANGE', $2, 'Awaiting Confirmation', 'Payment confirmation receipt uploaded, awaiting admin review', $3);
+        `, [oid, previousStatus, userEmail]);
+
+        // Send admin notification alert
+        await this.createSystemNotification(
+          'Payment Uploaded',
+          `Order ${oid.slice(0, 8)} uploaded a transaction receipt. Pending verification.`,
+          'payment',
+          oid
+        );
+      }
+
+      await queryRunner.commitTransaction();
+      return { success: true };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      console.error("[Screenshot] Transaction failed to save receipt:", e.message);
+      throw e;
+    } finally {
+      await queryRunner.release();
     }
-
-    return { success: true };
   }
 
   async getPrivateScreenshotStream(orderId: string) {
@@ -1843,62 +1920,291 @@ export class ApiService implements OnModuleInit {
   }
 
   // ── TIMER EXPIRATION WORKER METHOD ─────────────────────────────────
-  async expireActiveReservations() {
-    const expired = await this.dataSource.query(`
-      SELECT r.id, r.product_id, r.order_id, r.quantity, o.user_id, u.email
-      FROM reservations r
-      JOIN orders o ON o.id = r.order_id
-      JOIN users u ON u.id = o.user_id
-      WHERE r.status = 'Active' AND r.expires_at < NOW();
-    `);
+  async expireActiveOrders() {
+    // 1. Fetch reservation timeout hours from settings (fallback to 24)
+    let timeoutHours = 24;
+    try {
+      const rowsSettings = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
+      const settings = rowsSettings.length > 0 ? rowsSettings[0].value : {};
+      if (settings.reservation_timeout_hours !== undefined && !isNaN(Number(settings.reservation_timeout_hours))) {
+        timeoutHours = Number(settings.reservation_timeout_hours);
+      }
+    } catch (e) {
+      console.warn("[Expiry] Failed to fetch reservation_timeout_hours from settings, falling back to 24:", e.message);
+    }
 
-    for (const r of expired) {
-      console.log(`[Worker] Expiring stock lock reservation ID: ${r.id} for product: ${r.product_id}`);
+    // 2. Fetch all expired orders ('Pending' or unpaid 'Pre-Order' without screenshot)
+    const expiredOrders = await this.dataSource.query(`
+      SELECT o.id, o.status, o.user_id, u.email
+      FROM orders o
+      JOIN users u ON u.id = o.user_id
+      WHERE (o.status = 'Pending' OR (o.status = 'Pre-Order' AND NOT EXISTS (
+        SELECT 1 FROM order_payment_receipts WHERE order_id = o.id
+      )))
+        AND o.created_at + ($1 || ' hours')::INTERVAL < NOW()
+        AND o.deleted_at IS NULL;
+    `, [timeoutHours]);
+
+    for (const order of expiredOrders) {
+      console.log(`[Expiry Worker] Expiring order ID: ${order.id} for user: ${order.email}`);
       
       const queryRunner = this.dataSource.createQueryRunner();
       await queryRunner.connect();
       await queryRunner.startTransaction();
 
       try {
-        // Set statuses to Expired
-        await queryRunner.query("UPDATE reservations SET status = 'Expired' WHERE id = $1", [r.id]);
-        await queryRunner.query("UPDATE orders SET status = 'Expired', updated_at = NOW() WHERE id = $1", [r.order_id]);
+        // A. Set status to Expired
+        await queryRunner.query("UPDATE orders SET status = 'Expired', updated_at = NOW() WHERE id = $1", [order.id]);
 
-        // Release locked stock
+        // B. Record Order Event
         await queryRunner.query(`
-          UPDATE products 
-          SET locked_stock = GREATEST(0, locked_stock - $1), updated_at = NOW()
-          WHERE id = $2;
-        `, [r.quantity, r.product_id]);
+          INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+          VALUES ($1, 'ORDER_EXPIRED', $2, 'Expired', 'Order expired due to payment timeout', 'System Worker');
+        `, [order.id, order.status]);
+
+        // C. Fetch items to release stock locks
+        const items = await queryRunner.query('SELECT product_id, variant_id, qty FROM order_items WHERE order_id = $1', [order.id]);
+        for (const item of items) {
+          // Release variant locked stock and increment version
+          await queryRunner.query(`
+            UPDATE product_variants
+            SET locked_stock = GREATEST(0, locked_stock - $1),
+                version = version + 1,
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [item.qty, item.variant_id]);
+
+          // Sync parent product aggregate cache
+          await queryRunner.query(`
+            UPDATE products p
+            SET locked_stock = (SELECT COALESCE(SUM(locked_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+                updated_at = NOW()
+            WHERE p.id = $1;
+          `, [item.product_id]);
+
+          // Record in inventory ledger
+          await queryRunner.query(`
+            INSERT INTO inventory_ledger (variant_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+            VALUES ($1, $2, 'RELEASE_RESERVATION', $3, 0.00, 0.00, 'Released stock lock due to order expiration', 'System Worker');
+          `, [item.variant_id, order.id, item.qty]);
+        }
 
         await queryRunner.commitTransaction();
-        localCache.del('products_list_true');
-        localCache.del('products_list_false');
-
-        // Create alert notifications
-        await this.createSystemNotification(
-          'Reservation Expired',
-          `Acquisition lock expired for user ${r.email}. Stock restored.`,
-          'timer_alert'
-        );
-
-        await this.writeAuditLog(
-          'RESERVATION_EXPIRED',
-          'reservations',
-          r.id,
-          'System Worker',
-          '127.0.0.1',
-          { status: 'Active' },
-          { status: 'Expired' }
-        );
-
       } catch (err) {
         await queryRunner.rollbackTransaction();
-        console.error(`[Worker] Expiration transaction rollback failed for reservation: ${r.id}:`, err);
+        console.error(`[Expiry Worker] Rollback failed for order: ${order.id}:`, err);
       } finally {
         await queryRunner.release();
       }
     }
+
+    // 3. Clean up abandoned soft-deleted cart items older than 90 days
+    try {
+      await this.dataSource.query(`
+        DELETE FROM cart_items
+        WHERE deleted_at IS NOT NULL AND updated_at < NOW() - INTERVAL '90 days';
+      `);
+    } catch (e) {
+      console.error("[Expiry Worker] Failed to prune soft-deleted cart items:", e.message);
+    }
+
+    // 4. Release global localCache keys
+    localCache.del('products_list_true');
+    localCache.del('products_list_false');
+  }
+
+  // ── NON-BLOCKING LAZY CLEANUP RATE LIMITER ─────────────────────────
+  triggerLazyCleanup() {
+    const now = Date.now();
+    if (now - this.lastCleanupAt > 5 * 60 * 1000) { // 5 minutes
+      this.lastCleanupAt = now;
+      // Execute asynchronously in background (non-blocking)
+      this.expireActiveOrders().catch(err => {
+        console.error("[Expiry] Asynchronous lazy expiration failed:", err);
+      });
+    }
+  }
+
+  // ── DATABASE-BACKED USER CARTS SERVICES ────────────────────────────
+  async getOrCreateCart(userId: string, queryRunner?: any): Promise<string> {
+    const conn = queryRunner || this.dataSource;
+    const existing = await conn.query("SELECT id FROM carts WHERE user_id = $1 LIMIT 1;", [userId]);
+    if (existing.length > 0) return existing[0].id;
+
+    const res = await conn.query("INSERT INTO carts (user_id) VALUES ($1) RETURNING id;", [userId]);
+    return res[0].id;
+  }
+
+  async getUserCart(userId: string) {
+    const cartId = await this.getOrCreateCart(userId);
+    // Fetch active items, join with variant & product info to get dynamic price, availability and metadata
+    return this.dataSource.query(`
+      SELECT 
+        ci.id as "cartItemId",
+        ci.variant_id as "id", -- matches frontend item.id expectations
+        ci.variant_id as "variantId",
+        ci.quantity,
+        pv.product_id as "productId",
+        COALESCE(pv.name, ci.product_name_snapshot) as name,
+        COALESCE(pi.thumbnail_url, ci.image_snapshot) as image,
+        COALESCE(pv.selling_price, ci.price_snapshot)::float as price,
+        COALESCE(p.brand, ci.brand_snapshot) as brand,
+        p.scale,
+        p.is_prebook as "isPrebook",
+        p.is_prebook as "is_prebook",
+        (pv.total_stock - pv.locked_stock - pv.sold_stock)::int as "availableStock"
+      FROM cart_items ci
+      JOIN product_variants pv ON pv.id = ci.variant_id
+      JOIN products p ON p.id = pv.product_id
+      LEFT JOIN product_images pi ON pi.product_id = p.id AND pi.is_primary = true
+      WHERE ci.cart_id = $1 AND ci.deleted_at IS NULL
+      ORDER BY ci.created_at ASC;
+    `, [cartId]);
+  }
+
+  async upsertCartItem(
+    userId: string,
+    variantId: string,
+    quantity: number,
+    mode: 'add' | 'set',
+    snapshot?: { productName?: string; imageUrl?: string; price?: number; brand?: string }
+  ) {
+    const cartId = await this.getOrCreateCart(userId);
+    const qty = Math.max(1, parseInt(quantity as any || '1', 10));
+
+    // Check variant availability
+    const varRows = await this.dataSource.query(`
+      SELECT pv.product_id, (pv.total_stock - pv.locked_stock - pv.sold_stock) as available 
+      FROM product_variants pv 
+      WHERE pv.id = $1 AND pv.deleted_at IS NULL;
+    `, [variantId]);
+
+    if (varRows.length === 0) {
+      throw new BadRequestException("Casting variant does not exist or has been archived.");
+    }
+    const maxAvailable = Number(varRows[0].available);
+    const productId = varRows[0].product_id;
+
+    // Check if item already exists
+    const existing = await this.dataSource.query(
+      "SELECT id, quantity FROM cart_items WHERE cart_id = $1 AND variant_id = $2 AND deleted_at IS NULL LIMIT 1;",
+      [cartId, variantId]
+    );
+
+    let targetQty = qty;
+    if (existing.length > 0) {
+      targetQty = mode === 'add' ? Number(existing[0].quantity) + qty : qty;
+    }
+
+    if (targetQty > maxAvailable) {
+      throw new BadRequestException(`Only ${maxAvailable} unit(s) are available. You requested ${targetQty}.`);
+    }
+
+    if (existing.length > 0) {
+      await this.dataSource.query(`
+        UPDATE cart_items
+        SET quantity = $1, updated_at = NOW()
+        WHERE id = $2;
+      `, [targetQty, existing[0].id]);
+    } else {
+      await this.dataSource.query(`
+        INSERT INTO cart_items (cart_id, variant_id, quantity, product_name_snapshot, image_snapshot, price_snapshot, brand_snapshot)
+        VALUES ($1, $2, $3, $4, $5, $6, $7);
+      `, [
+        cartId,
+        variantId,
+        targetQty,
+        snapshot?.productName || null,
+        snapshot?.imageUrl || null,
+        snapshot?.price ? Number(snapshot.price) : null,
+        snapshot?.brand || null
+      ]);
+    }
+
+    return this.getUserCart(userId);
+  }
+
+  async deleteCartItem(userId: string, variantId: string) {
+    const cartId = await this.getOrCreateCart(userId);
+    await this.dataSource.query(`
+      UPDATE cart_items
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE cart_id = $1 AND variant_id = $2 AND deleted_at IS NULL;
+    `, [cartId, variantId]);
+    return this.getUserCart(userId);
+  }
+
+  async clearUserCartDb(userId: string) {
+    const cartId = await this.getOrCreateCart(userId);
+    await this.dataSource.query(`
+      UPDATE cart_items
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE cart_id = $1 AND deleted_at IS NULL;
+    `, [cartId]);
+    return { success: true };
+  }
+
+  async mergeCart(userId: string, items: Array<{ variantId: string; quantity: number; productName?: string; imageUrl?: string; price?: number; brand?: string }>) {
+    const cartId = await this.getOrCreateCart(userId);
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      for (const item of items) {
+        if (!item.variantId) continue;
+        const qty = Math.max(1, parseInt(item.quantity as any || '1', 10));
+
+        // Get availability
+        const varRows = await queryRunner.query(`
+          SELECT (pv.total_stock - pv.locked_stock - pv.sold_stock) as available 
+          FROM product_variants pv 
+          WHERE pv.id = $1 AND pv.deleted_at IS NULL FOR UPDATE;
+        `, [item.variantId]);
+
+        if (varRows.length === 0) continue; // skip deleted variants
+        const available = Number(varRows[0].available);
+
+        // Check existing item
+        const existing = await queryRunner.query(
+          "SELECT id, quantity FROM cart_items WHERE cart_id = $1 AND variant_id = $2 AND deleted_at IS NULL FOR UPDATE LIMIT 1;",
+          [cartId, item.variantId]
+        );
+
+        let targetQty = qty;
+        if (existing.length > 0) {
+          targetQty = Number(existing[0].quantity) + qty;
+        }
+        targetQty = Math.min(targetQty, available); // respect stock limit
+
+        if (targetQty > 0) {
+          if (existing.length > 0) {
+            await queryRunner.query("UPDATE cart_items SET quantity = $1, updated_at = NOW() WHERE id = $2;", [targetQty, existing[0].id]);
+          } else {
+            await queryRunner.query(`
+              INSERT INTO cart_items (cart_id, variant_id, quantity, product_name_snapshot, image_snapshot, price_snapshot, brand_snapshot)
+              VALUES ($1, $2, $3, $4, $5, $6, $7);
+            `, [
+              cartId,
+              item.variantId,
+              targetQty,
+              item.productName || null,
+              item.imageUrl || null,
+              item.price ? Number(item.price) : null,
+              item.brand || null
+            ]);
+          }
+        }
+      }
+      await queryRunner.commitTransaction();
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
+
+    return this.getUserCart(userId);
   }
 
   // ── ORDER PIPELINE STATE MANAGEMENT ───────────────────────────────
@@ -2028,34 +2334,50 @@ export class ApiService implements OnModuleInit {
       ORDER BY o.created_at DESC;
     `, [email.trim().toLowerCase()]);
   }
-  validateOrderTransition(currentStatus: string, nextStatus: string) {
+  validateOrderTransition(currentStatus: string, nextStatus: string, role?: string) {
     if (currentStatus === nextStatus) return;
 
     const validTransitions: Record<string, string[]> = {
-      'Pending': ['Verification Pending', 'Confirmed', 'Cancelled'],
-      'Pre-Order': ['Awaiting Stock', 'Cancelled'],
-      'Awaiting Stock': ['Verification Pending', 'Confirmed', 'Cancelled'],
-      'Verification Pending': ['Confirmed', 'Cancelled'],
-      'Confirmed': ['Paid', 'Shipped', 'Cancelled'],
-      'Paid': ['Shipped', 'Cancelled'],
+      'Pending': ['Awaiting Confirmation', 'Confirmed', 'Cancelled', 'Expired'],
+      'Pre-Order': ['Awaiting Confirmation', 'Cancelled'],
+      'Awaiting Stock': ['Awaiting Confirmation', 'Cancelled'],
+      'Awaiting Confirmation': ['Confirmed', 'Cancelled', 'Rejected'],
+      'Confirmed': ['Packed', 'Cancelled'],
+      'Packed': ['Shipped', 'Cancelled'],
       'Shipped': ['Delivered', 'Cancelled'],
-      'Delivered': [], // End state
-      'Cancelled': []  // End state
+      'Delivered': [],
+      'Cancelled': [],
+      'Expired': [],
+      'Rejected': []
     };
 
     const allowed = validTransitions[currentStatus] || [];
     if (!allowed.includes(nextStatus)) {
       throw new BadRequestException(`Illegal order state transition from "${currentStatus}" to "${nextStatus}".`);
     }
+
+    // Role-based constraints
+    if (role) {
+      if (['Confirmed', 'Cancelled', 'Rejected', 'Expired'].includes(nextStatus)) {
+        if (role !== 'Owner' && role !== 'Admin' && role !== 'System') {
+          throw new ForbiddenException(`Users with role "${role}" are not permitted to transition orders to "${nextStatus}".`);
+        }
+      }
+      if (['Packed', 'Shipped', 'Delivered'].includes(nextStatus)) {
+        if (role !== 'Owner' && role !== 'Admin' && role !== 'Warehouse') {
+          throw new ForbiddenException(`Users with role "${role}" are not permitted to transition orders to "${nextStatus}".`);
+        }
+      }
+    }
   }
 
-  async adminConfirmOrder(orderId: string, adminEmail: string, ipAddress: string) {
+  async adminConfirmOrder(orderId: string, adminEmail: string, ipAddress: string, role?: string) {
     const oldRes = await this.dataSource.query("SELECT status, booking_type FROM orders WHERE id = $1", [orderId]);
     if (oldRes.length === 0) {
       throw new Error("Order not found.");
     }
     
-    this.validateOrderTransition(oldRes[0].status, 'Confirmed');
+    this.validateOrderTransition(oldRes[0].status, 'Confirmed', role);
 
     if (oldRes[0].status === 'Confirmed' || oldRes[0].status === 'Pre-Order') {
       return { success: true };
@@ -2178,6 +2500,25 @@ export class ApiService implements OnModuleInit {
       await queryRunner.query("UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2", [targetStatus, orderId]);
       await queryRunner.query("UPDATE reservations SET status = 'Converted' WHERE order_id = $1", [orderId]);
 
+      // Update payment receipt status to Approved
+      await queryRunner.query(`
+        UPDATE order_payment_receipts 
+        SET status = 'Approved', updated_at = NOW() 
+        WHERE order_id = $1 AND status = 'Pending';
+      `, [orderId]);
+
+      // Write Payment Event
+      await queryRunner.query(`
+        INSERT INTO payment_events (order_id, event_type, details, performed_by)
+        VALUES ($1, 'RECEIPT_APPROVED', 'Payment receipt approved by administrator', $2);
+      `, [orderId, adminEmail]);
+
+      // Write Order Event
+      await queryRunner.query(`
+        INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+        VALUES ($1, 'STATUS_CHANGE', $2, $3, 'Order confirmed and stock allocated via admin approval', $4);
+      `, [orderId, oldRes[0].status, targetStatus, adminEmail]);
+
       if (isInitialPreorder) {
         await queryRunner.query(`
           UPDATE receipts 
@@ -2237,13 +2578,20 @@ export class ApiService implements OnModuleInit {
       await queryRunner.release();
     }
   }
-  async adminUpdateOrderStatus(orderId: string, fields: any, adminEmail: string, ipAddress: string) {
+  async adminUpdateOrderStatus(orderId: string, fields: any, adminEmail: string, ipAddress: string, role?: string) {
     const oldRes = await this.dataSource.query("SELECT * FROM orders WHERE id = $1", [orderId]);
     if (oldRes.length === 0) throw new BadRequestException('Order not found.');
     const old = oldRes[0];
 
+    const targetStatus = fields.status || old.status;
+
     if (fields.status) {
-      this.validateOrderTransition(old.status, fields.status);
+      this.validateOrderTransition(old.status, fields.status, role);
+    }
+
+    // Enforce courier details when shipping
+    if (targetStatus === 'Shipped' && (!fields.courierPartner || !fields.trackingNumber)) {
+      throw new BadRequestException("Courier partner and tracking number are required to ship this order.");
     }
 
     const queryRunner = this.dataSource.createQueryRunner();
@@ -2258,7 +2606,7 @@ export class ApiService implements OnModuleInit {
             updated_at = NOW()
         WHERE id = $8;
       `, [
-        fields.status || old.status,
+        targetStatus,
         fields.courierPartner || old.courier_partner,
         fields.trackingNumber || old.tracking_number,
         fields.shippingCost !== undefined ? Number(fields.shippingCost) : old.shipping_cost,
@@ -2268,8 +2616,13 @@ export class ApiService implements OnModuleInit {
         orderId
       ]);
 
+      // Write Order Event trail
+      await queryRunner.query(`
+        INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+        VALUES ($1, 'STATUS_CHANGE', $2, $3, $4, $5);
+      `, [orderId, old.status, targetStatus, `Order status updated to ${targetStatus}`, adminEmail]);
+
       // If status transitioned to Paid, Confirmed, Shipped, or Delivered, mark receipt as paid
-      const targetStatus = fields.status || old.status;
       if (targetStatus === 'Paid' || targetStatus === 'Confirmed' || targetStatus === 'Shipped' || targetStatus === 'Delivered') {
         await queryRunner.query(`
           UPDATE receipts 
@@ -2299,9 +2652,9 @@ export class ApiService implements OnModuleInit {
       }
 
       // Transition stock from Reserved to Sold on Shipment/Delivery
-      if ((targetStatus === 'Shipped' || targetStatus === 'Delivered') && old.status === 'Confirmed') {
+      if ((targetStatus === 'Shipped' || targetStatus === 'Delivered') && (old.status === 'Confirmed' || old.status === 'Packed')) {
         const allocations = await queryRunner.query(`
-          SELECT a.*, oi.product_id 
+          SELECT a.*, oi.product_id, oi.variant_id 
           FROM order_inventory_allocations a
           JOIN order_items oi ON oi.id = a.order_item_id
           WHERE oi.order_id = $1;
@@ -2319,9 +2672,9 @@ export class ApiService implements OnModuleInit {
 
           // Log to ledger
           await queryRunner.query(`
-            INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+            INSERT INTO inventory_ledger (variant_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
             VALUES ($1, $2, $3, 'SELL', 0, $4, $5, $6, $7);
-          `, [a.product_id, a.batch_id, orderId, Number(a.purchase_price), Number(a.selling_price), `Shipped/Delivered stock finalized`, adminEmail || 'System']);
+          `, [a.variant_id || a.product_id, a.batch_id, orderId, Number(a.purchase_price), Number(a.selling_price), `Shipped/Delivered stock finalized`, adminEmail || 'System']);
 
           // Update caches
           await queryRunner.query(`
@@ -2345,14 +2698,14 @@ export class ApiService implements OnModuleInit {
       // If status transitioned to Cancelled, release stock and allocations
       if (targetStatus === 'Cancelled' && old.status !== 'Cancelled') {
         const allocations = await queryRunner.query(`
-          SELECT a.*, oi.product_id 
+          SELECT a.*, oi.product_id, oi.variant_id 
           FROM order_inventory_allocations a
           JOIN order_items oi ON oi.id = a.order_item_id
           WHERE oi.order_id = $1;
         `, [orderId]);
 
         for (const a of allocations) {
-          if (old.status === 'Confirmed' || old.status === 'Pre-Order') {
+          if (old.status === 'Confirmed' || old.status === 'Pre-Order' || old.status === 'Packed') {
             // Stock was Reserved. Return to Available.
             await queryRunner.query(`
               UPDATE inventory_batches
@@ -2364,9 +2717,9 @@ export class ApiService implements OnModuleInit {
             `, [a.quantity, a.batch_id]);
 
             await queryRunner.query(`
-              INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+              INSERT INTO inventory_ledger (variant_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
               VALUES ($1, $2, $3, 'RELEASE_RESERVATION', $4, $5, $6, $7, $8);
-            `, [a.product_id, a.batch_id, orderId, a.quantity, Number(a.purchase_price), Number(a.selling_price), `Released reservation from cancelled order`, adminEmail || 'System']);
+            `, [a.variant_id || a.product_id, a.batch_id, orderId, a.quantity, Number(a.purchase_price), Number(a.selling_price), `Released reservation from cancelled order`, adminEmail || 'System']);
 
             await queryRunner.query(`
               UPDATE products
@@ -2394,9 +2747,9 @@ export class ApiService implements OnModuleInit {
             `, [a.quantity, a.batch_id]);
 
             await queryRunner.query(`
-              INSERT INTO inventory_ledger (product_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
+              INSERT INTO inventory_ledger (variant_id, batch_id, order_id, type, quantity_changed, purchase_price, selling_price, reason, performed_by)
               VALUES ($1, $2, $3, 'RETURN_CUSTOMER', $4, $5, $6, $7, $8);
-            `, [a.product_id, a.batch_id, orderId, a.quantity, Number(a.purchase_price), Number(a.selling_price), `Returned stock from cancelled order`, adminEmail || 'System']);
+            `, [a.variant_id || a.product_id, a.batch_id, orderId, a.quantity, Number(a.purchase_price), Number(a.selling_price), `Returned stock from cancelled order`, adminEmail || 'System']);
 
             await queryRunner.query(`
               UPDATE products
@@ -2421,7 +2774,7 @@ export class ApiService implements OnModuleInit {
           WHERE order_item_id IN (SELECT id FROM order_items WHERE order_id = $1);
         `, [orderId]);
 
-        if (old.status === 'Confirmed' || old.status === 'Pre-Order' || old.status === 'Shipped' || old.status === 'Delivered') {
+        if (old.status === 'Confirmed' || old.status === 'Pre-Order' || old.status === 'Packed' || old.status === 'Shipped' || old.status === 'Delivered') {
           const refundAmount = old.status === 'Pre-Order' ? Number(old.advance_amount) : Number(old.total_price);
           if (refundAmount > 0) {
             const refundRes = await queryRunner.query(`
@@ -2448,6 +2801,20 @@ export class ApiService implements OnModuleInit {
             }
           }
         }
+      }
+
+      // Update last Pending payment receipt if Rejected or Cancelled
+      if (targetStatus === 'Cancelled' || targetStatus === 'Rejected') {
+        await queryRunner.query(`
+          UPDATE order_payment_receipts 
+          SET status = 'Rejected', updated_at = NOW() 
+          WHERE order_id = $1 AND status = 'Pending';
+        `, [orderId]);
+
+        await queryRunner.query(`
+          INSERT INTO payment_events (order_id, event_type, details, performed_by)
+          VALUES ($1, 'RECEIPT_REJECTED', 'Payment receipt automatically rejected due to order cancellation/rejection', $2);
+        `, [orderId, adminEmail]);
       }
 
       await queryRunner.commitTransaction();
@@ -2542,6 +2909,7 @@ export class ApiService implements OnModuleInit {
     );
     if (orderRows.length === 0) throw new BadRequestException('Order not found.');
     const order = orderRows[0];
+
     if (order.user_id !== userId) {
       throw new UnauthorizedException('You do not have permission to update this order.');
     }
@@ -2550,8 +2918,29 @@ export class ApiService implements OnModuleInit {
       throw new BadRequestException('Remaining payment has not been requested for this order yet.');
     }
 
-    const fileName = `remain_${crypto.randomUUID()}.${fileExtension}`;
+    // A. File validation: extensions & max size (5MB)
+    const allowedExts = ['jpg', 'jpeg', 'png', 'webp'];
+    const ext = fileExtension.toLowerCase();
+    if (!allowedExts.includes(ext)) {
+      throw new BadRequestException("Invalid receipt file type. Only JPG, JPEG, PNG, and WebP images are allowed.");
+    }
+    if (fileBuffer.length > 5 * 1024 * 1024) {
+      throw new BadRequestException("Receipt image size must not exceed 5MB.");
+    }
+
+    // B. SHA256 hash deduplication check
+    const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    const existingReceipts = await this.dataSource.query(
+      "SELECT id FROM order_payment_receipts WHERE file_hash = $1 LIMIT 1;",
+      [fileHash]
+    );
+    if (existingReceipts.length > 0) {
+      return { success: true, message: 'Receipt already uploaded previously.', receiptId: existingReceipts[0].id };
+    }
+
+    const fileName = `remain_${crypto.randomUUID()}.${ext}`;
     
+    // C. Save receipt file
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
@@ -2560,9 +2949,8 @@ export class ApiService implements OnModuleInit {
           Bucket: process.env.S3_ASSETS_BUCKET,
           Key: `uploads/${fileName}`,
           Body: fileBuffer,
-          ContentType: `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
+          ContentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`
         }));
-        console.log(`[S3] Customer uploaded remaining screenshot ${fileName} to bucket ${process.env.S3_ASSETS_BUCKET}`);
       } catch (err: any) {
         console.error(`[S3] Failed to upload remaining screenshot to S3: ${err.message}`);
         throw err;
@@ -2572,32 +2960,61 @@ export class ApiService implements OnModuleInit {
       fs.writeFileSync(filePath, fileBuffer);
     }
 
-    await this.dataSource.query(`
-      UPDATE orders
-      SET advance_screenshot_url = $1,
-          status = 'Verification Pending',
-          updated_at = NOW()
-      WHERE id = $2;
-    `, [fileName, orderId]);
+    // Resolve user email
+    const userRows = await this.dataSource.query("SELECT email FROM users WHERE id = $1", [userId]);
+    const userEmail = userRows[0]?.email || 'User';
 
-    await this.createSystemNotification(
-      'Pre-Order: Remaining Payment Uploaded',
-      `Customer has uploaded remaining payment receipt for Order ${orderId.slice(0, 8)}. Verification required.`,
-      'payment',
-      orderId
-    );
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    await this.writeAuditLog(
-      'PREORDER_REMAINING_SUBMITTED',
-      'orders',
-      orderId,
-      'Customer',
-      ipAddress,
-      order,
-      { status: 'Verification Pending', advance_screenshot_url: fileName }
-    );
+    try {
+      // D. Insert receipt record
+      const receiptRes = await queryRunner.query(`
+        INSERT INTO order_payment_receipts (order_id, screenshot_url, file_hash, status, uploaded_by)
+        VALUES ($1, $2, $3, 'Pending', $4)
+        RETURNING id;
+      `, [orderId, fileName, fileHash, userId]);
+      const receiptId = receiptRes[0].id;
 
-    return { success: true };
+      // E. Update order status to Awaiting Confirmation
+      await queryRunner.query(`
+        UPDATE orders
+        SET advance_screenshot_url = $1,
+            status = 'Awaiting Confirmation',
+            updated_at = NOW()
+        WHERE id = $2;
+      `, [fileName, orderId]);
+
+      // F. Insert Payment Event record
+      await queryRunner.query(`
+        INSERT INTO payment_events (order_id, event_type, receipt_id, details, performed_by)
+        VALUES ($1, 'RECEIPT_UPLOADED', $2, 'Uploaded remaining payment confirmation receipt screenshot', $3);
+      `, [orderId, receiptId, userEmail]);
+
+      // G. Insert Order Event record
+      await queryRunner.query(`
+        INSERT INTO order_events (order_id, event_type, previous_status, new_status, details, performed_by)
+        VALUES ($1, 'STATUS_CHANGE', 'Awaiting Stock', 'Awaiting Confirmation', 'Remaining payment confirmation receipt uploaded, awaiting admin review', $3);
+      `, [orderId, userEmail]);
+
+      await queryRunner.commitTransaction();
+
+      await this.createSystemNotification(
+        'Pre-Order: Remaining Payment Uploaded',
+        `Customer has uploaded remaining payment receipt for Order ${orderId.slice(0, 8)}. Verification required.`,
+        'payment',
+        orderId
+      );
+
+      return { success: true };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      console.error("[Screenshot] Remaining payment transaction failed:", e.message);
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
   }
 
   // ── FORMAL RECEIPT DATA GENERATOR ─────────────────────────────────
@@ -4505,6 +4922,165 @@ export class ApiService implements OnModuleInit {
       return { success: false, error: err.message };
     }
   }
+
+  async reconcileVariantInventory(variantId: string, actualCount: number, reason: string, adminEmail: string, ipAddress: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // 1. Lock the variant FOR UPDATE
+      const varRows = await queryRunner.query(`
+        SELECT id, product_id, total_stock, version 
+        FROM product_variants 
+        WHERE id = $1 AND deleted_at IS NULL 
+        FOR UPDATE;
+      `, [variantId]);
+
+      if (varRows.length === 0) {
+        throw new BadRequestException("Target variant does not exist or has been archived.");
+      }
+
+      const pv = varRows[0];
+      const productId = pv.product_id;
+
+      // 2. Lock and fetch batches FOR UPDATE
+      const batches = await queryRunner.query(`
+        SELECT id, purchase_price, quantity_available, quantity_reserved 
+        FROM inventory_batches 
+        WHERE variant_id = $1 
+        FOR UPDATE;
+      `, [variantId]);
+
+      const systemCount = batches.reduce((sum, b) => sum + Number(b.quantity_available), 0);
+      const variance = actualCount - systemCount;
+
+      if (variance > 0) {
+        // Find latest batch to allocate extra stock
+        const latestBatchRes = await queryRunner.query(`
+          SELECT id, purchase_price 
+          FROM inventory_batches 
+          WHERE variant_id = $1 
+          ORDER BY received_at DESC, id DESC 
+          LIMIT 1;
+        `, [variantId]);
+
+        let targetBatchId: string;
+        let purchasePrice = 0.00;
+
+        if (latestBatchRes.length > 0) {
+          targetBatchId = latestBatchRes[0].id;
+          purchasePrice = Number(latestBatchRes[0].purchase_price);
+          await queryRunner.query(`
+            UPDATE inventory_batches 
+            SET quantity_available = quantity_available + $1, 
+                updated_at = NOW() 
+            WHERE id = $2;
+          `, [variance, targetBatchId]);
+        } else {
+          // Create default adjustment batch
+          const newBatchRes = await queryRunner.query(`
+            INSERT INTO inventory_batches (variant_id, quantity_received, quantity_available, quantity_reserved, quantity_sold, quantity_returned, quantity_damaged, purchase_price, received_at, status)
+            VALUES ($1, $2, $2, 0, 0, 0, 0, 0.00, NOW(), 'Active')
+            RETURNING id;
+          `, [variantId, variance]);
+          targetBatchId = newBatchRes[0].id;
+        }
+
+        // Increment variant total_stock and increment version
+        await queryRunner.query(`
+          UPDATE product_variants 
+          SET total_stock = total_stock + $1, 
+              version = version + 1, 
+              updated_at = NOW() 
+          WHERE id = $2;
+        `, [variance, variantId]);
+
+        // Insert ledger ADJUST_ADD
+        await queryRunner.query(`
+          INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, reason, performed_by)
+          VALUES ($1, $2, 'ADJUST_ADD', $3, $4, $5, $6);
+        `, [variantId, targetBatchId, variance, purchasePrice, reason || 'Cycle Count Stock Increase', adminEmail]);
+
+      } else if (variance < 0) {
+        // Deplete from active batches in FIFO order
+        const activeBatches = await queryRunner.query(`
+          SELECT id, purchase_price, quantity_available 
+          FROM inventory_batches 
+          WHERE variant_id = $1 AND quantity_available > 0 
+          ORDER BY received_at ASC 
+          FOR UPDATE;
+        `, [variantId]);
+
+        let remainingToReduce = Math.abs(variance);
+        for (const b of activeBatches) {
+          if (remainingToReduce <= 0) break;
+          const reduceQty = Math.min(remainingToReduce, Number(b.quantity_available));
+          
+          await queryRunner.query(`
+            UPDATE inventory_batches 
+            SET quantity_available = quantity_available - $1, 
+                status = CASE WHEN quantity_available - $1 = 0 THEN 'Fully Consumed'::VARCHAR ELSE status END, 
+                updated_at = NOW() 
+            WHERE id = $2;
+          `, [reduceQty, b.id]);
+
+          // Insert ledger ADJUST_REMOVE
+          await queryRunner.query(`
+            INSERT INTO inventory_ledger (variant_id, batch_id, type, quantity_changed, purchase_price, reason, performed_by)
+            VALUES ($1, $2, 'ADJUST_REMOVE', $3, $4, $5, $6);
+          `, [variantId, b.id, -reduceQty, Number(b.purchase_price), reason || 'Cycle Count Shrinkage Depletion', adminEmail]);
+
+          remainingToReduce -= reduceQty;
+        }
+
+        // Decrement variant total_stock and increment version
+        await queryRunner.query(`
+          UPDATE product_variants 
+          SET total_stock = GREATEST(0, total_stock - $1), 
+              version = version + 1, 
+              updated_at = NOW() 
+          WHERE id = $2;
+        `, [Math.abs(variance), variantId]);
+      }
+
+      // Sync parent products aggregate cache
+      await queryRunner.query(`
+        UPDATE products p
+        SET total_stock = (SELECT COALESCE(SUM(total_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+            updated_at = NOW()
+        WHERE p.id = $1;
+      `, [productId]);
+
+      // Record in reconciliations audit table
+      await queryRunner.query(`
+        INSERT INTO reconciliations (variant_id, system_count, actual_count, variance, reason, performed_by)
+        VALUES ($1, $2, $3, $4, $5, $6);
+      `, [variantId, systemCount, actualCount, variance, reason || 'Cycle Count', adminEmail]);
+
+      await queryRunner.commitTransaction();
+      localCache.del('products_list_true');
+      localCache.del('products_list_false');
+
+      await this.writeAuditLog(
+        'RECONCILE_CYCLE_COUNT',
+        'product_variants',
+        variantId,
+        adminEmail,
+        ipAddress,
+        { systemCount },
+        { actualCount, variance, reason }
+      );
+
+      return { success: true, systemCount, actualCount, variance };
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      throw e;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
 
   async getSupplierPurchases(page = 1, limit = 10, search = "") {
     const offset = (page - 1) * limit;

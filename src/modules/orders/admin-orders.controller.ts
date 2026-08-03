@@ -10,10 +10,10 @@ import { validateFileSignature } from '../api/api.helpers.js';
 export class AdminOrdersController {
   constructor(private readonly apiService: ApiService) {}
 
-  private checkAdmin(req: any) {
+  private checkAdmin(req: any, allowedRoles: string[] = ['Owner', 'Admin']) {
     const role = req.user?.role;
-    if (role !== 'Owner' && role !== 'Admin') {
-      throw new UnauthorizedException('Administrative privileges required.');
+    if (!allowedRoles.includes(role)) {
+      throw new UnauthorizedException('Insufficient privileges for this action.');
     }
   }
 
@@ -25,7 +25,7 @@ export class AdminOrdersController {
     @Query('status') status: string,
     @Request() req: any
   ) {
-    this.checkAdmin(req);
+    this.checkAdmin(req, ['Owner', 'Admin', 'Warehouse']);
     const pNum = page ? parseInt(page, 10) : undefined;
     const lNum = limit ? parseInt(limit, 10) : undefined;
     if (pNum || lNum || search || status) {
@@ -52,11 +52,12 @@ export class AdminOrdersController {
     },
     @Request() req: any
   ) {
-    this.checkAdmin(req);
+    this.checkAdmin(req, ['Owner', 'Admin', 'Warehouse']);
+    const role = req.user?.role;
     if (dto.status === 'Confirmed') {
-      return this.apiService.adminConfirmOrder(id, req.user.email, req.ip);
+      return this.apiService.adminConfirmOrder(id, req.user.email, req.ip, role);
     }
-    return this.apiService.adminUpdateOrderStatus(id, dto, req.user.email, req.ip);
+    return this.apiService.adminUpdateOrderStatus(id, dto, req.user.email, req.ip, role);
   }
 
   @Post(':id/collect-remaining')
@@ -80,7 +81,7 @@ export class AdminOrdersController {
 
   @Get(':id/receipt')
   async getOrderReceipt(@Param('id') orderId: string, @Request() req: any) {
-    this.checkAdmin(req);
+    this.checkAdmin(req, ['Owner', 'Admin', 'Warehouse']);
     return this.apiService.generateReceiptForOrder(orderId);
   }
 
