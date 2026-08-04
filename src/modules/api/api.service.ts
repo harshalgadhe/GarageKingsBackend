@@ -1743,9 +1743,18 @@ async calculateCheckoutPricing(dto: any) {
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
-        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
+        const sessionToken = process.env.AWS_SESSION_TOKEN?.trim();
+        const s3 = new S3Client({
+          region: process.env.AWS_REGION?.trim() || 'ap-south-1',
+          ...(accessKeyId && secretAccessKey ? {
+            credentials: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
+          } : {})
+        });
+        const bucket = process.env.S3_ASSETS_BUCKET.trim();
         await s3.send(new PutObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: bucket,
           Key: `uploads/${fileName}`,
           Body: fileBuffer,
           ContentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`
@@ -1876,15 +1885,24 @@ async calculateCheckoutPricing(dto: any) {
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
-        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
+        const sessionToken = process.env.AWS_SESSION_TOKEN?.trim();
+        const bucket = process.env.S3_ASSETS_BUCKET.trim();
+        const s3 = new S3Client({
+          region: process.env.AWS_REGION?.trim() || 'ap-south-1',
+          ...(accessKeyId && secretAccessKey ? {
+            credentials: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
+          } : {})
+        });
         await s3.send(new PutObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: bucket,
           Key: `uploads/${fileName}`,
           Body: fileBuffer,
           ContentType: mimetype
         }));
         console.log(`[S3] Uploaded public image: ${fileName}`);
-        return `https://${process.env.S3_ASSETS_BUCKET}.s3.amazonaws.com/uploads/${fileName}`;
+        return `https://${bucket}.s3.amazonaws.com/uploads/${fileName}`;
       } catch (err: any) {
         console.error(`[S3] uploadImage failed: ${err.message}`);
       }
@@ -1898,9 +1916,17 @@ async calculateCheckoutPricing(dto: any) {
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
-        const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
+        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
+        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
+        const sessionToken = process.env.AWS_SESSION_TOKEN?.trim();
+        const s3 = new S3Client({
+          region: process.env.AWS_REGION?.trim() || 'ap-south-1',
+          ...(accessKeyId && secretAccessKey ? {
+            credentials: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
+          } : {})
+        });
         const res = await s3.send(new GetObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: process.env.S3_ASSETS_BUCKET.trim(),
           Key: `uploads/${filename}`
         }));
         return {
