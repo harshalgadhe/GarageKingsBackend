@@ -28,6 +28,14 @@ export class ApiService implements OnModuleInit {
       console.warn(`[onModuleInit] Failed to create privateUploadDir: ${err.message}`);
     }
 
+    // Schema changes and scheduled maintenance belong in migrations/workers,
+    // not Lambda cold starts. Running them in every concurrent container can
+    // occupy the single serverless database connection and starve requests.
+    if (isLambda) {
+      console.log('[onModuleInit] Skipping schema and scheduler bootstrap in Lambda.');
+      return;
+    }
+
     // Dynamic schema validation & correction fallback (insulates against missed runs)
     await this.dataSource.query(`
       CREATE TABLE IF NOT EXISTS global_settings (

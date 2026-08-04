@@ -1,6 +1,8 @@
 import { Injectable, InternalServerErrorException, OnModuleInit } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 
+const isLambda = !!(process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT || process.env.LAMBDA_RUNTIME_DIR);
+
 export interface CreateReceiptItemDto {
   description: string;
   qty: number;
@@ -28,6 +30,10 @@ export class ReceiptsService implements OnModuleInit {
   constructor(private readonly dataSource: DataSource) {}
 
   async onModuleInit() {
+    if (isLambda) {
+      console.log('[Receipts] Skipping startup schema checks in Lambda.');
+      return;
+    }
     console.log('[Receipts] Running database check/alteration for customer fallback columns...');
     try {
       await this.dataSource.query(`
