@@ -210,6 +210,29 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_role.name
 }
 
+# Allow the API Lambda to store and retrieve only application-managed assets.
+# Lambda supplies short-lived execution-role credentials automatically, so no
+# long-lived AWS access keys are required in the function environment.
+resource "aws_iam_role_policy" "lambda_s3_assets" {
+  name = "gk-${var.environment}-lambda-s3-assets"
+  role = aws_iam_role.lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadWriteUploadedAssets"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject"
+        ]
+        Resource = "${aws_s3_bucket.assets_bucket.arn}/uploads/*"
+      }
+    ]
+  })
+}
+
 # Lambda Function URL (Always Free routing!)
 resource "aws_lambda_function" "api_monolith" {
   function_name = "gk-${var.environment}-api-prod"

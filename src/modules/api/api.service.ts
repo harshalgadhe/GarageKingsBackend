@@ -1743,14 +1743,8 @@ async calculateCheckoutPricing(dto: any) {
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
-        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
-        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
-        const sessionToken = process.env.AWS_SESSION_TOKEN?.trim();
         const s3 = new S3Client({
-          region: process.env.AWS_REGION?.trim() || 'ap-south-1',
-          ...(accessKeyId && secretAccessKey ? {
-            credentials: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
-          } : {})
+          region: process.env.AWS_REGION?.trim() || 'ap-south-1'
         });
         const bucket = process.env.S3_ASSETS_BUCKET.trim();
         await s3.send(new PutObjectCommand({
@@ -1885,15 +1879,9 @@ async calculateCheckoutPricing(dto: any) {
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
-        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
-        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
-        const sessionToken = process.env.AWS_SESSION_TOKEN?.trim();
         const bucket = process.env.S3_ASSETS_BUCKET.trim();
         const s3 = new S3Client({
-          region: process.env.AWS_REGION?.trim() || 'ap-south-1',
-          ...(accessKeyId && secretAccessKey ? {
-            credentials: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
-          } : {})
+          region: process.env.AWS_REGION?.trim() || 'ap-south-1'
         });
         await s3.send(new PutObjectCommand({
           Bucket: bucket,
@@ -1916,14 +1904,8 @@ async calculateCheckoutPricing(dto: any) {
     if (process.env.S3_ASSETS_BUCKET) {
       try {
         const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
-        const accessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim();
-        const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim();
-        const sessionToken = process.env.AWS_SESSION_TOKEN?.trim();
         const s3 = new S3Client({
-          region: process.env.AWS_REGION?.trim() || 'ap-south-1',
-          ...(accessKeyId && secretAccessKey ? {
-            credentials: { accessKeyId, secretAccessKey, ...(sessionToken ? { sessionToken } : {}) }
-          } : {})
+          region: process.env.AWS_REGION?.trim() || 'ap-south-1'
         });
         const res = await s3.send(new GetObjectCommand({
           Bucket: process.env.S3_ASSETS_BUCKET.trim(),
