@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS products (
     release_date TIMESTAMP WITH TIME ZONE,
     status VARCHAR(50) DEFAULT 'Draft',
     show_on_homepage BOOLEAN DEFAULT TRUE,
+    is_featured BOOLEAN NOT NULL DEFAULT FALSE,
     max_qty_per_customer INT DEFAULT NULL,
     is_prebook BOOLEAN DEFAULT FALSE,
     prebook_deposit_amount NUMERIC(12, 2) DEFAULT NULL,
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS products (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_products_brand_model ON products(brand, model_name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_single_featured ON products(is_featured) WHERE is_featured = TRUE AND deleted_at IS NULL;
 
 -- 3.2 Casing Types Table (Relational Casing Normalization)
 CREATE TABLE IF NOT EXISTS casing_types (

@@ -3100,7 +3100,47 @@ async calculateCheckoutPricing(dto: any) {
   }
 
   // ── CUSTOMERS CRM MODULE ───────────────────────────────────────────
-  async getCustomers() {
+  async getCustomers(search?: string) {
+    if (search && search.trim()) {
+      const q = `%${search.trim()}%`;
+      return this.dataSource.query(`
+        SELECT DISTINCT ON (LOWER(name)) *
+        FROM (
+          SELECT c.id, 
+                 c.full_name as name, 
+                 c.phone, 
+                 c.email, 
+                 c.instagram as insta, 
+                 c.address,
+                 c.created_at
+          FROM customers c
+          WHERE c.deleted_at IS NULL AND (
+            LOWER(c.full_name) LIKE LOWER($1) OR
+            LOWER(c.phone) LIKE LOWER($1) OR
+            LOWER(c.email) LIKE LOWER($1) OR
+            LOWER(c.instagram) LIKE LOWER($1)
+          )
+          UNION ALL
+          SELECT r.id, 
+                 r.customer_name as name, 
+                 r.customer_phone as phone, 
+                 COALESCE(r.customer_email, '') as email, 
+                 r.customer_instagram as insta, 
+                 r.customer_address as address,
+                 r.created_at
+          FROM receipts r
+          WHERE r.customer_name IS NOT NULL AND r.customer_name != '' AND (
+            LOWER(r.customer_name) LIKE LOWER($1) OR
+            LOWER(r.customer_phone) LIKE LOWER($1) OR
+            LOWER(COALESCE(r.customer_email, '')) LIKE LOWER($1) OR
+            LOWER(r.customer_instagram) LIKE LOWER($1)
+          )
+        ) combined
+        ORDER BY LOWER(name), created_at DESC
+        LIMIT 15;
+      `, [q]);
+    }
+
     return this.dataSource.query(`
       SELECT c.id, c.full_name as name, c.instagram as "instagramUsername", c.phone, c.email, c.city, c.notes, c.created_at as "createdAt",
              COALESCE(COUNT(o.id) FILTER (WHERE o.status = 'Confirmed' OR o.status = 'Shipped' OR o.status = 'Delivered'), 0) as "totalOrders",
@@ -3109,6 +3149,7 @@ async calculateCheckoutPricing(dto: any) {
       FROM customers c
       LEFT JOIN users u ON u.email = c.email
       LEFT JOIN orders o ON o.user_id = u.id
+      WHERE c.deleted_at IS NULL
       GROUP BY c.id
       ORDER BY "totalSpend" DESC;
     `);

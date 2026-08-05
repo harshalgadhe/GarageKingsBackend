@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 
 export interface CreateReceiptItemDto {
+  id?: string;
   description: string;
   qty: number;
   amount: number;
@@ -8,17 +9,21 @@ export interface CreateReceiptItemDto {
 }
 
 export interface CreateReceiptDto {
+  id?: string;
   receiptNumber: string;
-  customerId: string;
+  customerId?: string;
   formatType?: string;
   taxPercent?: number;
   shippingCharges?: number;
+  includeShipping?: boolean;
   advancePaid?: number;
   pendingBalance?: number;
   footerNote?: string;
   items: CreateReceiptItemDto[];
   customerName?: string;
   customerPhone?: string;
+  customerEmail?: string;
+  customerInsta?: string;
   customerInstagram?: string;
   customerAddress?: string;
 }
@@ -36,14 +41,15 @@ export function validateCreateReceipt(dto: CreateReceiptDto) {
   for (const item of dto.items) {
     const qty = Number(item?.qty);
     const amount = Number(item?.amount);
-    if (!item?.description?.trim() || item.description.trim().length > 500) {
-      throw new BadRequestException('Every line item needs a valid description.');
+    const desc = item?.description?.trim();
+    if (!desc || desc.length > 500) {
+      throw new BadRequestException('Every line item must have a valid description (1 to 500 characters).');
     }
     if (!Number.isInteger(qty) || qty < 1 || qty > 1000) {
-      throw new BadRequestException(`Invalid quantity for "${item.description}".`);
+      throw new BadRequestException(`Invalid quantity for "${desc}".`);
     }
     if (!Number.isFinite(amount) || amount < 0 || amount > 100000000) {
-      throw new BadRequestException(`Invalid amount for "${item.description}".`);
+      throw new BadRequestException(`Invalid amount for "${desc}".`);
     }
   }
   for (const [label, value] of [
@@ -65,3 +71,4 @@ export function validateVoidReceipt(dto: VoidReceiptDto) {
   }
   return reason;
 }
+

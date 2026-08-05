@@ -16,14 +16,14 @@ export class ProductsService {
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
-         is_prebook as "isPrebook",
+         is_prebook as "isPrebook", is_featured as "isFeatured",
          COALESCE(customer_eta, arrival_date) as "customerEta",
          image, created_at`
       : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          (COALESCE(stock, total_stock, 0) <= 0) as "isSoldOut",
-         is_prebook as "isPrebook",
+         is_prebook as "isPrebook", is_featured as "isFeatured",
          COALESCE(customer_eta, arrival_date) as "customerEta",
          image, created_at`;
 
@@ -50,6 +50,7 @@ export class ProductsService {
     search?: string;
     inStock?: boolean;
     preBooking?: boolean;
+    featured?: boolean;
     adminMode?: boolean;
     userAgent?: string;
   }) {
@@ -66,23 +67,27 @@ export class ProductsService {
       : (settings.marketplaceDesktopInitialPageSize || 12);
 
     const maxLimit = options.adminMode ? 100 : 50;
-    const limit = Math.max(1, Math.min(maxLimit, Number(options.limit || defaultPageSize)));
-    const page = Math.max(1, Number(options.page || 1));
-    const offset = options.offset !== undefined ? Number(options.offset) : (page - 1) * limit;
+    const rawLimit = Number(options.limit);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(maxLimit, rawLimit) : (options.adminMode ? 10 : defaultPageSize);
+    const rawPage = Number(options.page);
+    const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+    const offset = options.offset !== undefined && Number.isFinite(Number(options.offset)) 
+      ? Math.max(0, Number(options.offset)) 
+      : (page - 1) * limit;
 
     const selectFields = options.adminMode
       ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
-         is_prebook as "isPrebook",
+         is_prebook as "isPrebook", is_featured as "isFeatured",
          COALESCE(customer_eta, arrival_date) as "customerEta",
          image, created_at`
       : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          (COALESCE(stock, total_stock, 0) <= 0) as "isSoldOut",
-         is_prebook as "isPrebook",
+         is_prebook as "isPrebook", is_featured as "isFeatured",
          COALESCE(customer_eta, arrival_date) as "customerEta",
          image, created_at`;
 
@@ -117,14 +122,15 @@ export class ProductsService {
       paramIndex++;
     }
 
-    if (options.search) {
+    const searchTrimmed = typeof options.search === 'string' ? options.search.trim() : '';
+    if (searchTrimmed.length > 0) {
       queryStr += ` AND (
         LOWER(model_name) LIKE LOWER($${paramIndex}) OR
         LOWER(brand) LIKE LOWER($${paramIndex}) OR
         LOWER(series) LIKE LOWER($${paramIndex}) OR
         LOWER(sku) LIKE LOWER($${paramIndex})
       )`;
-      params.push(`%${options.search}%`);
+      params.push(`%${searchTrimmed}%`);
       paramIndex++;
     }
 
@@ -134,6 +140,12 @@ export class ProductsService {
 
     if (options.preBooking) {
       queryStr += ` AND (is_prebook = true OR status = 'Pre-Order')`;
+    }
+
+    if (options.featured !== undefined) {
+      queryStr += ` AND is_featured = $${paramIndex}`;
+      params.push(Boolean(options.featured));
+      paramIndex++;
     }
 
     const countQuery = `SELECT COUNT(*)::int as total FROM (${queryStr}) as sub`;
@@ -150,7 +162,7 @@ export class ProductsService {
       total,
       page,
       limit,
-      totalPages: Math.ceil(total / limit)
+      totalPages: Math.ceil(total / limit) || 1
     };
   }
 
@@ -162,7 +174,7 @@ export class ProductsService {
     const queryStr = `
       SELECT id, sku, brand, model_name as name, series, scale, casing,
              casing as "casingType", description, tag, subtags, tags, category,
-             status, show_on_homepage as "showOnHomepage",
+             status, show_on_homepage as "showOnHomepage", is_featured as "isFeatured",
              max_qty_per_customer as "maxQtyPerCustomer",
              COALESCE(selling_price, base_price, 0.00) as "sellingPrice",
              COALESCE(selling_price, base_price, 0.00) as price,

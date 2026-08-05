@@ -451,9 +451,9 @@ export class ApiController {
   // ── CRM CUSTOMERS REST ENDPOINTS ─────────────────────────────────────
   @Get('customers')
   @UseGuards(AuthGuard('jwt'))
-  async getCustomers(@Request() req: any) {
+  async getCustomers(@Query('search') search: string, @Request() req: any) {
     this.checkAdmin(req);
-    return this.apiService.getCustomers();
+    return this.apiService.getCustomers(search);
   }
 
   // ── CUSTOMER PROFILE & ORDERS REST ENDPOINTS ─────────────────────────

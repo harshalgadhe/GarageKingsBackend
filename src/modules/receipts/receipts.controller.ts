@@ -3,7 +3,7 @@ import { AuthGuard } from '@nestjs/passport';
 import { ReceiptsService } from './receipts.service.js';
 import { CreateReceiptDto, VoidReceiptDto } from './receipts.dto.js';
 
-@Controller('api/v1/receipts')
+@Controller(['api/v1/receipts', 'api/v1/admin/receipts'])
 @UseGuards(AuthGuard('jwt'))
 export class ReceiptsController {
   constructor(private readonly receiptsService: ReceiptsService) {}
@@ -45,6 +45,16 @@ export class ReceiptsController {
   async getReceiptById(@Param('id') id: string, @Request() req: any) {
     this.checkAdmin(req);
     return this.receiptsService.getReceiptById(id);
+  }
+
+  @Patch(':id')
+  async updateReceipt(
+    @Param('id') id: string,
+    @Body() dto: CreateReceiptDto,
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    return this.receiptsService.updateReceipt(id, dto, req.user.email);
   }
 
   @Patch(':id/void')

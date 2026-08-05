@@ -24,13 +24,29 @@ export class AdminProductsController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
     @Query('search') search?: string,
+    @Query('brand') brand?: string,
+    @Query('scale') scale?: string,
+    @Query('tag') tag?: string,
+    @Query('inStock') inStock?: string,
+    @Query('preBooking') preBooking?: string,
+    @Query('featured') featured?: string,
     @Request() req?: any
   ) {
     this.checkAdmin(req);
+    const parsedPage = page !== undefined && page !== null ? Math.max(1, parseInt(String(page), 10) || 1) : 1;
+    const parsedLimit = limit !== undefined && limit !== null ? Math.max(1, Math.min(100, parseInt(String(limit), 10) || 10)) : 10;
+    const searchClean = typeof search === 'string' ? search.trim() : undefined;
+
     const result = await this.productsService.getPaginatedProducts({
-      page: page ? parseInt(page, 10) : undefined,
-      limit: limit ? parseInt(limit, 10) : undefined,
-      search,
+      page: parsedPage,
+      limit: parsedLimit,
+      search: searchClean || undefined,
+      brand: brand?.trim() || undefined,
+      scale: scale?.trim() || undefined,
+      tag: tag?.trim() || undefined,
+      inStock: inStock === 'true',
+      preBooking: preBooking === 'true',
+      featured: featured !== undefined ? featured === 'true' : undefined,
       adminMode: true
     });
 

@@ -62,9 +62,9 @@ export class ReceiptsService {
         lineItemsSum += Number(item.amount) * parseInt(item.qty.toString(), 10);
       }
 
-      const shipping = Number(dto.shippingCharges || 0);
+      const shipping = dto.includeShipping !== false ? Number(dto.shippingCharges || 0) : 0;
       const taxRate = Number(dto.taxPercent || 0) / 100;
-      const taxVal = lineItemsSum * taxRate;
+      const taxVal = (lineItemsSum + shipping) * taxRate;
       const finalTotal = lineItemsSum + taxVal + shipping;
 
       const normalizedFormat = String(dto.formatType || 'standard').toLowerCase();
@@ -74,29 +74,71 @@ export class ReceiptsService {
       const balance = isPrebooking ? Number(dto.pendingBalance || 0) : 0;
       const orderTotal = finalTotal + balance;
 
-      // 2. Resolve/seed Guest Customer and Guest User
-      const phoneVal = (dto.customerPhone || '').trim() || '0000000000';
-      const emailClean = (dto.customerPhone 
-        ? `${dto.customerPhone.trim()}@guest.garagekings.in` 
-        : `guest_${Date.now()}_${Math.floor(Math.random() * 1000)}@guest.garagekings.in`
-      ).toLowerCase();
+      // 2. Resolve/seed Customer and User ONLY if real customer details are provided
+      const custName = dto.customerName?.trim() || null;
+      const custPhone = dto.customerPhone?.trim() || null;
+      const custEmail = dto.customerEmail?.trim()?.toLowerCase() || null;
+      const custInsta = (dto.customerInstagram || dto.customerInsta || '')?.trim() || null;
+      const custAddress = dto.customerAddress?.trim() || null;
 
-      const custRes = await queryRunner.query(`
-        INSERT INTO customers (full_name, phone, instagram, address, email, city)
-        VALUES ($1, $2, $3, $4, $5, 'Unknown')
-        ON CONFLICT (email) DO UPDATE 
-        SET full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, instagram = EXCLUDED.instagram, address = EXCLUDED.address
-        RETURNING id;
-      `, [dto.customerName || 'Guest Customer', phoneVal, dto.customerInstagram || '', dto.customerAddress || '', emailClean]);
-      const customerId = custRes[0].id;
+      let customerId: string | null = null;
+      let userId: string | null = null;
 
-      const userRes = await queryRunner.query(`
-        INSERT INTO users (email, cognito_sub)
-        VALUES ($1, $2)
-        ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-        RETURNING id;
-      `, [emailClean, `guest_${customerId}`]);
-      const userId = userRes[0].id;
+      if (custName || custPhone || custEmail || custInsta || custAddress) {
+        if (custEmail) {
+          const custRes = await queryRunner.query(`
+            INSERT INTO customers (full_name, phone, instagram, address, email)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (email) DO UPDATE 
+            SET full_name = COALESCE(EXCLUDED.full_name, customers.full_name),
+                phone = COALESCE(EXCLUDED.phone, customers.phone),
+                instagram = COALESCE(EXCLUDED.instagram, customers.instagram),
+                address = COALESCE(EXCLUDED.address, customers.address)
+            RETURNING id;
+          `, [custName, custPhone, custInsta, custAddress, custEmail]);
+          customerId = custRes[0]?.id || null;
+
+          const userRes = await queryRunner.query(`
+            INSERT INTO users (email, cognito_sub)
+            VALUES ($1, $2)
+            ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+            RETURNING id;
+          `, [custEmail, `user_${customerId || Date.now()}`]);
+          userId = userRes[0]?.id || null;
+        } else {
+          let existingCust = [];
+          if (custPhone) {
+            existingCust = await queryRunner.query(`
+              SELECT id FROM customers WHERE phone = $1 LIMIT 1;
+            `, [custPhone]);
+          }
+          if (existingCust.length === 0 && custName) {
+            existingCust = await queryRunner.query(`
+              SELECT id FROM customers WHERE LOWER(full_name) = LOWER($1) LIMIT 1;
+            `, [custName]);
+          }
+
+          if (existingCust.length > 0) {
+            customerId = existingCust[0].id;
+            await queryRunner.query(`
+              UPDATE customers
+              SET full_name = COALESCE($2, full_name),
+                  phone = COALESCE($3, phone),
+                  instagram = COALESCE($4, instagram),
+                  address = COALESCE($5, address),
+                  updated_at = NOW()
+              WHERE id = $1;
+            `, [customerId, custName, custPhone, custInsta, custAddress]);
+          } else {
+            const custRes = await queryRunner.query(`
+              INSERT INTO customers (full_name, phone, instagram, address)
+              VALUES ($1, $2, $3, $4)
+              RETURNING id;
+            `, [custName, custPhone, custInsta, custAddress]);
+            customerId = custRes[0]?.id || null;
+          }
+        }
+      }
 
       // 3. Create parent Pending/Confirmed order record
       const orderStatus = isPrebooking ? 'Pre-Order' : 'Confirmed';
@@ -105,7 +147,7 @@ export class ReceiptsService {
         INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
         RETURNING id;
-      `, [userId, orderTotal, `${dto.customerAddress || ''} | Insta: ${dto.customerInstagram || ''} | Phone: ${dto.customerPhone || ''}`, orderStatus, bookingType, advance, balance]);
+      `, [userId, orderTotal, `${custAddress || ''} | Insta: ${custInsta || ''} | Phone: ${custPhone || ''}`, orderStatus, bookingType, advance, balance]);
       const orderId = orderRes[0].id;
 
       // 4. Process line items: check stock, insert order_items, decrement inventory
@@ -153,8 +195,8 @@ export class ReceiptsService {
 
       // 5. Insert receipt row metadata linked to order_id
       const receiptInsertQuery = `
-        INSERT INTO receipts (receipt_number, customer_id, order_id, format_type, tax_percent, tax_amount, shipping_charges, total_amount, advance_paid, pending_balance, footer_note, customer_name, customer_phone, customer_instagram, customer_address)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        INSERT INTO receipts (receipt_number, customer_id, order_id, format_type, tax_percent, tax_amount, shipping_charges, total_amount, advance_paid, pending_balance, footer_note, customer_name, customer_phone, customer_email, customer_instagram, customer_address)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING id, created_at;
       `;
       const receiptRes = await queryRunner.query(receiptInsertQuery, [
@@ -171,6 +213,7 @@ export class ReceiptsService {
         dto.footerNote || null,
         dto.customerName || null,
         dto.customerPhone || null,
+        custEmail || null,
         dto.customerInstagram || null,
         dto.customerAddress || null
       ]);
@@ -211,21 +254,16 @@ export class ReceiptsService {
       // COMMIT TRANSACTION
       await queryRunner.commitTransaction();
 
-      return {
-        success: true,
-        receiptId,
-        receiptNumber: dto.receiptNumber,
-        totalAmount: finalTotal,
-        pendingBalance: balance,
-        createdAt: receiptRes[0].created_at,
-        orderId
-      };
+      return await this.getReceiptById(receiptId);
 
     } catch (error: any) {
       // ROLLBACK SQL TRANSACTION ON ERROR TO KEEP DB IMMUTABLE
       await queryRunner.rollbackTransaction();
       console.error('TypeORM QueryRunner Rolled Back:', error);
       if (error instanceof HttpException) throw error;
+      if (error?.code === '23505') {
+        throw new ConflictException('That receipt number is already in use.');
+      }
       throw new InternalServerErrorException(error.message || 'Receipt Generation failed.');
     } finally {
       // CRITICAL: Always release QueryRunner to return connection pool!
@@ -239,6 +277,7 @@ export class ReceiptsService {
         SELECT r.*, 
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone, 
+               COALESCE(r.customer_email, c.email) as customer_email, 
                COALESCE(r.customer_address, c.address) as customer_address,
                COALESCE(r.customer_instagram, c.instagram) as customer_instagram
         FROM receipts r
@@ -251,7 +290,7 @@ export class ReceiptsService {
       const receipt = rows[0];
 
       receipt.items = await this.dataSource.query(`
-        SELECT * FROM receipt_items WHERE receipt_id = $1 ORDER BY id ASC;
+        SELECT id, receipt_id, description, qty, amount FROM receipt_items WHERE receipt_id = $1 ORDER BY id ASC;
       `, [id]);
 
       return receipt;
@@ -261,14 +300,150 @@ export class ReceiptsService {
     }
   }
 
+  async updateReceipt(id: string, dto: CreateReceiptDto, adminEmail: string) {
+    validateCreateReceipt(dto);
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const existingRows = await queryRunner.query(`
+        SELECT id, order_id, receipt_number
+        FROM receipts
+        WHERE id = $1
+        FOR UPDATE;
+      `, [id]);
+      if (!existingRows.length) throw new NotFoundException('Receipt not found.');
+
+      if (dto.receiptNumber.trim() !== existingRows[0].receipt_number) {
+        const dup = await queryRunner.query(`
+          SELECT id FROM receipts WHERE receipt_number = $1 AND id != $2 LIMIT 1;
+        `, [dto.receiptNumber.trim(), id]);
+        if (dup.length > 0) {
+          throw new ConflictException('That receipt number is already in use by another receipt.');
+        }
+      }
+
+      const lineItemsSum = dto.items.reduce(
+        (sum, item) => sum + (Number(item.amount) * Number(item.qty)),
+        0
+      );
+      const shipping = dto.includeShipping !== false ? Number(dto.shippingCharges || 0) : 0;
+      const taxRate = Number(dto.taxPercent || 0) / 100;
+      const taxVal = (lineItemsSum + shipping) * taxRate;
+      const finalTotal = lineItemsSum + taxVal + shipping;
+      const normalizedFormat = String(dto.formatType || 'standard').toLowerCase();
+      const isPrebooking = ['prebooking', 'pre_order', 'po'].includes(normalizedFormat);
+      const receiptFormat = isPrebooking ? 'prebooking' : normalizedFormat;
+      const advance = isPrebooking ? Number(dto.advancePaid ?? finalTotal) : finalTotal;
+      const balance = isPrebooking ? Number(dto.pendingBalance || 0) : 0;
+
+      await queryRunner.query(`
+        UPDATE receipts
+        SET receipt_number = $2,
+            format_type = $3,
+            tax_percent = $4,
+            tax_amount = $5,
+            shipping_charges = $6,
+            total_amount = $7,
+            advance_paid = $8,
+            pending_balance = $9,
+            footer_note = $10,
+            customer_name = $11,
+            customer_phone = $12,
+            customer_email = $13,
+            customer_instagram = $14,
+            customer_address = $15,
+            updated_at = NOW()
+        WHERE id = $1;
+      `, [
+        id,
+        dto.receiptNumber.trim(),
+        receiptFormat,
+        Number(dto.taxPercent || 0),
+        taxVal,
+        shipping,
+        finalTotal,
+        advance,
+        balance,
+        dto.footerNote || null,
+        dto.customerName || null,
+        dto.customerPhone || null,
+        dto.customerEmail || null,
+        dto.customerInstagram || null,
+        dto.customerAddress || null
+      ]);
+
+      await queryRunner.query('DELETE FROM receipt_items WHERE receipt_id = $1;', [id]);
+      for (const item of dto.items) {
+        await queryRunner.query(`
+          INSERT INTO receipt_items (receipt_id, description, qty, amount)
+          VALUES ($1, $2, $3, $4);
+        `, [id, item.description.trim(), Number(item.qty), Number(item.amount)]);
+      }
+
+      const orderId = existingRows[0].order_id;
+      if (orderId) {
+        await queryRunner.query(`
+          UPDATE orders
+          SET total_price = $2,
+              booking_type = $3,
+              advance_amount = $4,
+              remaining_amount = $5,
+              updated_at = NOW()
+          WHERE id = $1;
+        `, [orderId, finalTotal + balance, isPrebooking ? 'pre_order' : 'standard', advance, balance]);
+      }
+
+      await queryRunner.query(`
+        INSERT INTO audit_logs (action, entity, entity_id, after_state)
+        VALUES ('RECEIPT_UPDATED', 'receipts', $1, $2);
+      `, [
+        id,
+        JSON.stringify({
+          receiptNumber: dto.receiptNumber.trim(),
+          totalAmount: finalTotal,
+          updatedBy: adminEmail
+        })
+      ]);
+
+      await queryRunner.commitTransaction();
+      return await this.getReceiptById(id);
+    } catch (error: any) {
+      await queryRunner.rollbackTransaction();
+      if (error instanceof HttpException) throw error;
+      if (error?.code === '23505') {
+        throw new ConflictException('That receipt number is already in use.');
+      }
+      console.error('updateReceipt failed:', error);
+      throw new InternalServerErrorException(error.message || 'Failed to update receipt.');
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   async getReceipts() {
     try {
       const receipts = await this.dataSource.query(`
-        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.advance_paid,
-               r.pending_balance, r.status,
+        SELECT r.id, r.receipt_number, r.format_type, r.tax_percent, r.tax_amount,
+               r.shipping_charges, r.total_amount, r.advance_paid,
+               r.pending_balance, r.footer_note, r.status,
                r.void_reason, r.voided_at, r.voided_by, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
-               COALESCE(r.customer_phone, c.phone) as customer_phone
+               COALESCE(r.customer_phone, c.phone) as customer_phone,
+               COALESCE(r.customer_email, c.email) as customer_email,
+               COALESCE(r.customer_instagram, c.instagram) as customer_instagram,
+               COALESCE(r.customer_address, c.address) as customer_address,
+               COALESCE((
+                 SELECT json_agg(json_build_object(
+                   'id', ri.id,
+                   'description', ri.description,
+                   'qty', ri.qty,
+                   'amount', ri.amount
+                 ) ORDER BY ri.id)
+                 FROM receipt_items ri
+                 WHERE ri.receipt_id = r.id
+               ), '[]'::json) as items
         FROM receipts r
         LEFT JOIN customers c ON r.customer_id = c.id
         ORDER BY r.created_at DESC;
@@ -298,10 +473,10 @@ export class ReceiptsService {
       if (options.search) {
         queryStr += ` AND (
             LOWER(r.receipt_number) LIKE LOWER($${paramIndex}) OR
-            LOWER(c.full_name) LIKE LOWER($${paramIndex}) OR
-            LOWER(c.phone) LIKE LOWER($${paramIndex}) OR
-            LOWER(r.customer_name) LIKE LOWER($${paramIndex}) OR
-            LOWER(r.customer_phone) LIKE LOWER($${paramIndex})
+            LOWER(COALESCE(r.customer_name, c.full_name)) LIKE LOWER($${paramIndex}) OR
+            LOWER(COALESCE(r.customer_phone, c.phone)) LIKE LOWER($${paramIndex}) OR
+            LOWER(COALESCE(r.customer_email, c.email)) LIKE LOWER($${paramIndex}) OR
+            LOWER(COALESCE(r.customer_instagram, c.instagram)) LIKE LOWER($${paramIndex})
         )`;
         params.push(`%${options.search}%`);
         paramIndex++;
@@ -312,11 +487,25 @@ export class ReceiptsService {
       const total = countRes[0]?.total || 0;
 
       const selectQuery = `
-        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.advance_paid,
-               r.pending_balance, r.status,
+        SELECT r.id, r.receipt_number, r.format_type, r.tax_percent, r.tax_amount,
+               r.shipping_charges, r.total_amount, r.advance_paid,
+               r.pending_balance, r.footer_note, r.status,
                r.void_reason, r.voided_at, r.voided_by, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
-               COALESCE(r.customer_phone, c.phone) as customer_phone
+               COALESCE(r.customer_phone, c.phone) as customer_phone,
+               COALESCE(r.customer_email, c.email) as customer_email,
+               COALESCE(r.customer_instagram, c.instagram) as customer_instagram,
+               COALESCE(r.customer_address, c.address) as customer_address,
+               COALESCE((
+                 SELECT json_agg(json_build_object(
+                   'id', ri.id,
+                   'description', ri.description,
+                   'qty', ri.qty,
+                   'amount', ri.amount
+                 ) ORDER BY ri.id)
+                 FROM receipt_items ri
+                 WHERE ri.receipt_id = r.id
+               ), '[]'::json) as items
         ${queryStr}
         ORDER BY r.created_at DESC
         LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
