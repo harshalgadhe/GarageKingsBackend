@@ -449,10 +449,17 @@ CREATE TABLE IF NOT EXISTS receipts (
     customer_instagram VARCHAR(100),
     customer_address TEXT,
     order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    status VARCHAR(30) NOT NULL DEFAULT 'Issued',
+    void_reason TEXT,
+    voided_at TIMESTAMP WITH TIME ZONE,
+    voided_by VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_receipts_num ON receipts(receipt_number);
 CREATE INDEX IF NOT EXISTS idx_receipts_customer ON receipts(customer_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_status_created ON receipts(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_receipts_pending_active ON receipts(pending_balance) WHERE status = 'Issued' AND pending_balance > 0;
 
 -- 9. Receipt Items Table
 CREATE TABLE IF NOT EXISTS receipt_items (

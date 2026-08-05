@@ -1,6 +1,7 @@
-import { Controller, Post, Get, Delete, Param, Body, Request, Query, UseGuards, ForbiddenException } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Patch, Param, Body, Request, Query, UseGuards, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
-import { ReceiptsService, CreateReceiptDto } from './receipts.service.js';
+import { ReceiptsService } from './receipts.service.js';
+import { CreateReceiptDto, VoidReceiptDto } from './receipts.dto.js';
 
 @Controller('api/v1/receipts')
 @UseGuards(AuthGuard('jwt'))
@@ -46,10 +47,16 @@ export class ReceiptsController {
     return this.receiptsService.getReceiptById(id);
   }
 
+  @Patch(':id/void')
+  async voidReceipt(@Param('id') id: string, @Body() dto: VoidReceiptDto, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.receiptsService.voidReceipt(id, dto, req.user.email);
+  }
+
   @Delete(':id')
   async deleteReceipt(@Param('id') id: string, @Request() req: any) {
     this.checkAdmin(req);
-    return this.receiptsService.deleteReceipt(id);
+    throw new BadRequestException('Receipts are financial records and cannot be deleted. Void the receipt instead.');
   }
 }
 export default ReceiptsController;

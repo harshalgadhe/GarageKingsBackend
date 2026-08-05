@@ -31,8 +31,8 @@ export class ApiService implements OnModuleInit {
     // Schema changes and scheduled maintenance belong in migrations/workers,
     // not Lambda cold starts. Running them in every concurrent container can
     // occupy the single serverless database connection and starve requests.
-    if (isLambda) {
-      console.log('[onModuleInit] Skipping schema and scheduler bootstrap in Lambda.');
+    if (process.env.RUN_LEGACY_STARTUP_MAINTENANCE !== 'true') {
+      console.log('[onModuleInit] Schema bootstrap and reconciliation skipped. Use versioned migrations and explicit maintenance jobs.');
       return;
     }
 
@@ -3492,6 +3492,26 @@ async calculateCheckoutPricing(dto: any) {
     const noPriceRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (selling_price IS NULL OR selling_price <= 0);');
     const productsWithoutPrice = noPriceRes[0].total;
 
+    const receiptExceptions = await this.dataSource.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE status = 'Issued' AND pending_balance > 0)::int AS "pendingReceiptCount",
+        COALESCE(SUM(pending_balance) FILTER (WHERE status = 'Issued' AND pending_balance > 0), 0)::float AS "pendingReceiptBalance",
+        COUNT(*) FILTER (WHERE status = 'Voided')::int AS "voidedReceiptCount"
+      FROM receipts;
+    `);
+    const failedReceiptJobs = await this.dataSource.query(`
+      SELECT COUNT(*)::int AS total
+      FROM receipt_generation_jobs
+      WHERE status = 'Failed' OR retry_count >= max_retries;
+    `);
+    const overduePurchases = await this.dataSource.query(`
+      SELECT COUNT(*)::int AS total
+      FROM supplier_purchases
+      WHERE status NOT IN ('Draft', 'Cancelled', 'Completed')
+        AND expected_arrival_date IS NOT NULL
+        AND expected_arrival_date < CURRENT_DATE;
+    `);
+
     // Gross profits & average margins
     const todayStart = new Date(); todayStart.setHours(0,0,0,0);
     const todayEnd = new Date(); todayEnd.setHours(23,59,59,999);
@@ -3558,6 +3578,11 @@ async calculateCheckoutPricing(dto: any) {
       preorderCount,
       productsWithoutSKU,
       productsWithoutPrice,
+      pendingReceiptCount: receiptExceptions[0].pendingReceiptCount,
+      pendingReceiptBalance: receiptExceptions[0].pendingReceiptBalance,
+      voidedReceiptCount: receiptExceptions[0].voidedReceiptCount,
+      failedReceiptJobs: failedReceiptJobs[0].total,
+      overduePurchaseOrders: overduePurchases[0].total,
       todayGrossProfit,
       monthlyGrossProfit,
       averageMargin

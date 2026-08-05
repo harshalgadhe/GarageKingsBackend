@@ -10,6 +10,7 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "migrate": "node src/bin/migrate.js",
+    "migrate:up": "node src/bin/migrate-incremental.js",
     "rollback": "node src/bin/rollback.js"
   },
   "dependencies": {

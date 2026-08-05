@@ -1,35 +1,13 @@
-import { BadRequestException, ConflictException, HttpException, Injectable, InternalServerErrorException, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
-
-const isLambda = !!(process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT || process.env.LAMBDA_RUNTIME_DIR);
-
-export interface CreateReceiptItemDto {
-  description: string;
-  qty: number;
-  amount: number;
-  productId?: string;
-}
-
-export interface CreateReceiptDto {
-  receiptNumber: string;
-  customerId: string;
-  formatType?: string;
-  taxPercent?: number;
-  shippingCharges?: number;
-  advancePaid?: number;
-  footerNote?: string;
-  items: CreateReceiptItemDto[];
-  customerName?: string;
-  customerPhone?: string;
-  customerInstagram?: string;
-  customerAddress?: string;
-}
+import { CreateReceiptDto, validateCreateReceipt, validateVoidReceipt, VoidReceiptDto } from './receipts.dto.js';
 
 @Injectable()
-export class ReceiptsService implements OnModuleInit {
+export class ReceiptsService {
   constructor(private readonly dataSource: DataSource) {}
 
   async onModuleInit() {
+    /* Schema changes are applied by npm run migrate:up before deployment.
     if (isLambda) {
       console.log('[Receipts] Skipping startup schema checks in Lambda.');
       return;
@@ -64,6 +42,7 @@ export class ReceiptsService implements OnModuleInit {
     } catch (err: any) {
       console.error('[Receipts] Failed to run receipts startup migrations:', err);
     }
+    */
   }
 
   /**
@@ -71,7 +50,7 @@ export class ReceiptsService implements OnModuleInit {
    * Executes invoice creation, maps line items, and updates inventory stock atomically.
    */
   async generateBillingReceipt(dto: CreateReceiptDto) {
-    this.validateReceipt(dto);
+    validateCreateReceipt(dto);
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -249,40 +228,6 @@ export class ReceiptsService implements OnModuleInit {
     }
   }
 
-  private validateReceipt(dto: CreateReceiptDto) {
-    if (!dto || !dto.receiptNumber?.trim()) {
-      throw new BadRequestException('Receipt number is required.');
-    }
-    if (dto.receiptNumber.trim().length > 100) {
-      throw new BadRequestException('Receipt number must be 100 characters or fewer.');
-    }
-    if (!Array.isArray(dto.items) || dto.items.length === 0 || dto.items.length > 100) {
-      throw new BadRequestException('A receipt must contain between 1 and 100 line items.');
-    }
-    for (const item of dto.items) {
-      const qty = Number(item?.qty);
-      const amount = Number(item?.amount);
-      if (!item?.description?.trim() || item.description.trim().length > 500) {
-        throw new BadRequestException('Every line item needs a valid description.');
-      }
-      if (!Number.isInteger(qty) || qty < 1 || qty > 1000) {
-        throw new BadRequestException(`Invalid quantity for "${item.description}".`);
-      }
-      if (!Number.isFinite(amount) || amount < 0 || amount > 100000000) {
-        throw new BadRequestException(`Invalid amount for "${item.description}".`);
-      }
-    }
-    for (const [label, value] of [
-      ['tax percentage', dto.taxPercent],
-      ['shipping charges', dto.shippingCharges],
-      ['advance paid', dto.advancePaid]
-    ] as const) {
-      if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
-        throw new BadRequestException(`Invalid ${label}.`);
-      }
-    }
-  }
-
   async getReceiptById(id: string) {
     try {
       const rows = await this.dataSource.query(`
@@ -314,7 +259,8 @@ export class ReceiptsService implements OnModuleInit {
   async getReceipts() {
     try {
       const receipts = await this.dataSource.query(`
-        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.created_at,
+        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.status,
+               r.void_reason, r.voided_at, r.voided_by, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone
         FROM receipts r
@@ -360,7 +306,8 @@ export class ReceiptsService implements OnModuleInit {
       const total = countRes[0]?.total || 0;
 
       const selectQuery = `
-        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.created_at,
+        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.status,
+               r.void_reason, r.voided_at, r.voided_by, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone
         ${queryStr}
@@ -383,15 +330,66 @@ export class ReceiptsService implements OnModuleInit {
   }
 
 
-  async deleteReceipt(id: string) {
+  async voidReceipt(id: string, dto: VoidReceiptDto, adminEmail: string) {
+    const reason = validateVoidReceipt(dto);
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
     try {
-      await this.dataSource.query(`
-        DELETE FROM receipts WHERE id = $1;
+      const rows = await queryRunner.query(`
+        SELECT id, order_id, status, receipt_number
+        FROM receipts WHERE id = $1 FOR UPDATE;
       `, [id]);
-      return { success: true };
-    } catch (error: any) {
-      console.error('deleteReceipt failed:', error);
-      throw new InternalServerErrorException(error.message || 'Failed to delete receipt.');
+      if (!rows.length) throw new NotFoundException('Receipt not found.');
+      const receipt = rows[0];
+      if (receipt.status === 'Voided') throw new ConflictException('This receipt has already been voided.');
+
+      if (receipt.order_id) {
+        const productColumn = await queryRunner.query(`
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = 'public' AND table_name = 'order_items' AND column_name = 'product_id';
+        `);
+        if (productColumn.length) {
+          const items = await queryRunner.query(`
+            SELECT product_id, qty FROM order_items
+            WHERE order_id = $1 AND product_id IS NOT NULL;
+          `, [receipt.order_id]);
+          for (const item of items) {
+            await queryRunner.query(`
+              UPDATE products
+              SET sold_stock = GREATEST(0, sold_stock - $1), updated_at = NOW()
+              WHERE id = $2;
+            `, [Number(item.qty), item.product_id]);
+            await queryRunner.query(`
+              UPDATE inventory
+              SET quantity_available = quantity_available + $1, updated_at = NOW()
+              WHERE product_id = $2;
+            `, [Number(item.qty), item.product_id]);
+          }
+        }
+        await queryRunner.query(`
+          UPDATE orders SET status = 'Cancelled', updated_at = NOW() WHERE id = $1;
+        `, [receipt.order_id]);
+      }
+
+      await queryRunner.query(`
+        UPDATE receipts
+        SET status = 'Voided', void_reason = $1, voided_at = NOW(), voided_by = $2, updated_at = NOW()
+        WHERE id = $3;
+      `, [reason, adminEmail, id]);
+      await queryRunner.query(`
+        INSERT INTO audit_logs (action, entity, entity_id, after_state)
+        VALUES ('RECEIPT_VOIDED', 'receipts', $1, $2);
+      `, [id, JSON.stringify({ receiptNumber: receipt.receipt_number, reason, voidedBy: adminEmail })]);
+
+      await queryRunner.commitTransaction();
+      return { success: true, id, status: 'Voided' };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      if (error instanceof HttpException) throw error;
+      throw new InternalServerErrorException('Failed to void receipt.');
+    } finally {
+      await queryRunner.release();
     }
   }
 }
