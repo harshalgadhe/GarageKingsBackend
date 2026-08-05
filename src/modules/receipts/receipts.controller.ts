@@ -1,12 +1,17 @@
-import { Controller, Post, Get, Delete, Param, Body, Request, Query } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Param, Body, Request, Query, UseGuards, ForbiddenException } from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
 import { ReceiptsService, CreateReceiptDto } from './receipts.service.js';
 
 @Controller('api/v1/receipts')
+@UseGuards(AuthGuard('jwt'))
 export class ReceiptsController {
   constructor(private readonly receiptsService: ReceiptsService) {}
 
   private checkAdmin(req: any) {
-    return true;
+    const role = req.user?.role;
+    if (role !== 'Owner' && role !== 'Admin') {
+      throw new ForbiddenException('Administrative privileges required.');
+    }
   }
 
   /**

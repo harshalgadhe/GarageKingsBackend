@@ -53,8 +53,13 @@ export class ProductsService {
     adminMode?: boolean;
     userAgent?: string;
   }) {
-    const rowsSettings = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
-    const settings = rowsSettings.length > 0 ? rowsSettings[0].value : {};
+    const settingsCacheKey = 'public_product_page_settings';
+    let settings = localCache.get(settingsCacheKey);
+    if (!settings) {
+      const rowsSettings = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
+      settings = rowsSettings.length > 0 ? rowsSettings[0].value : {};
+      localCache.set(settingsCacheKey, settings, 60);
+    }
     const isMobile = options.userAgent ? /mobi|android|iphone|ipad|phone/i.test(options.userAgent) : false;
     const defaultPageSize = isMobile 
       ? (settings.marketplaceMobileInitialPageSize || 5) 
@@ -116,7 +121,8 @@ export class ProductsService {
       queryStr += ` AND (
         LOWER(model_name) LIKE LOWER($${paramIndex}) OR
         LOWER(brand) LIKE LOWER($${paramIndex}) OR
-        LOWER(series) LIKE LOWER($${paramIndex})
+        LOWER(series) LIKE LOWER($${paramIndex}) OR
+        LOWER(sku) LIKE LOWER($${paramIndex})
       )`;
       params.push(`%${options.search}%`);
       paramIndex++;

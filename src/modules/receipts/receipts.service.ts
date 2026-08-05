@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, Injectable, InternalServerErrorException, OnModuleInit } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 
 const isLambda = !!(process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT || process.env.LAMBDA_RUNTIME_DIR);
@@ -71,6 +71,7 @@ export class ReceiptsService implements OnModuleInit {
    * Executes invoice creation, maps line items, and updates inventory stock atomically.
    */
   async generateBillingReceipt(dto: CreateReceiptDto) {
+    this.validateReceipt(dto);
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -126,12 +127,6 @@ export class ReceiptsService implements OnModuleInit {
       // 4. Process line items: check stock, insert order_items, decrement inventory
       for (const item of dto.items) {
         if (item.productId) {
-          // Insert e-commerce order item
-          await queryRunner.query(`
-            INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
-            VALUES ($1, $2, $3, $4);
-          `, [orderId, item.productId, parseInt(item.qty.toString(), 10), Number(item.amount)]);
-
           // Row-level lock and verify product stock
           const prodRows = await queryRunner.query(`
             SELECT id, model_name as name, total_stock, sold_stock, locked_stock
@@ -140,27 +135,35 @@ export class ReceiptsService implements OnModuleInit {
             FOR UPDATE;
           `, [item.productId]);
 
-          if (prodRows.length > 0) {
-            const p = prodRows[0];
-            const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
-            if (available >= Number(item.qty)) {
-              // Increment sold_stock in products table
-              await queryRunner.query(`
-                UPDATE products 
-                SET sold_stock = sold_stock + $1,
-                    updated_at = NOW() 
-                WHERE id = $2;
-              `, [Number(item.qty), item.productId]);
-
-              // Update quantity_available in inventory table to match sold deduction
-              await queryRunner.query(`
-                UPDATE inventory 
-                SET quantity_available = GREATEST(0, quantity_available - $1),
-                    updated_at = NOW()
-                WHERE product_id = $2;
-              `, [Number(item.qty), item.productId]);
-            }
+          if (prodRows.length === 0) {
+            throw new BadRequestException(`The selected model for "${item.description}" is no longer available.`);
           }
+
+          const p = prodRows[0];
+          const requested = Number(item.qty);
+          const available = Number(p.total_stock) - Number(p.locked_stock || 0) - Number(p.sold_stock);
+          if (available < requested) {
+            throw new ConflictException(`Only ${Math.max(0, available)} unit(s) of ${p.name} are currently available.`);
+          }
+
+          await queryRunner.query(`
+            INSERT INTO order_items (order_id, product_id, qty, price_at_purchase)
+            VALUES ($1, $2, $3, $4);
+          `, [orderId, item.productId, requested, Number(item.amount)]);
+
+          await queryRunner.query(`
+            UPDATE products
+            SET sold_stock = sold_stock + $1,
+                updated_at = NOW()
+            WHERE id = $2;
+          `, [requested, item.productId]);
+
+          await queryRunner.query(`
+            UPDATE inventory
+            SET quantity_available = GREATEST(0, quantity_available - $1),
+                updated_at = NOW()
+            WHERE product_id = $2;
+          `, [requested, item.productId]);
         }
       }
 
@@ -238,10 +241,45 @@ export class ReceiptsService implements OnModuleInit {
       // ROLLBACK SQL TRANSACTION ON ERROR TO KEEP DB IMMUTABLE
       await queryRunner.rollbackTransaction();
       console.error('TypeORM QueryRunner Rolled Back:', error);
+      if (error instanceof HttpException) throw error;
       throw new InternalServerErrorException(error.message || 'Receipt Generation failed.');
     } finally {
       // CRITICAL: Always release QueryRunner to return connection pool!
       await queryRunner.release();
+    }
+  }
+
+  private validateReceipt(dto: CreateReceiptDto) {
+    if (!dto || !dto.receiptNumber?.trim()) {
+      throw new BadRequestException('Receipt number is required.');
+    }
+    if (dto.receiptNumber.trim().length > 100) {
+      throw new BadRequestException('Receipt number must be 100 characters or fewer.');
+    }
+    if (!Array.isArray(dto.items) || dto.items.length === 0 || dto.items.length > 100) {
+      throw new BadRequestException('A receipt must contain between 1 and 100 line items.');
+    }
+    for (const item of dto.items) {
+      const qty = Number(item?.qty);
+      const amount = Number(item?.amount);
+      if (!item?.description?.trim() || item.description.trim().length > 500) {
+        throw new BadRequestException('Every line item needs a valid description.');
+      }
+      if (!Number.isInteger(qty) || qty < 1 || qty > 1000) {
+        throw new BadRequestException(`Invalid quantity for "${item.description}".`);
+      }
+      if (!Number.isFinite(amount) || amount < 0 || amount > 100000000) {
+        throw new BadRequestException(`Invalid amount for "${item.description}".`);
+      }
+    }
+    for (const [label, value] of [
+      ['tax percentage', dto.taxPercent],
+      ['shipping charges', dto.shippingCharges],
+      ['advance paid', dto.advancePaid]
+    ] as const) {
+      if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
+        throw new BadRequestException(`Invalid ${label}.`);
+      }
     }
   }
 
@@ -293,7 +331,7 @@ export class ReceiptsService implements OnModuleInit {
   async getPaginatedReceipts(options: { page?: number; limit?: number; search?: string }) {
     try {
       const page = Math.max(1, Number(options.page || 1));
-      const limit = Math.max(1, Math.min(2000, Number(options.limit || 50)));
+      const limit = Math.max(1, Math.min(100, Number(options.limit || 25)));
       const offset = (page - 1) * limit;
 
       let queryStr = `
@@ -307,10 +345,11 @@ export class ReceiptsService implements OnModuleInit {
 
       if (options.search) {
         queryStr += ` AND (
-          LOWER(r.receipt_number) LIKE LOWER($${paramIndex}) OR
-          LOWER(c.full_name) LIKE LOWER($${paramIndex}) OR
-          LOWER(c.phone) LIKE LOWER($${paramIndex}) OR
-          LOWER(r.customer_name) LIKE LOWER($${paramIndex})
+            LOWER(r.receipt_number) LIKE LOWER($${paramIndex}) OR
+            LOWER(c.full_name) LIKE LOWER($${paramIndex}) OR
+            LOWER(c.phone) LIKE LOWER($${paramIndex}) OR
+            LOWER(r.customer_name) LIKE LOWER($${paramIndex}) OR
+            LOWER(r.customer_phone) LIKE LOWER($${paramIndex})
         )`;
         params.push(`%${options.search}%`);
         paramIndex++;

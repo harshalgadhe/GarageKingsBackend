@@ -174,7 +174,9 @@ export class ApiController {
 
   // ── LEGACY COGNITO BYPASSES ─────────────────────────────────────────
   @Post('auth/auto-confirm')
-  async autoConfirmUser(@Body() dto: { email: string }) {
+  @UseGuards(AuthGuard('jwt'))
+  async autoConfirmUser(@Body() dto: { email: string }, @Request() req: any) {
+    this.checkAdmin(req);
     const { email } = dto;
     if (!email) {
       throw new Error('Email is required for auto-confirmation');
@@ -219,9 +221,7 @@ export class ApiController {
       let googleGivenName = '';
 
       if (idToken.includes('@')) {
-        // Developer sandbox bypass mode
-        console.log(`[GoogleLogin] Sandbox bypass mode detected for email: ${idToken}`);
-        cleanEmail = idToken.trim();
+        throw new UnauthorizedException('A valid Google OAuth token is required.');
       } else {
         // 1. Verify Google Token via tokeninfo endpoint (supports both ID Token and Access Token)
         const isJwt = idToken.split('.').length === 3;
