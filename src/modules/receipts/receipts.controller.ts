@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Delete, Patch, Param, Body, Request, Query, UseGuards, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Patch, Param, Body, Request, Query, UseGuards, ForbiddenException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ReceiptsService } from './receipts.service.js';
 import { CreateReceiptDto, VoidReceiptDto } from './receipts.dto.js';
@@ -56,7 +56,7 @@ export class ReceiptsController {
   @Delete(':id')
   async deleteReceipt(@Param('id') id: string, @Request() req: any) {
     this.checkAdmin(req);
-    throw new BadRequestException('Receipts are financial records and cannot be deleted. Void the receipt instead.');
+    return this.receiptsService.deleteReceipt(id, req.user.email);
   }
 }
 export default ReceiptsController;

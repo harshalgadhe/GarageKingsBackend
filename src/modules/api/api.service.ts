@@ -3492,13 +3492,46 @@ async calculateCheckoutPricing(dto: any) {
     const noPriceRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (selling_price IS NULL OR selling_price <= 0);');
     const productsWithoutPrice = noPriceRes[0].total;
 
-    const receiptExceptions = await this.dataSource.query(`
+    const receiptInsights = await this.dataSource.query(`
       SELECT
-        COUNT(*) FILTER (WHERE status = 'Issued' AND pending_balance > 0)::int AS "pendingReceiptCount",
-        COALESCE(SUM(pending_balance) FILTER (WHERE status = 'Issued' AND pending_balance > 0), 0)::float AS "pendingReceiptBalance",
-        COUNT(*) FILTER (WHERE status = 'Voided')::int AS "voidedReceiptCount"
+        COUNT(*) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND pending_balance > 0)::int AS "pendingReceiptCount",
+        COALESCE(SUM(pending_balance) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND pending_balance > 0), 0)::float AS "pendingReceiptBalance",
+        COUNT(*) FILTER (WHERE status = 'Voided')::int AS "voidedReceiptCount",
+        COUNT(*) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided')::int AS "totalReceiptsCount",
+        COUNT(*) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND LOWER(COALESCE(format_type, 'standard')) NOT IN ('prebooking', 'pre_order', 'po'))::int AS "standardCount",
+        COUNT(*) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND LOWER(COALESCE(format_type, 'standard')) IN ('prebooking', 'pre_order', 'po'))::int AS "poCount",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND LOWER(COALESCE(format_type, 'standard')) NOT IN ('prebooking', 'pre_order', 'po')), 0)::float AS "stockRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND LOWER(COALESCE(format_type, 'standard')) IN ('prebooking', 'pre_order', 'po')), 0)::float AS "poRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided'), 0)::float AS "totalRevenue",
+        COALESCE(AVG(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided'), 0)::float AS "avgReceiptValue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= DATE_TRUNC('month', CURRENT_DATE)), 0)::float AS "thisMonthRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' AND created_at < DATE_TRUNC('month', CURRENT_DATE)), 0)::float AS "lastMonthRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= CURRENT_DATE - INTERVAL '6 days'), 0)::float AS "thisWeekRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= CURRENT_DATE - INTERVAL '13 days' AND created_at < CURRENT_DATE - INTERVAL '6 days'), 0)::float AS "lastWeekRevenue"
       FROM receipts;
     `);
+    const receiptChartQuery = (startExpression: string, step: string, count: number, labelExpression: string) => `
+      WITH buckets AS (
+        SELECT generate_series(${startExpression}, ${startExpression} + INTERVAL '${count - 1} ${step}', INTERVAL '1 ${step}') AS bucket_start
+      )
+      SELECT
+        ${labelExpression} AS label,
+        COALESCE(SUM(r.total_amount) FILTER (WHERE LOWER(COALESCE(r.format_type, 'standard')) NOT IN ('prebooking', 'pre_order', 'po')), 0)::float AS stock,
+        COALESCE(SUM(r.total_amount) FILTER (WHERE LOWER(COALESCE(r.format_type, 'standard')) IN ('prebooking', 'pre_order', 'po')), 0)::float AS po,
+        COALESCE(SUM(r.total_amount), 0)::float AS total
+      FROM buckets b
+      LEFT JOIN receipts r
+        ON r.created_at >= b.bucket_start
+       AND r.created_at < b.bucket_start + INTERVAL '1 ${step}'
+       AND COALESCE(r.status, 'Issued') <> 'Voided'
+      GROUP BY b.bucket_start
+      ORDER BY b.bucket_start;
+    `;
+    const [dailyReceiptChart, weeklyReceiptChart, monthlyReceiptChart] = await Promise.all([
+      this.dataSource.query(receiptChartQuery("CURRENT_DATE - INTERVAL '6 days'", 'day', 7, "CASE WHEN b.bucket_start::date = CURRENT_DATE THEN 'Today' ELSE TO_CHAR(b.bucket_start, 'Dy DD Mon') END")),
+      this.dataSource.query(receiptChartQuery("DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 weeks'", 'week', 8, "TO_CHAR(b.bucket_start, 'DD Mon')")),
+      this.dataSource.query(receiptChartQuery("DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months'", 'month', 12, "TO_CHAR(b.bucket_start, 'Mon YY')"))
+    ]);
     const failedReceiptJobs = await this.dataSource.query(`
       SELECT COUNT(*)::int AS total
       FROM receipt_generation_jobs
@@ -3578,9 +3611,34 @@ async calculateCheckoutPricing(dto: any) {
       preorderCount,
       productsWithoutSKU,
       productsWithoutPrice,
-      pendingReceiptCount: receiptExceptions[0].pendingReceiptCount,
-      pendingReceiptBalance: receiptExceptions[0].pendingReceiptBalance,
-      voidedReceiptCount: receiptExceptions[0].voidedReceiptCount,
+      pendingReceiptCount: receiptInsights[0].pendingReceiptCount,
+      pendingReceiptBalance: receiptInsights[0].pendingReceiptBalance,
+      voidedReceiptCount: receiptInsights[0].voidedReceiptCount,
+      receiptStats: {
+        totalReceiptsCount: receiptInsights[0].totalReceiptsCount,
+        standardCount: receiptInsights[0].standardCount,
+        poCount: receiptInsights[0].poCount,
+        stockRevenue: receiptInsights[0].stockRevenue,
+        poRevenue: receiptInsights[0].poRevenue,
+        poPendingAmount: receiptInsights[0].pendingReceiptBalance,
+        totalRevenue: receiptInsights[0].totalRevenue,
+        avgReceiptValue: receiptInsights[0].avgReceiptValue,
+        thisMonthRevenue: receiptInsights[0].thisMonthRevenue,
+        lastMonthRevenue: receiptInsights[0].lastMonthRevenue,
+        monthGrowthPct: receiptInsights[0].lastMonthRevenue > 0
+          ? Number((((receiptInsights[0].thisMonthRevenue - receiptInsights[0].lastMonthRevenue) / receiptInsights[0].lastMonthRevenue) * 100).toFixed(1))
+          : receiptInsights[0].thisMonthRevenue > 0 ? 100 : 0,
+        thisWeekRevenue: receiptInsights[0].thisWeekRevenue,
+        lastWeekRevenue: receiptInsights[0].lastWeekRevenue,
+        weekGrowthPct: receiptInsights[0].lastWeekRevenue > 0
+          ? Number((((receiptInsights[0].thisWeekRevenue - receiptInsights[0].lastWeekRevenue) / receiptInsights[0].lastWeekRevenue) * 100).toFixed(1))
+          : receiptInsights[0].thisWeekRevenue > 0 ? 100 : 0
+      },
+      receiptCharts: {
+        daily: dailyReceiptChart,
+        weekly: weeklyReceiptChart,
+        monthly: monthlyReceiptChart
+      },
       failedReceiptJobs: failedReceiptJobs[0].total,
       overduePurchaseOrders: overduePurchases[0].total,
       todayGrossProfit,

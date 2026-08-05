@@ -67,8 +67,12 @@ export class ReceiptsService {
       const taxVal = lineItemsSum * taxRate;
       const finalTotal = lineItemsSum + taxVal + shipping;
 
-      const advance = Number(dto.advancePaid || 0);
-      const balance = Math.max(0, finalTotal - advance);
+      const normalizedFormat = String(dto.formatType || 'standard').toLowerCase();
+      const isPrebooking = ['prebooking', 'pre_order', 'po'].includes(normalizedFormat);
+      const receiptFormat = isPrebooking ? 'prebooking' : normalizedFormat;
+      const advance = isPrebooking ? Number(dto.advancePaid ?? finalTotal) : finalTotal;
+      const balance = isPrebooking ? Number(dto.pendingBalance || 0) : 0;
+      const orderTotal = finalTotal + balance;
 
       // 2. Resolve/seed Guest Customer and Guest User
       const phoneVal = (dto.customerPhone || '').trim() || '0000000000';
@@ -95,12 +99,13 @@ export class ReceiptsService {
       const userId = userRes[0].id;
 
       // 3. Create parent Pending/Confirmed order record
-      const orderStatus = dto.formatType === 'pre_order' ? 'Pre-Order' : 'Confirmed';
+      const orderStatus = isPrebooking ? 'Pre-Order' : 'Confirmed';
+      const bookingType = isPrebooking ? 'pre_order' : 'standard';
       const orderRes = await queryRunner.query(`
         INSERT INTO orders (user_id, total_price, shipping_address, status, booking_type, advance_amount, remaining_amount, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
         RETURNING id;
-      `, [userId, finalTotal, `${dto.customerAddress || ''} | Insta: ${dto.customerInstagram || ''} | Phone: ${dto.customerPhone || ''}`, orderStatus, dto.formatType || 'standard', advance, balance]);
+      `, [userId, orderTotal, `${dto.customerAddress || ''} | Insta: ${dto.customerInstagram || ''} | Phone: ${dto.customerPhone || ''}`, orderStatus, bookingType, advance, balance]);
       const orderId = orderRes[0].id;
 
       // 4. Process line items: check stock, insert order_items, decrement inventory
@@ -156,7 +161,7 @@ export class ReceiptsService {
         dto.receiptNumber.trim(),
         customerId,
         orderId,
-        dto.formatType || 'standard',
+        receiptFormat,
         Number(dto.taxPercent || 0),
         taxVal,
         shipping,
@@ -259,7 +264,8 @@ export class ReceiptsService {
   async getReceipts() {
     try {
       const receipts = await this.dataSource.query(`
-        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.status,
+        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.advance_paid,
+               r.pending_balance, r.status,
                r.void_reason, r.voided_at, r.voided_by, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone
@@ -306,7 +312,8 @@ export class ReceiptsService {
       const total = countRes[0]?.total || 0;
 
       const selectQuery = `
-        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.status,
+        SELECT r.id, r.receipt_number, r.format_type, r.total_amount, r.advance_paid,
+               r.pending_balance, r.status,
                r.void_reason, r.voided_at, r.voided_by, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone
@@ -388,6 +395,37 @@ export class ReceiptsService {
       await queryRunner.rollbackTransaction();
       if (error instanceof HttpException) throw error;
       throw new InternalServerErrorException('Failed to void receipt.');
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async deleteReceipt(id: string, adminEmail: string) {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const rows = await queryRunner.query(`
+        SELECT id, receipt_number
+        FROM receipts
+        WHERE id = $1
+        FOR UPDATE;
+      `, [id]);
+      if (!rows.length) throw new NotFoundException('Receipt not found.');
+
+      const receiptNumber = rows[0].receipt_number;
+      await queryRunner.query(`DELETE FROM receipts WHERE id = $1;`, [id]);
+      await queryRunner.query(`
+        INSERT INTO audit_logs (action, entity, entity_id, after_state)
+        VALUES ('RECEIPT_DELETED', 'receipts', $1, $2);
+      `, [id, JSON.stringify({ receiptNumber, deletedBy: adminEmail })]);
+
+      await queryRunner.commitTransaction();
+      return { success: true, id, deleted: true };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      if (error instanceof HttpException) throw error;
+      throw new InternalServerErrorException('Failed to delete receipt.');
     } finally {
       await queryRunner.release();
     }

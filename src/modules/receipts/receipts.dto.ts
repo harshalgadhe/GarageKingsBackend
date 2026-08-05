@@ -14,6 +14,7 @@ export interface CreateReceiptDto {
   taxPercent?: number;
   shippingCharges?: number;
   advancePaid?: number;
+  pendingBalance?: number;
   footerNote?: string;
   items: CreateReceiptItemDto[];
   customerName?: string;
@@ -48,7 +49,8 @@ export function validateCreateReceipt(dto: CreateReceiptDto) {
   for (const [label, value] of [
     ['tax percentage', dto.taxPercent],
     ['shipping charges', dto.shippingCharges],
-    ['advance paid', dto.advancePaid]
+    ['advance paid', dto.advancePaid],
+    ['pending balance', dto.pendingBalance]
   ] as const) {
     if (value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0)) {
       throw new BadRequestException(`Invalid ${label}.`);
