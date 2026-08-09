@@ -1,11 +1,14 @@
 import fs from 'fs';
-import archiver from 'archiver';
+import * as archiverModule from 'archiver';
 
 const OUTPUT = 'lambda-deploy.zip';
 if (fs.existsSync(OUTPUT)) fs.unlinkSync(OUTPUT);
 
 const output = fs.createWriteStream(OUTPUT);
-const archive = archiver('zip', { zlib: { level: 1 } });
+const archiveOptions = { zlib: { level: 1 } };
+const archive = typeof archiverModule.default === 'function'
+  ? archiverModule.default('zip', archiveOptions)
+  : new archiverModule.ZipArchive(archiveOptions);
 
 await new Promise((resolve, reject) => {
   output.on('close', resolve);
