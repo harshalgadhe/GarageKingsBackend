@@ -1,11 +1,11 @@
 import fs from 'fs';
-import { ZipArchive } from 'archiver';
+import archiver from 'archiver';
 
 const OUTPUT = 'lambda-deploy.zip';
 if (fs.existsSync(OUTPUT)) fs.unlinkSync(OUTPUT);
 
 const output = fs.createWriteStream(OUTPUT);
-const archive = new ZipArchive({ zlib: { level: 1 } });
+const archive = archiver('zip', { zlib: { level: 1 } });
 
 await new Promise((resolve, reject) => {
   output.on('close', resolve);
@@ -19,5 +19,5 @@ await new Promise((resolve, reject) => {
   archive.finalize();
 });
 
-const mb = (fs.statSync(OUTPUT).size / 1024 / 1024).toFixed(1);
+const mb = (archive.pointer() / 1024 / 1024).toFixed(1);
 console.log(`Done. lambda-deploy.zip: ${mb} MB`);

@@ -29,6 +29,9 @@ jobs:
       - name: Build Application
         run: npm run build
 
+      - name: Prune Development Dependencies
+        run: npm prune --omit=dev
+
       - name: Create Lambda Package (Zip)
         run: node pack-lambda.mjs
 
