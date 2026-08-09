@@ -17,6 +17,7 @@ await new Promise((resolve, reject) => {
 
   archive.pipe(output);
   archive.directory('dist/', 'dist');
+  archive.directory('certs/', 'certs');
   archive.directory('node_modules/', 'node_modules');
   archive.file('package.json', { name: 'package.json' });
   archive.finalize();

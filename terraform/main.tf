@@ -412,6 +412,7 @@ resource "aws_lambda_function" "api_monolith" {
     variables = {
       NODE_ENV                         = "production"
       NODE_OPTIONS                     = "--dns-result-order=ipv6first"
+      NODE_EXTRA_CA_CERTS              = "/var/task/certs/ap-south-1-bundle.pem"
       DATABASE_URL                     = var.app_database_url
       COGNITO_USER_POOL_ID             = aws_cognito_user_pool.user_pool.id
       COGNITO_CLIENT_ID                = aws_cognito_user_pool_client.client.id
