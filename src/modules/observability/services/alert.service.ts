@@ -3,7 +3,26 @@ import { DataSource } from 'typeorm';
 
 @Injectable()
 export class AlertService {
+  private lastScheduledCheckAt = 0;
+  private scheduledCheck: Promise<void> | null = null;
+
   constructor(private readonly dataSource: DataSource) {}
+
+  scheduleAlertCheck(minIntervalMs = 60_000) {
+    const now = Date.now();
+    if (this.scheduledCheck || now - this.lastScheduledCheckAt < minIntervalMs) {
+      return;
+    }
+
+    this.lastScheduledCheckAt = now;
+    this.scheduledCheck = this.checkAlerts()
+      .catch((error: any) => {
+        console.error('Scheduled alert check failed:', error.message);
+      })
+      .finally(() => {
+        this.scheduledCheck = null;
+      });
+  }
 
   async getObservabilitySettings() {
     const rows = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'observability_settings'");

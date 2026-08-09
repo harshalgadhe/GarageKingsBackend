@@ -35,11 +35,10 @@ export class MetricsService {
         metric.metadata ? JSON.stringify(metric.metadata) : null
       ]);
 
-      // Trigger alert checks in background when api_latency metrics are logged
+      // Alert aggregation is intentionally throttled. Running four alert queries
+      // after every request can starve the small serverless connection pool.
       if (metric.metricType === 'api_latency') {
-        this.alertService.checkAlerts().catch((err: any) => {
-          console.error('Failed to run alert checks after metric recording:', err.message);
-        });
+        this.alertService.scheduleAlertCheck();
       }
     } catch (e: any) {
       console.error('Failed to log performance metric:', e.message);

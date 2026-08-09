@@ -419,6 +419,7 @@ resource "aws_lambda_function" "api_monolith" {
       S3_ASSETS_BUCKET                 = aws_s3_bucket.assets_bucket.id
       DATABASE_SSL                     = "true"
       DATABASE_SSL_REJECT_UNAUTHORIZED = "true"
+      DATABASE_POOL_MAX                = "2"
       JWT_SECRET                       = var.jwt_secret
       OWNER_SETUP_TOKEN                = var.owner_setup_token
       CORS_ALLOWED_ORIGINS             = "https://garagekingsindia.com,https://www.garagekingsindia.com"

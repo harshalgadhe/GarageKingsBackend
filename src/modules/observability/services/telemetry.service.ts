@@ -84,10 +84,8 @@ export class TelemetryService {
         errorData.buildVersion || '1.0.0'
       ]);
 
-      // Check alert conditions after logging error
-      this.alertService.checkAlerts().catch((err: any) => {
-        console.error('Failed to run alert checks after error logging:', err.message);
-      });
+      // Check alert conditions at most once per minute per warm Lambda container.
+      this.alertService.scheduleAlertCheck();
     } catch (e: any) {
       // Direct console log as fallback to avoid recursion
       console.error('Failed to log telemetry error:', e.message);

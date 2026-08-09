@@ -1,5 +1,5 @@
 import { Injectable, OnModuleInit, UnauthorizedException, BadRequestException, HttpException, HttpStatus, ForbiddenException } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, QueryRunner } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
 import crypto from 'crypto';
@@ -446,9 +446,10 @@ export class ApiService implements OnModuleInit {
   }
 
   // ── AUDIT LOGGING SYSTEM (IMMUTABLE LOGS) ──────────────────────────
-  async writeAuditLog(action: string, entity: string, entityId: string, performedBy: string, ipAddress: string, before: any, after: any) {
+  async writeAuditLog(action: string, entity: string, entityId: string, performedBy: string, ipAddress: string, before: any, after: any, queryRunner?: QueryRunner) {
     try {
-      await this.dataSource.query(`
+      const executor = queryRunner || this.dataSource;
+      await executor.query(`
         INSERT INTO audit_logs (action, entity, entity_id, performed_by, ip_address, before_state, after_state, timestamp)
         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW());
       `, [
@@ -1108,16 +1109,16 @@ export class ApiService implements OnModuleInit {
         await this.createSystemNotification(
           'Low Stock Alert',
           `Casting "${car.name}" has critical stock count: ${initialStock}`,
-          'low_stock'
+          'low_stock',
+          null,
+          queryRunner
         );
       }
 
+      await this.writeAuditLog('CREATE_PRODUCT', 'products', productId, creatorEmail, ipAddress, null, car, queryRunner);
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
       localCache.del('products_list_false');
-
-      // Log audit trace
-      await this.writeAuditLog('CREATE_PRODUCT', 'products', productId, creatorEmail, ipAddress, null, car);
 
       return { id: productId, sku };
     } catch (err) {
@@ -1275,20 +1276,22 @@ export class ApiService implements OnModuleInit {
           `, [casingTypeId, `${car.name || oldData.model_name || 'Unknown Casting'} (${reqCasing})`, priceVal, id]);
         }
       }
+      await this.writeAuditLog('UPDATE_PRODUCT', 'products', id, updaterEmail, ipAddress, oldData, car, queryRunner);
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
       localCache.del('products_list_false');
       localCache.del(`product_${id}_true`);
       localCache.del(`product_${id}_false`);
-
-      await this.writeAuditLog('UPDATE_PRODUCT', 'products', id, updaterEmail, ipAddress, oldData, car);
-      return this.getProduct(id, true);
     } catch (err) {
-      await queryRunner.rollbackTransaction();
+      if (queryRunner.isTransactionActive) {
+        await queryRunner.rollbackTransaction();
+      }
       throw err;
     } finally {
       await queryRunner.release();
     }
+
+    return this.getProduct(id, true);
   }
 
   async softDeleteProduct(id: string, deleterEmail: string, ipAddress: string) {
@@ -2010,7 +2013,8 @@ async calculateCheckoutPricing(dto: any) {
           'Payment Uploaded',
           `Order ${oid.slice(0, 8)} uploaded a transaction receipt. Pending verification.`,
           'payment',
-          oid
+          oid,
+          queryRunner
         );
       }
 
@@ -4537,8 +4541,9 @@ async calculateCheckoutPricing(dto: any) {
     );
   }
 
-  async createSystemNotification(title: string, message: string, type: string = 'info', orderId: string | null = null) {
-    await this.dataSource.query(`
+  async createSystemNotification(title: string, message: string, type: string = 'info', orderId: string | null = null, queryRunner?: QueryRunner) {
+    const executor = queryRunner || this.dataSource;
+    await executor.query(`
       INSERT INTO system_notifications (title, message, type, order_id)
       VALUES ($1, $2, $3, $4);
     `, [title, message, type, orderId]);
