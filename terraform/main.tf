@@ -28,12 +28,6 @@ variable "environment" {
   default = "production"
 }
 
-variable "db_master_password" {
-  type        = string
-  sensitive   = true
-  description = "RDS master password supplied through TF_VAR_db_master_password"
-}
-
 variable "app_database_url" {
   type        = string
   sensitive   = true
@@ -206,24 +200,24 @@ resource "aws_security_group_rule" "lambda_to_s3" {
 
 # 2. Private RDS PostgreSQL Database Instance
 resource "aws_db_instance" "postgres" {
-  identifier                 = "gk-${var.environment}-postgres"
-  engine                     = "postgres"
-  engine_version             = "16.13"
-  instance_class             = "db.t4g.micro" # Free Tier Eligible
-  allocated_storage          = 20             # 20GB Free Tier GP3
-  storage_type               = "gp3"
-  db_subnet_group_name       = aws_db_subnet_group.db_subnet.name
-  vpc_security_group_ids     = [aws_security_group.db_sg.id]
-  username                   = "gk_admin"
-  password                   = var.db_master_password
-  db_name                    = "garagekings_prod"
-  port                       = 25432
-  skip_final_snapshot        = false
-  final_snapshot_identifier  = "gk-${var.environment}-postgres-final"
-  publicly_accessible        = false
-  deletion_protection        = true
-  storage_encrypted          = true
-  auto_minor_version_upgrade = true
+  identifier                  = "gk-${var.environment}-postgres"
+  engine                      = "postgres"
+  engine_version              = "16.13"
+  instance_class              = "db.t4g.micro" # Free Tier Eligible
+  allocated_storage           = 20             # 20GB Free Tier GP3
+  storage_type                = "gp3"
+  db_subnet_group_name        = aws_db_subnet_group.db_subnet.name
+  vpc_security_group_ids      = [aws_security_group.db_sg.id]
+  username                    = "gk_admin"
+  manage_master_user_password = true
+  db_name                     = "garagekings_prod"
+  port                        = 25432
+  skip_final_snapshot         = false
+  final_snapshot_identifier   = "gk-${var.environment}-postgres-final"
+  publicly_accessible         = false
+  deletion_protection         = true
+  storage_encrypted           = true
+  auto_minor_version_upgrade  = true
 
   backup_retention_period = 7
   copy_tags_to_snapshot   = true
