@@ -5,6 +5,7 @@ import { ApiService } from './modules/api/api.service.js';
 import { configure as serverlessExpress } from '@vendia/serverless-express';
 import { Handler, Context, Callback } from 'aws-lambda';
 import { getJwtSecret, isAllowedOrigin } from './config/security.config.js';
+import { applyReceiptBusinessDateMigration } from './database/receipt-business-date.migration.js';
 
 getJwtSecret();
 
@@ -55,6 +56,13 @@ async function bootstrap() {
 let nestApp: any;
 
 export const handler: Handler = async (event: any, context: Context, callback: Callback) => {
+  if (event && event.task === 'apply-receipt-business-date-migration') {
+    console.log('[Lambda] Applying the receipt business-date migration.');
+    const result = await applyReceiptBusinessDateMigration();
+    console.log('[Lambda] Receipt business-date migration completed.', result);
+    return { success: true, ...result };
+  }
+
   if (event && event.task === 'cleanup-expired-orders') {
     console.log('[Lambda] Intercepted direct EventBridge cleanup task invocation.');
     if (!nestApp) {
