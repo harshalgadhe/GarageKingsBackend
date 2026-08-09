@@ -135,7 +135,8 @@ export class ProductsService {
     }
 
     if (options.inStock) {
-      queryStr += ` AND COALESCE(stock, total_stock, 0) > 0`;
+      // In Stock = has physical stock AND is NOT a pre-order/pre-book item
+      queryStr += ` AND COALESCE(stock, total_stock, 0) > 0 AND (is_prebook IS NULL OR is_prebook = false) AND status != 'Pre-Order'`;
     }
 
     if (options.preBooking) {
@@ -149,13 +150,13 @@ export class ProductsService {
     }
 
     const countQuery = `SELECT COUNT(*)::int as total FROM (${queryStr}) as sub`;
-    const countRows = await this.dataSource.query(countQuery, params);
+    const dataQuery = `${queryStr} ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    const dataParams = [...params, limit, offset];
+    const [countRows, rows] = await Promise.all([
+      this.dataSource.query(countQuery, params),
+      this.dataSource.query(dataQuery, dataParams)
+    ]);
     const total = parseInt(countRows[0]?.total || '0', 10);
-
-    queryStr += ` ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-    params.push(limit, offset);
-
-    const rows = await this.dataSource.query(queryStr, params);
 
     return {
       products: rows,

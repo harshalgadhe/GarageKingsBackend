@@ -11,7 +11,10 @@
     "start:prod": "node dist/main",
     "migrate": "node src/bin/migrate.js",
     "migrate:up": "node src/bin/migrate-incremental.js",
-    "rollback": "node src/bin/rollback.js"
+    "rollback": "node src/bin/rollback.js",
+    "backfill:catalog": "node scripts/backfill-marketplace-catalog.mjs",
+    "audit:images": "node scripts/audit-product-images.mjs",
+    "cleanup:duplicate-images": "node scripts/cleanup-duplicate-images.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-cognito-identity-provider": "^3.1063.0",
@@ -33,6 +36,7 @@
     "pg": "^8.13.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "sharp": "^0.35.3",
     "typeorm": "^0.3.20",
     "xlsx": "^0.18.5"
   },

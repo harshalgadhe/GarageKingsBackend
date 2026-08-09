@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
@@ -73,14 +73,19 @@ export class ApiController {
   }
 
   @Post('auth/login')
-  async login(@Body() dto: any, @Res({ passthrough: true }) res: ExpressResponse) {
+  async login(@Body() dto: any, @Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
     const { email, password } = dto;
     if (!email || !password) {
       throw new BadRequestException('Email and password are required.');
     }
+    const failedAttempts = await this.apiService.getRecentFailedLoginCount(email);
+    if (failedAttempts >= 5) {
+      throw new HttpException('Too many sign-in attempts. Please wait 15 minutes before trying again.', HttpStatus.TOO_MANY_REQUESTS);
+    }
     const user = await this.apiService.validateUserCredentials(email, password);
     if (!user) {
-      throw new UnauthorizedException('Invalid credentials.');
+      await this.apiService.recordFailedLogin(email, req.ip || req.headers?.['x-forwarded-for'] || 'unknown');
+      throw new UnauthorizedException('Email or password is incorrect.');
     }
 
     const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
@@ -343,6 +348,12 @@ export class ApiController {
       return;
     }
     return data;
+  }
+
+  @Get('products/homepage')
+  async getHomepageProducts(@Res({ passthrough: true }) res: ExpressResponse) {
+    res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=120');
+    return this.apiService.getHomepageProducts();
   }
 
   @Get('products/:id')

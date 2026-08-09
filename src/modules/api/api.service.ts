@@ -487,6 +487,12 @@ export class ApiService implements OnModuleInit {
 
   async registerUser(email: string, pass: string, fullName?: string) {
     const emailClean = email.trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(emailClean)) {
+      throw new BadRequestException('Enter a valid email address.');
+    }
+    if (pass.length < 8 || !/[a-z]/.test(pass) || !/[A-Z]/.test(pass) || !/\d/.test(pass)) {
+      throw new BadRequestException('Password must contain at least 8 characters, including uppercase, lowercase and a number.');
+    }
     const existing = await this.dataSource.query("SELECT id FROM users WHERE email = $1", [emailClean]);
     if (existing.length > 0) {
       throw new BadRequestException('Email address already registered.');
@@ -518,6 +524,22 @@ export class ApiService implements OnModuleInit {
       return { id: user.id, email: user.email, role };
     }
     return null;
+  }
+
+  async getRecentFailedLoginCount(email: string) {
+    const rows = await this.dataSource.query(`
+      SELECT COUNT(*)::int AS count
+      FROM audit_logs
+      WHERE action = 'LOGIN_FAILED'
+        AND entity = 'Authentication'
+        AND LOWER(performed_by) = LOWER($1)
+        AND timestamp > NOW() - INTERVAL '15 minutes';
+    `, [email.trim()]);
+    return Number(rows[0]?.count || 0);
+  }
+
+  async recordFailedLogin(email: string, ipAddress = 'unknown') {
+    await this.writeAuditLog('LOGIN_FAILED', 'Authentication', '00000000-0000-0000-0000-000000000000', email.trim().toLowerCase(), ipAddress, null, null);
   }
 
   async syncGoogleUser(email: string, pass: string) {
@@ -679,6 +701,29 @@ export class ApiService implements OnModuleInit {
     };
   }
 
+  async getHomepageProducts() {
+    const cacheKey = 'public_homepage_products';
+    const cached = localCache.get(cacheKey);
+    if (cached) return cached;
+
+    const fields = `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
+      COALESCE(selling_price, base_price, 0.00) as price,
+      COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
+      (COALESCE(stock, total_stock, 0) <= 0) as "isSoldOut",
+      is_prebook as "isPrebook", COALESCE(customer_eta, arrival_date) as "customerEta",
+      COALESCE(image, (SELECT thumbnail_url FROM product_images WHERE product_id = products.id ORDER BY is_primary DESC, created_at ASC LIMIT 1)) as image,
+      created_at`;
+    const visibility = `deleted_at IS NULL AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
+
+    const [featured, recent] = await Promise.all([
+      this.dataSource.query(`SELECT ${fields} FROM products WHERE ${visibility} AND is_featured = true ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 1;`),
+      this.dataSource.query(`SELECT ${fields} FROM products WHERE ${visibility} ORDER BY created_at DESC LIMIT 8;`)
+    ]);
+    const payload = { featured: featured[0] || null, recent };
+    localCache.set(cacheKey, payload, 30);
+    return payload;
+  }
+
   async getPaginatedProducts(options: {
     page?: number;
     limit?: number;
@@ -692,8 +737,13 @@ export class ApiService implements OnModuleInit {
     adminMode?: boolean;
     userAgent?: string;
   }) {
-    const rowsSettings = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
-    const settings = rowsSettings.length > 0 ? rowsSettings[0].value : {};
+    const settingsCacheKey = 'public_product_page_settings';
+    let settings = localCache.get(settingsCacheKey);
+    if (!settings) {
+      const rowsSettings = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
+      settings = rowsSettings.length > 0 ? rowsSettings[0].value : {};
+      localCache.set(settingsCacheKey, settings, 60);
+    }
     const isMobile = options.userAgent ? /mobi|android|iphone|ipad|phone/i.test(options.userAgent) : false;
     const defaultPageSize = isMobile 
       ? (settings.marketplaceMobileInitialPageSize || 5) 
@@ -754,7 +804,9 @@ export class ApiService implements OnModuleInit {
     }
 
     if (options.inStock) {
-      queryStr += ` AND COALESCE(stock, total_stock, 0) > 0`;
+      queryStr += ` AND COALESCE(available_stock, stock, total_stock, 0) > 0
+                    AND COALESCE(is_prebook, false) = false
+                    AND COALESCE(status, '') != 'Pre-Order'`;
     }
 
     if (options.preBooking) {
@@ -765,7 +817,8 @@ export class ApiService implements OnModuleInit {
       queryStr += ` AND (
         LOWER(model_name) LIKE LOWER($${paramIndex}) OR
         LOWER(brand) LIKE LOWER($${paramIndex}) OR
-        LOWER(series) LIKE LOWER($${paramIndex})
+        LOWER(series) LIKE LOWER($${paramIndex}) OR
+        LOWER(sku) LIKE LOWER($${paramIndex})
       )`;
       params.push(`%${options.search}%`);
       paramIndex++;
@@ -773,14 +826,13 @@ export class ApiService implements OnModuleInit {
 
     // Clone query for count
     const countQuery = `SELECT COUNT(*)::int as total FROM (${queryStr}) as sub`;
-    const countRows = await this.dataSource.query(countQuery, params);
+    const dataQuery = `${queryStr} ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    const dataParams = [...params, limit, offset];
+    const [countRows, rows] = await Promise.all([
+      this.dataSource.query(countQuery, params),
+      this.dataSource.query(dataQuery, dataParams)
+    ]);
     const total = parseInt(countRows[0]?.total || '0', 10);
-
-    // Add ordering and pagination
-    queryStr += ` ORDER BY created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-    params.push(limit, offset);
-
-    const rows = await this.dataSource.query(queryStr, params);
 
     return {
       products: rows,
@@ -884,7 +936,7 @@ export class ApiService implements OnModuleInit {
         : (car.image ? [car.image] : []);
 
       const primaryImg = car.image || imageList[0] || null;
-      const initialStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock || 10)));
+      const initialStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock !== undefined ? car.totalStock : 0)));
       const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount || 0));
       const priceVal = Number(car.price || car.sellingPrice || 0);
 
@@ -1079,7 +1131,7 @@ export class ApiService implements OnModuleInit {
         : (car.image ? [car.image] : (oldData.images || []));
 
       const primaryImg = car.image || imageList[0] || oldData.image || null;
-      const finalStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock !== undefined ? car.totalStock : (oldData.stock || 10))));
+      const finalStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock !== undefined ? car.totalStock : (oldData.stock || 0))));
       const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount !== undefined ? car.prebookDepositAmount : (oldData.po_amount || 0)));
       const priceVal = Number(car.price !== undefined ? car.price : (car.sellingPrice !== undefined ? car.sellingPrice : (oldData.price || 0)));
 
@@ -1144,34 +1196,69 @@ export class ApiService implements OnModuleInit {
         }
       }
 
-      // Update primary variant casing_type_id and name if casing was updated
+      // Update variants if car.variants is provided, or fallback to updating primary variant
       const casingTypesRes = await queryRunner.query("SELECT id, name FROM casing_types;");
-      const casingMap = {};
+      const casingMap: Record<string, string> = {};
       for (const ct of casingTypesRes) {
         casingMap[ct.name.toUpperCase()] = ct.id;
       }
-      let casingTypeId = casingMap[reqCasing.toUpperCase()];
-      if (!casingTypeId) {
+
+      const getOrInsertCasingTypeId = async (casingName: string) => {
+        const upper = casingName.toUpperCase();
+        if (casingMap[upper]) return casingMap[upper];
         const insRes = await queryRunner.query(`
           INSERT INTO casing_types (name, display_name)
           VALUES ($1, $2)
           ON CONFLICT (name) DO UPDATE SET display_name = EXCLUDED.display_name
           RETURNING id;
-        `, [reqCasing.toUpperCase(), reqCasing]);
-        casingTypeId = insRes[0]?.id;
-      }
+        `, [upper, casingName]);
+        const newId = insRes[0]?.id;
+        casingMap[upper] = newId;
+        return newId;
+      };
 
-      if (casingTypeId) {
-        await queryRunner.query(`
-          UPDATE product_variants 
-          SET casing_type_id = $1, 
-              name = $2,
-              selling_price = $3,
-              updated_at = NOW()
-          WHERE id = (
-            SELECT id FROM product_variants WHERE product_id = $4 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1
+      if (Array.isArray(car.variants) && car.variants.length > 0) {
+        for (const v of car.variants) {
+          const vCasing = v.casing || 'Blister';
+          const casingTypeId = await getOrInsertCasingTypeId(vCasing);
+          const vSku = v.sku || `${car.sku || oldData.sku}-${vCasing.toUpperCase()}`;
+          const vName = v.name || `${car.name || oldData.model_name || 'Unknown Casting'} (${vCasing})`;
+          const vPrice = Number(v.price || v.sellingPrice || priceVal);
+
+          const existingVar = await queryRunner.query(
+            "SELECT id FROM product_variants WHERE product_id = $1 AND casing_type_id = $2 AND deleted_at IS NULL;",
+            [id, casingTypeId]
           );
-        `, [casingTypeId, `${car.name || oldData.model_name || 'Unknown Casting'} (${reqCasing})`, priceVal, id]);
+
+          if (existingVar.length > 0) {
+            await queryRunner.query(`
+              UPDATE product_variants 
+              SET selling_price = $1, name = $2, sku = $3, updated_at = NOW()
+              WHERE id = $4;
+            `, [vPrice, vName, vSku, existingVar[0].id]);
+          } else {
+            await queryRunner.query(`
+              INSERT INTO product_variants (
+                product_id, casing_type_id, sku, name, selling_price, visibility, status, sales_status, created_by
+              )
+              VALUES ($1, $2, $3, $4, $5, 'Visible', 'Active', 'Available', $6);
+            `, [id, casingTypeId, vSku, vName, vPrice, updaterEmail]);
+          }
+        }
+      } else {
+        const casingTypeId = await getOrInsertCasingTypeId(reqCasing);
+        if (casingTypeId) {
+          await queryRunner.query(`
+            UPDATE product_variants 
+            SET casing_type_id = $1, 
+                name = $2,
+                selling_price = $3,
+                updated_at = NOW()
+            WHERE id = (
+              SELECT id FROM product_variants WHERE product_id = $4 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1
+            );
+          `, [casingTypeId, `${car.name || oldData.model_name || 'Unknown Casting'} (${reqCasing})`, priceVal, id]);
+        }
       }
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -5825,22 +5912,52 @@ async calculateCheckoutPricing(dto: any) {
     if (adminMode) {
       return this.dataSource.query("SELECT * FROM brands ORDER BY display_order ASC, name ASC;");
     }
-    return this.dataSource.query("SELECT * FROM brands WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;");
+    return this.dataSource.query(`
+      SELECT b.id,
+             b.name,
+             b.slug,
+             b.logo_url,
+             b.website,
+             b.display_order,
+             b.is_visible,
+             b.status,
+             b.accent_color,
+             b.secondary_color,
+             b.background_color,
+             b.theme_variant,
+             b.logo_treatment,
+             b.kicker,
+             b.headline,
+             b.description,
+             b.origin_label,
+             b.style_label,
+             COUNT(p.id)::int AS product_count
+      FROM brands b
+      LEFT JOIN products p
+        ON LOWER(TRIM(p.brand)) = LOWER(TRIM(b.name))
+       AND p.deleted_at IS NULL
+       AND (p.status IN ('Published', 'Pre-Order', 'Active') OR p.status IS NULL)
+      WHERE b.deleted_at IS NULL
+        AND b.is_visible = true
+        AND b.status = 'Active'
+      GROUP BY b.id
+      ORDER BY b.display_order ASC, b.name ASC;
+    `);
   }
 
   async createBrand(body: any) {
-    const { name, logoUrl, website, displayOrder, isVisible, status } = body;
+    const { name, logoUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
     const slug = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
     const result = await this.dataSource.query(`
-      INSERT INTO brands (name, slug, logo_url, website, display_order, is_visible, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      INSERT INTO brands (name, slug, logo_url, website, display_order, is_visible, status, accent_color, secondary_color, background_color, theme_variant, logo_treatment, kicker, headline, description, origin_label, style_label)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING *;
-    `, [name, slug, logoUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active']);
+    `, [name, slug, logoUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active', accentColor || '#C8AE7D', secondaryColor || '#F4F1EC', backgroundColor || '#080706', themeVariant || 'archive', logoTreatment || 'natural', kicker || null, headline || null, description || null, originLabel || null, styleLabel || null]);
     return result[0];
   }
 
   async updateBrand(id: string, body: any) {
-    const { name, logoUrl, website, displayOrder, isVisible, status } = body;
+    const { name, logoUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
     const slug = name ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '') : undefined;
     
     const fields: string[] = [];
@@ -5853,6 +5970,16 @@ async calculateCheckoutPricing(dto: any) {
     if (displayOrder !== undefined) { fields.push(`display_order = $${paramIndex++}`); params.push(displayOrder); }
     if (isVisible !== undefined) { fields.push(`is_visible = $${paramIndex++}`); params.push(isVisible); }
     if (status !== undefined) { fields.push(`status = $${paramIndex++}`); params.push(status); }
+    if (accentColor !== undefined) { fields.push(`accent_color = $${paramIndex++}`); params.push(accentColor); }
+    if (secondaryColor !== undefined) { fields.push(`secondary_color = $${paramIndex++}`); params.push(secondaryColor); }
+    if (backgroundColor !== undefined) { fields.push(`background_color = $${paramIndex++}`); params.push(backgroundColor); }
+    if (themeVariant !== undefined) { fields.push(`theme_variant = $${paramIndex++}`); params.push(themeVariant); }
+    if (logoTreatment !== undefined) { fields.push(`logo_treatment = $${paramIndex++}`); params.push(logoTreatment); }
+    if (kicker !== undefined) { fields.push(`kicker = $${paramIndex++}`); params.push(kicker); }
+    if (headline !== undefined) { fields.push(`headline = $${paramIndex++}`); params.push(headline); }
+    if (description !== undefined) { fields.push(`description = $${paramIndex++}`); params.push(description); }
+    if (originLabel !== undefined) { fields.push(`origin_label = $${paramIndex++}`); params.push(originLabel); }
+    if (styleLabel !== undefined) { fields.push(`style_label = $${paramIndex++}`); params.push(styleLabel); }
 
     if (fields.length === 0) return { success: true };
 
