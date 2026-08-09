@@ -27,6 +27,7 @@ export class AdminProductResponseDto {
   updatedAt: string;
   image?: string;
   manufacturer?: string;
+  isFeatured?: boolean;
   variants: VariantResponseDto[];
 
   static fromEntity(p: any): AdminProductResponseDto {
@@ -44,10 +45,11 @@ export class AdminProductResponseDto {
     dto.createdAt = p.createdAt || p.created_at;
     dto.updatedAt = p.updatedAt || p.updated_at;
     dto.image = p.image;
+    dto.isFeatured = p.isFeatured !== undefined ? Boolean(p.isFeatured) : Boolean(p.is_featured);
     dto.variants = (p.variants || []).map((v: any) => VariantResponseDto.fromEntity(v));
 
     // Fallbacks and aggregated metrics
-    const primaryVar = dto.variants.find(v => v.casing.toUpperCase() === 'BOX') || dto.variants[0];
+    const primaryVar = dto.variants[0];
     dto.sku = primaryVar ? primaryVar.sku : (p.sku || '');
     dto.price = primaryVar ? primaryVar.sellingPrice : Number(p.price || p.sellingPrice || 0);
     dto.purchasePrice = Number(p.purchasePrice || 0);
@@ -59,7 +61,7 @@ export class AdminProductResponseDto {
     dto.soldStock = dto.variants.reduce((sum, v) => sum + v.soldStock, 0);
 
     dto.supplier = p.supplier || '';
-    dto.casingTypes = dto.variants.map(v => v.casing);
+    dto.casingTypes = (p.casingTypes && p.casingTypes.length > 0) ? p.casingTypes : (dto.variants.length > 0 ? dto.variants.map(v => v.casing) : [p.casing || 'Blister']);
     dto.isPrebook = primaryVar ? primaryVar.salesStatus === 'Preorder' : !!p.isPrebook;
     dto.prebookDepositAmount = p.prebookDepositAmount ? Number(p.prebookDepositAmount) : undefined;
     dto.arrivalDate = primaryVar ? primaryVar.customerEta : p.arrivalDate;

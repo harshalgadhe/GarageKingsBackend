@@ -492,7 +492,8 @@ export class ApiService implements OnModuleInit {
       throw new BadRequestException('Email address already registered.');
     }
     const hash = hashPassword(pass);
-    const targetRole = emailClean === 'harshalgadhe123@gmail.com' ? 'Owner' : 'Collector';
+    const isOwnerEmail = emailClean === 'harshalgadhe123@gmail.com' || emailClean === 'garagekingsindia@gmail.com';
+    const targetRole = isOwnerEmail ? 'Owner' : 'Collector';
     const result = await this.dataSource.query(`
       INSERT INTO users (email, password_hash, role)
       VALUES ($1, $2, $3)
@@ -509,7 +510,8 @@ export class ApiService implements OnModuleInit {
     const user = rows[0];
     if (verifyPassword(pass, user.password_hash)) {
       let role = user.role;
-      if (emailClean === 'harshalgadhe123@gmail.com' && role !== 'Owner') {
+      const isOwnerEmail = emailClean === 'harshalgadhe123@gmail.com' || emailClean === 'garagekingsindia@gmail.com';
+      if (isOwnerEmail && role !== 'Owner') {
         role = 'Owner';
         await this.dataSource.query("UPDATE users SET role = 'Owner' WHERE id = $1", [user.id]);
       }
@@ -523,11 +525,12 @@ export class ApiService implements OnModuleInit {
     const emailClean = email.trim().toLowerCase();
     const existing = await this.dataSource.query("SELECT id, role, password_hash FROM users WHERE email = $1", [emailClean]);
     
-    const targetRole = emailClean === 'harshalgadhe123@gmail.com' ? 'Owner' : 'Collector';
+    const isOwnerEmail = emailClean === 'harshalgadhe123@gmail.com' || emailClean === 'garagekingsindia@gmail.com';
+    const targetRole = isOwnerEmail ? 'Owner' : 'Collector';
     
     if (existing.length > 0) {
-      await this.dataSource.query("UPDATE users SET password_hash = $1, role = CASE WHEN email = 'harshalgadhe123@gmail.com' THEN 'Owner' ELSE role END WHERE email = $2", [hash, emailClean]);
-      return { id: existing[0].id, email: emailClean, role: emailClean === 'harshalgadhe123@gmail.com' ? 'Owner' : existing[0].role };
+      await this.dataSource.query("UPDATE users SET password_hash = $1, role = CASE WHEN email IN ('harshalgadhe123@gmail.com', 'garagekingsindia@gmail.com') THEN 'Owner' ELSE role END WHERE email = $2", [hash, emailClean]);
+      return { id: existing[0].id, email: emailClean, role: isOwnerEmail ? 'Owner' : existing[0].role };
     } else {
       const result = await this.dataSource.query(`
         INSERT INTO users (email, password_hash, role)
@@ -810,7 +813,8 @@ export class ApiService implements OnModuleInit {
              ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
              p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage",
+             p.status, p.show_on_homepage as "showOnHomepage", p.is_featured as "isFeatured",
+             p.casing, p.casing_types as "casingTypes",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
              p.casing_types as "casingTypes",
@@ -884,14 +888,22 @@ export class ApiService implements OnModuleInit {
       const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount || 0));
       const priceVal = Number(car.price || car.sellingPrice || 0);
 
+      const rawCasing = car.casing || car.casingType || 'Blister';
+      const reqCasing = rawCasing.charAt(0).toUpperCase() + rawCasing.slice(1).toLowerCase();
+      const isFeaturedVal = car.isFeatured !== undefined ? Boolean(car.isFeatured) : Boolean(car.showOnHomepage);
+
+      if (isFeaturedVal) {
+        await queryRunner.query("UPDATE products SET is_featured = FALSE WHERE is_featured = TRUE AND deleted_at IS NULL;");
+      }
+
       const prodRes = await queryRunner.query(`
         INSERT INTO products (
-          sku, brand, model_name, series, scale, casing, base_price, selling_price, price,
-          po_amount, prebook_deposit_amount, stock, total_stock, available_stock, is_prebook, status,
+          sku, brand, model_name, series, scale, casing, casing_types, base_price, selling_price, price,
+          po_amount, prebook_deposit_amount, stock, total_stock, available_stock, is_prebook, is_featured, status,
           customer_eta, arrival_date, release_date, tag, subtags, tags, description, image, images,
           supplier, created_by, category
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
         RETURNING id;
       `, [
         sku,
@@ -899,7 +911,8 @@ export class ApiService implements OnModuleInit {
         car.name || 'Unknown Casting',
         car.series || 'Collector Series',
         car.scale || '1:64',
-        car.casing || car.casingType || 'Box',
+        reqCasing,
+        [reqCasing.toLowerCase()],
         priceVal,
         priceVal,
         priceVal,
@@ -909,6 +922,7 @@ export class ApiService implements OnModuleInit {
         initialStock,
         initialStock,
         Boolean(car.isPrebook),
+        isFeaturedVal,
         car.status || (car.isPrebook ? 'Pre-Order' : 'Published'),
         car.customerEta || car.arrivalDate || car.releaseDate || null,
         car.arrivalDate || car.customerEta || null,
@@ -978,8 +992,18 @@ export class ApiService implements OnModuleInit {
           ]);
         }
       } else {
-        // Fallback default variant if no variants array is provided
-        const casingTypeId = casingMap['BOX'] || casingTypesRes[0]?.id;
+        // Fallback default variant matching requested casing
+        let casingTypeId = casingMap[reqCasing.toUpperCase()];
+        if (!casingTypeId) {
+          const insRes = await queryRunner.query(`
+            INSERT INTO casing_types (name, display_name)
+            VALUES ($1, $2)
+            ON CONFLICT (name) DO UPDATE SET display_name = EXCLUDED.display_name
+            RETURNING id;
+          `, [reqCasing.toUpperCase(), reqCasing]);
+          casingTypeId = insRes[0]?.id;
+        }
+
         await queryRunner.query(`
           INSERT INTO product_variants (
             product_id, casing_type_id, sku, name, selling_price, visibility, status, sales_status, created_by
@@ -989,7 +1013,7 @@ export class ApiService implements OnModuleInit {
           productId,
           casingTypeId,
           sku,
-          `${car.name || 'Unknown Casting'} (Box)`,
+          `${car.name || 'Unknown Casting'} (${reqCasing})`,
           Number(car.price || 0),
           creatorEmail
         ]);
@@ -1059,21 +1083,30 @@ export class ApiService implements OnModuleInit {
       const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount !== undefined ? car.prebookDepositAmount : (oldData.po_amount || 0)));
       const priceVal = Number(car.price !== undefined ? car.price : (car.sellingPrice !== undefined ? car.sellingPrice : (oldData.price || 0)));
 
+      const rawCasing = car.casing || car.casingType || oldData.casing || 'Blister';
+      const reqCasing = rawCasing.charAt(0).toUpperCase() + rawCasing.slice(1).toLowerCase();
+      const isFeaturedVal = car.isFeatured !== undefined ? Boolean(car.isFeatured) : (car.showOnHomepage !== undefined ? Boolean(car.showOnHomepage) : oldData.is_featured);
+
+      if (isFeaturedVal && !oldData.is_featured) {
+        await queryRunner.query("UPDATE products SET is_featured = FALSE WHERE is_featured = TRUE AND id != $1 AND deleted_at IS NULL;", [id]);
+      }
+
       await queryRunner.query(`
         UPDATE products 
-        SET sku = $1, brand = $2, model_name = $3, series = $4, scale = $5, casing = $6,
-            base_price = $7, selling_price = $8, price = $9, po_amount = $10, prebook_deposit_amount = $11,
-            stock = $12, total_stock = $13, is_prebook = $14, status = $15, customer_eta = $16,
-            arrival_date = $17, release_date = $18, tag = $19, subtags = $20, tags = $21,
-            description = $22, image = $23, images = $24, supplier = $25, updated_by = $26, updated_at = NOW()
-        WHERE id = $27;
+        SET sku = $1, brand = $2, model_name = $3, series = $4, scale = $5, casing = $6, casing_types = $7,
+            base_price = $8, selling_price = $9, price = $10, po_amount = $11, prebook_deposit_amount = $12,
+            stock = $13, total_stock = $14, is_prebook = $15, is_featured = $16, status = $17, customer_eta = $18,
+            arrival_date = $19, release_date = $20, tag = $21, subtags = $22, tags = $23,
+            description = $24, image = $25, images = $26, supplier = $27, updated_by = $28, updated_at = NOW()
+        WHERE id = $29;
       `, [
         car.sku || oldData.sku,
         car.brand || oldData.brand,
         car.name || oldData.model_name,
         car.series !== undefined ? car.series : oldData.series,
         car.scale || oldData.scale,
-        car.casing || car.casingType || oldData.casing || 'Box',
+        reqCasing,
+        [reqCasing.toLowerCase()],
         priceVal,
         priceVal,
         priceVal,
@@ -1082,6 +1115,7 @@ export class ApiService implements OnModuleInit {
         finalStock,
         finalStock,
         car.isPrebook !== undefined ? Boolean(car.isPrebook) : oldData.is_prebook,
+        isFeaturedVal,
         car.status || oldData.status,
         car.customerEta !== undefined ? car.customerEta : (car.arrivalDate !== undefined ? car.arrivalDate : oldData.customer_eta),
         car.arrivalDate !== undefined ? car.arrivalDate : oldData.arrival_date,
@@ -1096,6 +1130,49 @@ export class ApiService implements OnModuleInit {
         updaterEmail,
         id
       ]);
+
+      // Sync product_images table
+      if (Array.isArray(car.images) || car.image) {
+        await queryRunner.query("DELETE FROM product_images WHERE product_id = $1;", [id]);
+        for (let idx = 0; idx < imageList.length; idx++) {
+          const imgUrl = imageList[idx];
+          const isPrimary = idx === 0;
+          await queryRunner.query(`
+            INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
+            VALUES ($1, $2, $3, $4, $5);
+          `, [id, imgUrl, imgUrl, imgUrl, isPrimary]);
+        }
+      }
+
+      // Update primary variant casing_type_id and name if casing was updated
+      const casingTypesRes = await queryRunner.query("SELECT id, name FROM casing_types;");
+      const casingMap = {};
+      for (const ct of casingTypesRes) {
+        casingMap[ct.name.toUpperCase()] = ct.id;
+      }
+      let casingTypeId = casingMap[reqCasing.toUpperCase()];
+      if (!casingTypeId) {
+        const insRes = await queryRunner.query(`
+          INSERT INTO casing_types (name, display_name)
+          VALUES ($1, $2)
+          ON CONFLICT (name) DO UPDATE SET display_name = EXCLUDED.display_name
+          RETURNING id;
+        `, [reqCasing.toUpperCase(), reqCasing]);
+        casingTypeId = insRes[0]?.id;
+      }
+
+      if (casingTypeId) {
+        await queryRunner.query(`
+          UPDATE product_variants 
+          SET casing_type_id = $1, 
+              name = $2,
+              selling_price = $3,
+              updated_at = NOW()
+          WHERE id = (
+            SELECT id FROM product_variants WHERE product_id = $4 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1
+          );
+        `, [casingTypeId, `${car.name || oldData.model_name || 'Unknown Casting'} (${reqCasing})`, priceVal, id]);
+      }
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
       localCache.del('products_list_false');
