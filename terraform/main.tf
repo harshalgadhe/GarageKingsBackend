@@ -28,11 +28,24 @@ variable "environment" {
   default = "production"
 }
 
+variable "db_master_password" {
+  type        = string
+  sensitive   = true
+  description = "RDS master password supplied through TF_VAR_db_master_password"
+}
+
+variable "app_database_url" {
+  type        = string
+  sensitive   = true
+  description = "Least-privilege gk_app connection URL supplied through TF_VAR_app_database_url"
+}
+
 # 1. VPC Networking Configurations
 resource "aws_vpc" "gk_vpc" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+  cidr_block                       = "10.0.0.0/16"
+  assign_generated_ipv6_cidr_block = true
+  enable_dns_hostnames             = true
+  enable_dns_support               = true
   tags = {
     Name = "gk-${var.environment}-vpc"
   }
@@ -40,31 +53,35 @@ resource "aws_vpc" "gk_vpc" {
 
 # Subnets (2 Public for CloudFront/Lambda outbound, 2 Private for RDS)
 resource "aws_subnet" "public_1" {
-  vpc_id            = aws_vpc.gk_vpc.id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "${var.aws_region}a"
-  tags = { Name = "gk-public-subnet-1" }
+  vpc_id                          = aws_vpc.gk_vpc.id
+  cidr_block                      = "10.0.1.0/24"
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc.gk_vpc.ipv6_cidr_block, 8, 0)
+  assign_ipv6_address_on_creation = true
+  availability_zone               = "${var.aws_region}a"
+  tags                            = { Name = "gk-public-subnet-1" }
 }
 
 resource "aws_subnet" "public_2" {
-  vpc_id            = aws_vpc.gk_vpc.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = "${var.aws_region}b"
-  tags = { Name = "gk-public-subnet-2" }
+  vpc_id                          = aws_vpc.gk_vpc.id
+  cidr_block                      = "10.0.2.0/24"
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc.gk_vpc.ipv6_cidr_block, 8, 1)
+  assign_ipv6_address_on_creation = true
+  availability_zone               = "${var.aws_region}b"
+  tags                            = { Name = "gk-public-subnet-2" }
 }
 
 resource "aws_subnet" "private_1" {
   vpc_id            = aws_vpc.gk_vpc.id
   cidr_block        = "10.0.3.0/24"
   availability_zone = "${var.aws_region}a"
-  tags = { Name = "gk-private-subnet-1" }
+  tags              = { Name = "gk-private-subnet-1" }
 }
 
 resource "aws_subnet" "private_2" {
   vpc_id            = aws_vpc.gk_vpc.id
   cidr_block        = "10.0.4.0/24"
   availability_zone = "${var.aws_region}b"
-  tags = { Name = "gk-private-subnet-2" }
+  tags              = { Name = "gk-private-subnet-2" }
 }
 
 # Internet Gateway
@@ -73,6 +90,39 @@ resource "aws_internet_gateway" "igw" {
   tags = {
     Name = "gk-${var.environment}-igw"
   }
+}
+
+resource "aws_egress_only_internet_gateway" "lambda_ipv6" {
+  vpc_id = aws_vpc.gk_vpc.id
+  tags   = { Name = "gk-${var.environment}-ipv6-egress" }
+}
+
+resource "aws_route_table" "lambda_private_rt" {
+  vpc_id = aws_vpc.gk_vpc.id
+
+  route {
+    ipv6_cidr_block        = "::/0"
+    egress_only_gateway_id = aws_egress_only_internet_gateway.lambda_ipv6.id
+  }
+
+  tags = { Name = "gk-${var.environment}-lambda-private-rt" }
+}
+
+resource "aws_route_table_association" "lambda_1_assoc" {
+  subnet_id      = aws_subnet.public_1.id
+  route_table_id = aws_route_table.lambda_private_rt.id
+}
+
+resource "aws_route_table_association" "lambda_2_assoc" {
+  subnet_id      = aws_subnet.public_2.id
+  route_table_id = aws_route_table.lambda_private_rt.id
+}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.gk_vpc.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.lambda_private_rt.id]
 }
 
 # Route Table for Public/Database Subnets
@@ -102,7 +152,7 @@ resource "aws_route_table_association" "private_2_assoc" {
 resource "aws_db_subnet_group" "db_subnet" {
   name       = "gk-${var.environment}-db-subnet-group"
   subnet_ids = [aws_subnet.private_1.id, aws_subnet.private_2.id]
-  tags = { Name = "gk-db-subnet-group" }
+  tags       = { Name = "gk-db-subnet-group" }
 }
 
 # Security Groups
@@ -111,12 +161,11 @@ resource "aws_security_group" "db_sg" {
   description = "Access to private PostgreSQL RDS"
   vpc_id      = aws_vpc.gk_vpc.id
 
-  # Ingress allowed from all IP addresses to support Lambda outside VPC & local migrations (port shifted to non-standard)
   ingress {
-    from_port   = 25432
-    to_port     = 25432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port       = 25432
+    to_port         = 25432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lambda_sg.id]
   }
 
   egress {
@@ -124,6 +173,20 @@ resource "aws_security_group" "db_sg" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "lambda_sg" {
+  name        = "gk-${var.environment}-lambda-sg"
+  description = "Outbound-only Lambda access to private services"
+  vpc_id      = aws_vpc.gk_vpc.id
+
+  egress {
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
   }
 }
 
@@ -138,12 +201,12 @@ resource "aws_db_instance" "postgres" {
   db_subnet_group_name   = aws_db_subnet_group.db_subnet.name
   vpc_security_group_ids = [aws_security_group.db_sg.id]
   username               = "gk_admin"
-  password               = "GkProdDbSec_981a8dc71f"
+  password               = var.db_master_password
   db_name                = "garagekings_prod"
   port                   = 25432
   skip_final_snapshot    = true
-  publicly_accessible    = true # Enabled for Zero-Cost VPC Routing (Lambda outside VPC)
-  
+  publicly_accessible    = false
+
   # Automated Backup (Free PITR - Set to 0 to satisfy sandbox constraints)
   backup_retention_period = 0
 }
@@ -152,7 +215,7 @@ resource "aws_db_instance" "postgres" {
 resource "aws_cognito_user_pool" "user_pool" {
   name = "gk-${var.environment}-user-pool"
 
-  username_attributes = ["email"]
+  username_attributes      = ["email"]
   auto_verified_attributes = ["email"]
 
   password_policy {
@@ -197,8 +260,8 @@ resource "aws_iam_role" "lambda_role" {
     Version = "2012-10-17"
     Statement = [
       {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
         Principal = { Service = "lambda.amazonaws.com" }
       }
     ]
@@ -254,15 +317,22 @@ resource "aws_lambda_function" "api_monolith" {
     ]
   }
 
+  vpc_config {
+    subnet_ids                  = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+    security_group_ids          = [aws_security_group.lambda_sg.id]
+    ipv6_allowed_for_dual_stack = true
+  }
+
   environment {
     variables = {
-      NODE_ENV              = "production"
-      DATABASE_URL          = "postgresql://gk_admin:GkProdDbSec_981a8dc71f@${aws_db_instance.postgres.endpoint}/garagekings_prod"
-      COGNITO_USER_POOL_ID  = aws_cognito_user_pool.user_pool.id
-      COGNITO_CLIENT_ID     = aws_cognito_user_pool_client.client.id
-      GOOGLE_CLIENT_ID      = "231477217878-0g2nq0e6fmvqt802gdu8esm1uucfmjvv.apps.googleusercontent.com"
-      S3_ASSETS_BUCKET      = aws_s3_bucket.assets_bucket.id
-      DATABASE_SSL          = "true"
+      NODE_ENV             = "production"
+      NODE_OPTIONS         = "--dns-result-order=ipv6first"
+      DATABASE_URL         = var.app_database_url
+      COGNITO_USER_POOL_ID = aws_cognito_user_pool.user_pool.id
+      COGNITO_CLIENT_ID    = aws_cognito_user_pool_client.client.id
+      GOOGLE_CLIENT_ID     = "231477217878-0g2nq0e6fmvqt802gdu8esm1uucfmjvv.apps.googleusercontent.com"
+      S3_ASSETS_BUCKET     = aws_s3_bucket.assets_bucket.id
+      DATABASE_SSL         = "true"
     }
   }
 }
@@ -272,11 +342,11 @@ resource "aws_lambda_function_url" "api_furl" {
   authorization_type = "AWS_IAM"
 
   cors {
-    allow_origins     = ["*"]
-    allow_methods     = ["*"]
-    allow_headers     = ["*"]
-    expose_headers    = ["keep-alive", "date"]
-    max_age           = 86400
+    allow_origins  = ["*"]
+    allow_methods  = ["*"]
+    allow_headers  = ["*"]
+    expose_headers = ["keep-alive", "date"]
+    max_age        = 86400
   }
 }
 
