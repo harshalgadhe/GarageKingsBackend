@@ -3,7 +3,7 @@ const { Pool } = pkg;
 import dotenv from 'dotenv';
 import fs from 'fs';
 dotenv.config({ path: 'C:/Users/harsh/Desktop/Project/GarageKings/server/.env' });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } });
 const client = await pool.connect();
 
 // Read receipts

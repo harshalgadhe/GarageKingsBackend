@@ -18,7 +18,7 @@ async function seedReceipts() {
 
   const pgPool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' }
   });
 
   // Get a fresh connection for reads

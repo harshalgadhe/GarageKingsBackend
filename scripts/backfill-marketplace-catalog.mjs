@@ -18,7 +18,7 @@ const imageManifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(m
 const unresolvedImages = fs.existsSync(unresolvedPath) ? JSON.parse(fs.readFileSync(unresolvedPath, 'utf8')) : [];
 
 const dbUrl = process.env.DATABASE_URL;
-const sslOption = process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false;
+const sslOption = process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : false;
 
 const pool = new Pool({
   connectionString: dbUrl,

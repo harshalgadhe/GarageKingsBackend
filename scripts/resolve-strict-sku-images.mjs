@@ -107,7 +107,7 @@ function getBufferHash(buffer) {
 }
 
 const dbUrl = process.env.DATABASE_URL;
-const sslOption = process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false;
+const sslOption = process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : false;
 const pool = new Pool({ connectionString: dbUrl, ssl: sslOption });
 
 const bucketName = process.env.S3_ASSETS_BUCKET || 'gk-production-public-assets-2026';

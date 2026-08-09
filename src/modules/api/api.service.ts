@@ -498,8 +498,7 @@ export class ApiService implements OnModuleInit {
       throw new BadRequestException('Email address already registered.');
     }
     const hash = hashPassword(pass);
-    const isOwnerEmail = emailClean === 'harshalgadhe123@gmail.com' || emailClean === 'garagekingsindia@gmail.com';
-    const targetRole = isOwnerEmail ? 'Owner' : 'Collector';
+    const targetRole = 'Collector';
     const result = await this.dataSource.query(`
       INSERT INTO users (email, password_hash, role)
       VALUES ($1, $2, $3)
@@ -515,13 +514,7 @@ export class ApiService implements OnModuleInit {
     
     const user = rows[0];
     if (verifyPassword(pass, user.password_hash)) {
-      let role = user.role;
-      const isOwnerEmail = emailClean === 'harshalgadhe123@gmail.com' || emailClean === 'garagekingsindia@gmail.com';
-      if (isOwnerEmail && role !== 'Owner') {
-        role = 'Owner';
-        await this.dataSource.query("UPDATE users SET role = 'Owner' WHERE id = $1", [user.id]);
-      }
-      return { id: user.id, email: user.email, role };
+      return { id: user.id, email: user.email, role: user.role };
     }
     return null;
   }
@@ -547,12 +540,11 @@ export class ApiService implements OnModuleInit {
     const emailClean = email.trim().toLowerCase();
     const existing = await this.dataSource.query("SELECT id, role, password_hash FROM users WHERE email = $1", [emailClean]);
     
-    const isOwnerEmail = emailClean === 'harshalgadhe123@gmail.com' || emailClean === 'garagekingsindia@gmail.com';
-    const targetRole = isOwnerEmail ? 'Owner' : 'Collector';
+    const targetRole = 'Collector';
     
     if (existing.length > 0) {
-      await this.dataSource.query("UPDATE users SET password_hash = $1, role = CASE WHEN email IN ('harshalgadhe123@gmail.com', 'garagekingsindia@gmail.com') THEN 'Owner' ELSE role END WHERE email = $2", [hash, emailClean]);
-      return { id: existing[0].id, email: emailClean, role: isOwnerEmail ? 'Owner' : existing[0].role };
+      await this.dataSource.query("UPDATE users SET password_hash = $1 WHERE email = $2", [hash, emailClean]);
+      return { id: existing[0].id, email: emailClean, role: existing[0].role };
     } else {
       const result = await this.dataSource.query(`
         INSERT INTO users (email, password_hash, role)
@@ -577,7 +569,9 @@ export class ApiService implements OnModuleInit {
     const rows = await this.dataSource.query("SELECT refresh_token_hash FROM users WHERE id = $1 AND deleted_at IS NULL", [userId]);
     if (rows.length === 0 || !rows[0].refresh_token_hash) return false;
     const expectedHash = crypto.createHash('sha256').update(token).digest('hex');
-    return expectedHash === rows[0].refresh_token_hash;
+    const storedHash = String(rows[0].refresh_token_hash);
+    return expectedHash.length === storedHash.length
+      && crypto.timingSafeEqual(Buffer.from(expectedHash), Buffer.from(storedHash));
   }
 
   // ── INVENTORY MODULE ───────────────────────────────────────────────
@@ -722,6 +716,27 @@ export class ApiService implements OnModuleInit {
     const payload = { featured: featured[0] || null, recent };
     localCache.set(cacheKey, payload, 30);
     return payload;
+  }
+
+  async setUserRole(email: string, role: string, performedBy: string, ipAddress: string) {
+    const emailClean = String(email || '').trim().toLowerCase();
+    const allowedRoles = new Set(['Admin', 'Collector', 'Warehouse']);
+    if (!/^\S+@\S+\.\S+$/.test(emailClean)) throw new BadRequestException('Enter a valid email address.');
+    if (!allowedRoles.has(role)) throw new BadRequestException('Role must be Admin, Collector, or Warehouse.');
+
+    const beforeRows = await this.dataSource.query(
+      'SELECT id, email, role FROM users WHERE email = $1 AND deleted_at IS NULL LIMIT 1;',
+      [emailClean]
+    );
+    const result = await this.dataSource.query(`
+      INSERT INTO users (email, role)
+      VALUES ($1, $2)
+      ON CONFLICT (email) DO UPDATE
+      SET role = EXCLUDED.role, updated_at = NOW(), deleted_at = NULL
+      RETURNING id, email, role;
+    `, [emailClean, role]);
+    await this.writeAuditLog('USER_ROLE_CHANGED', 'users', result[0].id, performedBy, ipAddress, beforeRows[0] || null, result[0]);
+    return result[0];
   }
 
   async getPaginatedProducts(options: {
@@ -1912,13 +1927,13 @@ async calculateCheckoutPricing(dto: any) {
     const fileName = `${crypto.randomUUID()}.${ext}`;
     
     // 5. Save receipt file (S3 or local filesystem)
-    if (process.env.S3_ASSETS_BUCKET) {
+    if (process.env.S3_PRIVATE_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
         const s3 = new S3Client({
           region: process.env.AWS_REGION?.trim() || 'ap-south-1'
         });
-        const bucket = process.env.S3_ASSETS_BUCKET.trim();
+        const bucket = process.env.S3_PRIVATE_BUCKET.trim();
         await s3.send(new PutObjectCommand({
           Bucket: bucket,
           Key: `uploads/${fileName}`,
@@ -2020,12 +2035,12 @@ async calculateCheckoutPricing(dto: any) {
     const fileName = rows[0].screenshot_url || rows[0].advance_screenshot_url;
     if (!fileName) return null;
 
-    if (process.env.S3_ASSETS_BUCKET) {
+    if (process.env.S3_PRIVATE_BUCKET) {
       try {
         const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
         const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
         const res = await s3.send(new GetObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: process.env.S3_PRIVATE_BUCKET,
           Key: `uploads/${fileName}`
         }));
         return {
@@ -3032,17 +3047,17 @@ async calculateCheckoutPricing(dto: any) {
 
     const fileName = `remain_${crypto.randomUUID()}.${fileExtension}`;
     
-    if (process.env.S3_ASSETS_BUCKET) {
+    if (process.env.S3_PRIVATE_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
         const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
         await s3.send(new PutObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: process.env.S3_PRIVATE_BUCKET,
           Key: `uploads/${fileName}`,
           Body: fileBuffer,
           ContentType: `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
         }));
-        console.log(`[S3] Successfully uploaded remaining screenshot ${fileName} to bucket ${process.env.S3_ASSETS_BUCKET}`);
+        console.log(`[S3] Successfully uploaded remaining payment evidence ${fileName}.`);
       } catch (err: any) {
         console.error(`[S3] Failed to upload remaining screenshot to S3: ${err.message}`);
         throw err;
@@ -3121,12 +3136,12 @@ async calculateCheckoutPricing(dto: any) {
     const fileName = `remain_${crypto.randomUUID()}.${ext}`;
     
     // C. Save receipt file
-    if (process.env.S3_ASSETS_BUCKET) {
+    if (process.env.S3_PRIVATE_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
         const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
         await s3.send(new PutObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: process.env.S3_PRIVATE_BUCKET,
           Key: `uploads/${fileName}`,
           Body: fileBuffer,
           ContentType: `image/${ext === 'jpg' ? 'jpeg' : ext}`
@@ -3709,10 +3724,10 @@ async calculateCheckoutPricing(dto: any) {
         COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND LOWER(COALESCE(format_type, 'standard')) IN ('prebooking', 'pre_order', 'po')), 0)::float AS "poRevenue",
         COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided'), 0)::float AS "totalRevenue",
         COALESCE(AVG(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided'), 0)::float AS "avgReceiptValue",
-        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= DATE_TRUNC('month', CURRENT_DATE)), 0)::float AS "thisMonthRevenue",
-        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' AND created_at < DATE_TRUNC('month', CURRENT_DATE)), 0)::float AS "lastMonthRevenue",
-        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= CURRENT_DATE - INTERVAL '6 days'), 0)::float AS "thisWeekRevenue",
-        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND created_at >= CURRENT_DATE - INTERVAL '13 days' AND created_at < CURRENT_DATE - INTERVAL '6 days'), 0)::float AS "lastWeekRevenue"
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND COALESCE(receipt_date, created_at) >= DATE_TRUNC('month', CURRENT_DATE)), 0)::float AS "thisMonthRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND COALESCE(receipt_date, created_at) >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 month' AND COALESCE(receipt_date, created_at) < DATE_TRUNC('month', CURRENT_DATE)), 0)::float AS "lastMonthRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND COALESCE(receipt_date, created_at) >= CURRENT_DATE - INTERVAL '6 days'), 0)::float AS "thisWeekRevenue",
+        COALESCE(SUM(total_amount) FILTER (WHERE COALESCE(status, 'Issued') <> 'Voided' AND COALESCE(receipt_date, created_at) >= CURRENT_DATE - INTERVAL '13 days' AND COALESCE(receipt_date, created_at) < CURRENT_DATE - INTERVAL '6 days'), 0)::float AS "lastWeekRevenue"
       FROM receipts;
     `);
     const receiptChartQuery = (startExpression: string, step: string, count: number, labelExpression: string) => `
@@ -3726,8 +3741,8 @@ async calculateCheckoutPricing(dto: any) {
         COALESCE(SUM(r.total_amount), 0)::float AS total
       FROM buckets b
       LEFT JOIN receipts r
-        ON r.created_at >= b.bucket_start
-       AND r.created_at < b.bucket_start + INTERVAL '1 ${step}'
+        ON COALESCE(r.receipt_date, r.created_at) >= b.bucket_start
+       AND COALESCE(r.receipt_date, r.created_at) < b.bucket_start + INTERVAL '1 ${step}'
        AND COALESCE(r.status, 'Issued') <> 'Voided'
       GROUP BY b.bucket_start
       ORDER BY b.bucket_start;
@@ -6125,12 +6140,12 @@ async calculateCheckoutPricing(dto: any) {
 
   async addSupplierPurchaseAttachment(purchaseId: string, fileBuffer: Buffer, fileName: string, fileExtension: string, adminEmail: string) {
     const generatedName = `${crypto.randomUUID()}.${fileExtension}`;
-    if (process.env.S3_ASSETS_BUCKET) {
+    if (process.env.S3_PRIVATE_BUCKET) {
       try {
         const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3');
         const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
         await s3.send(new PutObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: process.env.S3_PRIVATE_BUCKET,
           Key: `attachments/${generatedName}`,
           Body: fileBuffer,
           ContentType: fileExtension === 'pdf' ? 'application/pdf' : `image/${fileExtension === 'jpg' ? 'jpeg' : fileExtension}`
@@ -6163,12 +6178,12 @@ async calculateCheckoutPricing(dto: any) {
     const generatedName = rows[0].file_path;
     const originalName = rows[0].file_name;
 
-    if (process.env.S3_ASSETS_BUCKET) {
+    if (process.env.S3_PRIVATE_BUCKET) {
       try {
         const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
         const s3 = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1' });
         const res = await s3.send(new GetObjectCommand({
-          Bucket: process.env.S3_ASSETS_BUCKET,
+          Bucket: process.env.S3_PRIVATE_BUCKET,
           Key: `attachments/${generatedName}`
         }));
         return {

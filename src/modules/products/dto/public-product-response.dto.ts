@@ -7,10 +7,7 @@ export class VariantResponseDto {
   visibility: string;
   status: string;
   salesStatus: string;
-  totalStock: number;
-  availableStock: number;
-  lockedStock: number;
-  soldStock: number;
+  availabilityState: 'IN_STOCK' | 'LOW_STOCK' | 'OUT_OF_STOCK';
   casing: string;
   casingDisplay: string;
 
@@ -24,10 +21,8 @@ export class VariantResponseDto {
     dto.visibility = v.visibility;
     dto.status = v.status;
     dto.salesStatus = v.salesStatus;
-    dto.totalStock = Number(v.totalStock || 0);
-    dto.availableStock = Number(v.availableStock || 0);
-    dto.lockedStock = Number(v.lockedStock || 0);
-    dto.soldStock = Number(v.soldStock || 0);
+    const available = Number(v.availableStock || 0);
+    dto.availabilityState = available <= 0 ? 'OUT_OF_STOCK' : available <= 3 ? 'LOW_STOCK' : 'IN_STOCK';
     dto.casing = v.casing || '';
     dto.casingDisplay = v.casingDisplay || '';
     return dto;
@@ -77,7 +72,7 @@ export class PublicProductResponseDto {
     dto.arrivalDate = primaryVar ? primaryVar.customerEta : p.arrivalDate;
     dto.casingTypes = dto.variants.map(v => v.casing);
 
-    const available = dto.variants.reduce((sum, v) => sum + v.availableStock, 0);
+    const available = (p.variants || []).reduce((sum: number, v: any) => sum + Number(v.availableStock || 0), 0);
     if (dto.isPrebook) {
       dto.availabilityState = 'PREORDER';
     } else if (dto.releaseDate && new Date(dto.releaseDate) > new Date()) {

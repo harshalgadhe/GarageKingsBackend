@@ -40,6 +40,22 @@ variable "app_database_url" {
   description = "Least-privilege gk_app connection URL supplied through TF_VAR_app_database_url"
 }
 
+variable "jwt_secret" {
+  type        = string
+  sensitive   = true
+  description = "Random JWT signing secret of at least 32 characters supplied through TF_VAR_jwt_secret"
+  validation {
+    condition     = length(var.jwt_secret) >= 32
+    error_message = "jwt_secret must contain at least 32 characters."
+  }
+}
+
+variable "owner_setup_token" {
+  type        = string
+  sensitive   = true
+  description = "One-time bootstrap token supplied through TF_VAR_owner_setup_token"
+}
+
 # 1. VPC Networking Configurations
 resource "aws_vpc" "gk_vpc" {
   cidr_block                       = "10.0.0.0/16"
@@ -125,29 +141,6 @@ resource "aws_vpc_endpoint" "s3" {
   route_table_ids   = [aws_route_table.lambda_private_rt.id]
 }
 
-# Route Table for Public/Database Subnets
-resource "aws_route_table" "public_rt" {
-  vpc_id = aws_vpc.gk_vpc.id
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
-  }
-  tags = {
-    Name = "gk-${var.environment}-public-rt"
-  }
-}
-
-# Associate Private Subnets (Database subnets) with Route Table to enable public pathing
-resource "aws_route_table_association" "private_1_assoc" {
-  subnet_id      = aws_subnet.private_1.id
-  route_table_id = aws_route_table.public_rt.id
-}
-
-resource "aws_route_table_association" "private_2_assoc" {
-  subnet_id      = aws_subnet.private_2.id
-  route_table_id = aws_route_table.public_rt.id
-}
-
 # Database Subnet Group
 resource "aws_db_subnet_group" "db_subnet" {
   name       = "gk-${var.environment}-db-subnet-group"
@@ -161,19 +154,6 @@ resource "aws_security_group" "db_sg" {
   description = "Access to private PostgreSQL RDS"
   vpc_id      = aws_vpc.gk_vpc.id
 
-  ingress {
-    from_port       = 25432
-    to_port         = 25432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.lambda_sg.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 }
 
 resource "aws_security_group" "lambda_sg" {
@@ -182,33 +162,71 @@ resource "aws_security_group" "lambda_sg" {
   vpc_id      = aws_vpc.gk_vpc.id
 
   egress {
-    from_port        = 0
-    to_port          = 0
-    protocol         = "-1"
-    cidr_blocks      = ["0.0.0.0/0"]
+    description      = "HTTPS to AWS and OAuth services over controlled IPv6 egress"
+    from_port        = 443
+    to_port          = 443
+    protocol         = "tcp"
     ipv6_cidr_blocks = ["::/0"]
   }
 }
 
+resource "aws_security_group_rule" "db_from_lambda" {
+  type                     = "ingress"
+  description              = "PostgreSQL from application Lambda only"
+  from_port                = 25432
+  to_port                  = 25432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.db_sg.id
+  source_security_group_id = aws_security_group.lambda_sg.id
+}
+
+resource "aws_security_group_rule" "lambda_to_db" {
+  type                     = "egress"
+  description              = "PostgreSQL to RDS only"
+  from_port                = 25432
+  to_port                  = 25432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.lambda_sg.id
+  source_security_group_id = aws_security_group.db_sg.id
+}
+
+data "aws_prefix_list" "s3" {
+  name = "com.amazonaws.${var.aws_region}.s3"
+}
+
+resource "aws_security_group_rule" "lambda_to_s3" {
+  type              = "egress"
+  description       = "HTTPS to S3 through the VPC gateway endpoint"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  security_group_id = aws_security_group.lambda_sg.id
+  prefix_list_ids   = [data.aws_prefix_list.s3.id]
+}
+
 # 2. Private RDS PostgreSQL Database Instance
 resource "aws_db_instance" "postgres" {
-  identifier             = "gk-${var.environment}-postgres"
-  engine                 = "postgres"
-  engine_version         = "16.13"
-  instance_class         = "db.t4g.micro" # Free Tier Eligible
-  allocated_storage      = 20             # 20GB Free Tier GP3
-  storage_type           = "gp3"
-  db_subnet_group_name   = aws_db_subnet_group.db_subnet.name
-  vpc_security_group_ids = [aws_security_group.db_sg.id]
-  username               = "gk_admin"
-  password               = var.db_master_password
-  db_name                = "garagekings_prod"
-  port                   = 25432
-  skip_final_snapshot    = true
-  publicly_accessible    = false
+  identifier                 = "gk-${var.environment}-postgres"
+  engine                     = "postgres"
+  engine_version             = "16.13"
+  instance_class             = "db.t4g.micro" # Free Tier Eligible
+  allocated_storage          = 20             # 20GB Free Tier GP3
+  storage_type               = "gp3"
+  db_subnet_group_name       = aws_db_subnet_group.db_subnet.name
+  vpc_security_group_ids     = [aws_security_group.db_sg.id]
+  username                   = "gk_admin"
+  password                   = var.db_master_password
+  db_name                    = "garagekings_prod"
+  port                       = 25432
+  skip_final_snapshot        = false
+  final_snapshot_identifier  = "gk-${var.environment}-postgres-final"
+  publicly_accessible        = false
+  deletion_protection        = true
+  storage_encrypted          = true
+  auto_minor_version_upgrade = true
 
-  # Automated Backup (Free PITR - Set to 0 to satisfy sandbox constraints)
-  backup_retention_period = 0
+  backup_retention_period = 7
+  copy_tags_to_snapshot   = true
 }
 
 # 3. AWS Cognito User Pool
@@ -240,7 +258,68 @@ resource "aws_cognito_user_pool_client" "client" {
 # 4. Amazon S3 Bucket (Product Images & Receipts)
 resource "aws_s3_bucket" "assets_bucket" {
   bucket        = "gk-${var.environment}-public-assets-2026"
-  force_destroy = true
+  force_destroy = false
+}
+
+resource "aws_s3_bucket" "private_documents_bucket" {
+  bucket        = "gk-${var.environment}-private-documents-2026"
+  force_destroy = false
+}
+
+resource "aws_s3_bucket_versioning" "assets" {
+  bucket = aws_s3_bucket.assets_bucket.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "assets" {
+  bucket = aws_s3_bucket.assets_bucket.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "private_documents" {
+  bucket                  = aws_s3_bucket.private_documents_bucket.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "private_documents" {
+  bucket = aws_s3_bucket.private_documents_bucket.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "private_documents" {
+  bucket = aws_s3_bucket.private_documents_bucket.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "private_documents" {
+  bucket = aws_s3_bucket.private_documents_bucket.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.private_documents_bucket.arn,
+        "${aws_s3_bucket.private_documents_bucket.arn}/*"
+      ]
+      Condition = {
+        Bool = { "aws:SecureTransport" = "false" }
+      }
+    }]
+  })
 }
 
 resource "aws_s3_bucket_public_access_block" "block" {
@@ -291,6 +370,12 @@ resource "aws_iam_role_policy" "lambda_s3_assets" {
           "s3:PutObject"
         ]
         Resource = "${aws_s3_bucket.assets_bucket.arn}/uploads/*"
+      },
+      {
+        Sid      = "PrivateDocumentStorage"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.private_documents_bucket.arn}/*"
       }
     ]
   })
@@ -325,14 +410,19 @@ resource "aws_lambda_function" "api_monolith" {
 
   environment {
     variables = {
-      NODE_ENV             = "production"
-      NODE_OPTIONS         = "--dns-result-order=ipv6first"
-      DATABASE_URL         = var.app_database_url
-      COGNITO_USER_POOL_ID = aws_cognito_user_pool.user_pool.id
-      COGNITO_CLIENT_ID    = aws_cognito_user_pool_client.client.id
-      GOOGLE_CLIENT_ID     = "231477217878-0g2nq0e6fmvqt802gdu8esm1uucfmjvv.apps.googleusercontent.com"
-      S3_ASSETS_BUCKET     = aws_s3_bucket.assets_bucket.id
-      DATABASE_SSL         = "true"
+      NODE_ENV                         = "production"
+      NODE_OPTIONS                     = "--dns-result-order=ipv6first"
+      DATABASE_URL                     = var.app_database_url
+      COGNITO_USER_POOL_ID             = aws_cognito_user_pool.user_pool.id
+      COGNITO_CLIENT_ID                = aws_cognito_user_pool_client.client.id
+      GOOGLE_CLIENT_ID                 = "231477217878-0g2nq0e6fmvqt802gdu8esm1uucfmjvv.apps.googleusercontent.com"
+      S3_ASSETS_BUCKET                 = aws_s3_bucket.assets_bucket.id
+      DATABASE_SSL                     = "true"
+      DATABASE_SSL_REJECT_UNAUTHORIZED = "true"
+      JWT_SECRET                       = var.jwt_secret
+      OWNER_SETUP_TOKEN                = var.owner_setup_token
+      CORS_ALLOWED_ORIGINS             = "https://garagekingsindia.com,https://www.garagekingsindia.com"
+      S3_PRIVATE_BUCKET                = aws_s3_bucket.private_documents_bucket.id
     }
   }
 }
@@ -342,11 +432,12 @@ resource "aws_lambda_function_url" "api_furl" {
   authorization_type = "AWS_IAM"
 
   cors {
-    allow_origins  = ["*"]
-    allow_methods  = ["*"]
-    allow_headers  = ["*"]
-    expose_headers = ["keep-alive", "date"]
-    max_age        = 86400
+    allow_credentials = true
+    allow_origins     = ["https://garagekingsindia.com", "https://www.garagekingsindia.com"]
+    allow_methods     = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+    allow_headers     = ["Content-Type", "Authorization", "X-Correlation-Id", "X-CSRF-Token"]
+    expose_headers    = ["X-Correlation-Id"]
+    max_age           = 86400
   }
 }
 
@@ -468,7 +559,20 @@ resource "aws_s3_bucket_policy" "assets_bucket_policy" {
         Effect    = "Allow"
         Principal = "*"
         Action    = "s3:GetObject"
-        Resource  = "${aws_s3_bucket.assets_bucket.arn}/*"
+        Resource  = "${aws_s3_bucket.assets_bucket.arn}/uploads/*"
+      },
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+        Resource = [
+          aws_s3_bucket.assets_bucket.arn,
+          "${aws_s3_bucket.assets_bucket.arn}/*"
+        ]
+        Condition = {
+          Bool = { "aws:SecureTransport" = "false" }
+        }
       }
     ]
   })

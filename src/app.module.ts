@@ -10,6 +10,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter.js';
 import { ObservabilityModule } from './modules/observability/observability.module.js';
 import { TraceMiddleware } from './common/middleware/trace.middleware.js';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor.js';
+import { MulterModule } from '@nestjs/platform-express';
 
 // New Feature Modules
 import { ProductsModule } from './modules/products/products.module.js';
@@ -30,6 +31,14 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
       ttl: 60000, // Time-to-Live window of 1 minute (60 seconds)
       limit: 60,  // Max 60 requests per IP address in this window
     }]),
+    MulterModule.register({
+      limits: {
+        fileSize: 10 * 1024 * 1024,
+        files: 1,
+        fields: 20,
+        fieldSize: 64 * 1024
+      }
+    }),
 
     // 3. Domain Modules
     ReceiptsModule,

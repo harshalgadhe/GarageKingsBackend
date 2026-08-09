@@ -11,6 +11,8 @@ export interface CreateReceiptItemDto {
 export interface CreateReceiptDto {
   id?: string;
   receiptNumber: string;
+  receiptDate?: string;
+  dateString?: string;
   customerId?: string;
   formatType?: string;
   taxPercent?: number;
@@ -35,6 +37,12 @@ export interface VoidReceiptDto {
 export function validateCreateReceipt(dto: CreateReceiptDto) {
   if (!dto || !dto.receiptNumber?.trim()) throw new BadRequestException('Receipt number is required.');
   if (dto.receiptNumber.trim().length > 100) throw new BadRequestException('Receipt number must be 100 characters or fewer.');
+  if (dto.receiptDate && Number.isNaN(new Date(dto.receiptDate).getTime())) {
+    throw new BadRequestException('Receipt date is invalid.');
+  }
+  if (dto.dateString && dto.dateString.trim().length > 150) {
+    throw new BadRequestException('Receipt date label must be 150 characters or fewer.');
+  }
   if (!Array.isArray(dto.items) || dto.items.length === 0 || dto.items.length > 100) {
     throw new BadRequestException('A receipt must contain between 1 and 100 line items.');
   }
@@ -71,4 +79,3 @@ export function validateVoidReceipt(dto: VoidReceiptDto) {
   }
   return reason;
 }
-

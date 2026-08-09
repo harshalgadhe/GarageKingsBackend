@@ -2,16 +2,29 @@ import * as crypto from 'crypto';
 
 // ── PASSWORD HASHING (PBKDF2 SH512) ───────────────────────────────
 export function hashPassword(password: string): string {
+  const iterations = 310000;
   const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-  return `${salt}:${hash}`;
+  const hash = crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512').toString('hex');
+  return `pbkdf2$${iterations}$${salt}$${hash}`;
 }
 
 export function verifyPassword(password: string, storedHash: string): boolean {
-  if (!storedHash || !storedHash.includes(':')) return false;
-  const [salt, originalHash] = storedHash.split(':');
-  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-  return hash === originalHash;
+  if (!storedHash) return false;
+  let iterations = 1000;
+  let salt = '';
+  let originalHash = '';
+  if (storedHash.startsWith('pbkdf2$')) {
+    const parts = storedHash.split('$');
+    iterations = Number(parts[1]);
+    salt = parts[2];
+    originalHash = parts[3];
+  } else {
+    [salt, originalHash] = storedHash.split(':');
+  }
+  if (!salt || !originalHash || !Number.isInteger(iterations) || iterations < 1000) return false;
+  const computed = crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512');
+  const expected = Buffer.from(originalHash, 'hex');
+  return expected.length === computed.length && crypto.timingSafeEqual(computed, expected);
 }
 
 // ── JWT GENERATION & VERIFICATION (HMAC SHA256) ───────────────────
@@ -44,7 +57,9 @@ export function verifyJwt(token: string, secret: string): any {
   const data = part1 + '.' + part2;
   
   const expectedSignature = base64url(crypto.createHmac('sha256', secret).update(data).digest());
-  if (signature !== expectedSignature) return null;
+  const received = Buffer.from(signature);
+  const expected = Buffer.from(expectedSignature);
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
   
   try {
     const payload = JSON.parse(Buffer.from(part2, 'base64').toString('utf8'));

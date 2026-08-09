@@ -1,4 +1,5 @@
-import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { worksheetToObjects } from './excel-rows.js';
 import pkg from 'pg';
 const { Pool } = pkg;
 import dotenv from 'dotenv';
@@ -81,14 +82,11 @@ async function run() {
     process.exit(1);
   }
 
-  const workbook = XLSX.readFile(excelPath);
-  const invSheet = workbook.Sheets['Inventory'];
-  const ordSheet = workbook.Sheets['Orders'];
-  const expSheet = workbook.Sheets['Expense'];
-
-  const rawProducts = XLSX.utils.sheet_to_json(invSheet);
-  const rawOrders = XLSX.utils.sheet_to_json(ordSheet);
-  const rawExpenses = XLSX.utils.sheet_to_json(expSheet);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(excelPath);
+  const rawProducts = worksheetToObjects(workbook.getWorksheet('Inventory'));
+  const rawOrders = worksheetToObjects(workbook.getWorksheet('Orders'));
+  const rawExpenses = worksheetToObjects(workbook.getWorksheet('Expense'));
 
   // Initialize report metrics
   const report = {
@@ -306,7 +304,7 @@ async function run() {
   console.log("Connecting to PostgreSQL pool for final writes...");
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false
+    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : false
   });
 
   const client = await pool.connect();

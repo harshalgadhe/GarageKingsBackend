@@ -11,7 +11,9 @@ export const databaseConfig = (): TypeOrmModuleOptions => ({
   entities: [
     'dist/**/*.entity{.ts,.js}'
   ],
-  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  ssl: process.env.DATABASE_SSL === 'true'
+    ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' }
+    : false,
   extra: {
     // CRITICAL: Serverless connection pool mitigations
     max: (process.env.IS_OFFLINE || process.env.LAMBDA_TASK_ROOT) ? 1 : 10, // Enforce 1 active socket in Lambda containers, support 10 in standard monolithic daemon mode

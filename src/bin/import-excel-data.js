@@ -1,4 +1,5 @@
-import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { worksheetToObjects } from './excel-rows.js';
 import pkg from 'pg';
 const { Pool } = pkg;
 import dotenv from 'dotenv';
@@ -59,14 +60,11 @@ async function runImport() {
   }
 
   // 1. Read Excel file sheets
-  const workbook = XLSX.readFile(excelPath);
-  const invSheet = workbook.Sheets['Inventory'];
-  const ordSheet = workbook.Sheets['Orders'];
-  const expSheet = workbook.Sheets['Expense'];
-
-  const rawProducts = XLSX.utils.sheet_to_json(invSheet).filter(row => row['SKU ID'] && row['SKU ID'].toString().trim());
-  const rawOrders = XLSX.utils.sheet_to_json(ordSheet).filter(row => row['Order ID'] && row['Order ID'].toString().trim());
-  const rawExpenses = XLSX.utils.sheet_to_json(expSheet).filter(row => row['Description'] && row['Description'].toString().trim());
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(excelPath);
+  const rawProducts = worksheetToObjects(workbook.getWorksheet('Inventory')).filter(row => row['SKU ID'] && row['SKU ID'].toString().trim());
+  const rawOrders = worksheetToObjects(workbook.getWorksheet('Orders')).filter(row => row['Order ID'] && row['Order ID'].toString().trim());
+  const rawExpenses = worksheetToObjects(workbook.getWorksheet('Expense')).filter(row => row['Description'] && row['Description'].toString().trim());
 
   console.log(`✔ Excel sheets parsed:`);
   console.log(`  - Products in Inventory: ${rawProducts.length}`);
@@ -76,7 +74,7 @@ async function runImport() {
   // 2. Connect to database
   const pgPool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false
+    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : false
   });
   const pgClient = await pgPool.connect();
   console.log("✔ Connected to PostgreSQL database.");

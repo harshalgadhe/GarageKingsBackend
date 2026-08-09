@@ -115,7 +115,7 @@ async function downloadImage(url) {
   } catch { return null; }
 }
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : false });
 const bucketName = process.env.S3_ASSETS_BUCKET || 'gk-production-public-assets-2026';
 const s3Client = new S3Client({ region: process.env.AWS_REGION || 'ap-south-1', ...(process.env.AWS_ACCESS_KEY_ID ? { credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY } } : {}) });
 

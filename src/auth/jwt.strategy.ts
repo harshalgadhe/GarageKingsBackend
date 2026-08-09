@@ -2,6 +2,7 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import dotenv from 'dotenv';
+import { getJwtSecret } from '../config/security.config.js';
 
 dotenv.config();
 
@@ -32,7 +33,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         }
       ]),
       ignoreExpiration: false,
-      secretOrKey: process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026',
+      secretOrKey: getJwtSecret(),
       algorithms: ['HS256']
     });
   }

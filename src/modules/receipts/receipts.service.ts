@@ -195,12 +195,14 @@ export class ReceiptsService {
 
       // 5. Insert receipt row metadata linked to order_id
       const receiptInsertQuery = `
-        INSERT INTO receipts (receipt_number, customer_id, order_id, format_type, tax_percent, tax_amount, shipping_charges, total_amount, advance_paid, pending_balance, footer_note, customer_name, customer_phone, customer_email, customer_instagram, customer_address)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        INSERT INTO receipts (receipt_number, receipt_date, date_string, customer_id, order_id, format_type, tax_percent, tax_amount, shipping_charges, total_amount, advance_paid, pending_balance, footer_note, customer_name, customer_phone, customer_email, customer_instagram, customer_address)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING id, created_at;
       `;
       const receiptRes = await queryRunner.query(receiptInsertQuery, [
         dto.receiptNumber.trim(),
+        dto.receiptDate ? new Date(dto.receiptDate) : new Date(),
+        dto.dateString?.trim() || null,
         customerId,
         orderId,
         receiptFormat,
@@ -354,6 +356,8 @@ export class ReceiptsService {
             customer_email = $13,
             customer_instagram = $14,
             customer_address = $15,
+            receipt_date = $16,
+            date_string = $17,
             updated_at = NOW()
         WHERE id = $1;
       `, [
@@ -371,7 +375,9 @@ export class ReceiptsService {
         dto.customerPhone || null,
         dto.customerEmail || null,
         dto.customerInstagram || null,
-        dto.customerAddress || null
+        dto.customerAddress || null,
+        dto.receiptDate ? new Date(dto.receiptDate) : new Date(),
+        dto.dateString?.trim() || null
       ]);
 
       await queryRunner.query('DELETE FROM receipt_items WHERE receipt_id = $1;', [id]);
@@ -428,7 +434,7 @@ export class ReceiptsService {
         SELECT r.id, r.receipt_number, r.format_type, r.tax_percent, r.tax_amount,
                r.shipping_charges, r.total_amount, r.advance_paid,
                r.pending_balance, r.footer_note, r.status,
-               r.void_reason, r.voided_at, r.voided_by, r.created_at,
+               r.void_reason, r.voided_at, r.voided_by, r.receipt_date, r.date_string, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone,
                COALESCE(r.customer_email, c.email) as customer_email,
@@ -446,7 +452,7 @@ export class ReceiptsService {
                ), '[]'::json) as items
         FROM receipts r
         LEFT JOIN customers c ON r.customer_id = c.id
-        ORDER BY r.created_at DESC;
+        ORDER BY r.receipt_date DESC, r.created_at DESC;
       `);
       return receipts;
     } catch (error: any) {
@@ -490,7 +496,7 @@ export class ReceiptsService {
         SELECT r.id, r.receipt_number, r.format_type, r.tax_percent, r.tax_amount,
                r.shipping_charges, r.total_amount, r.advance_paid,
                r.pending_balance, r.footer_note, r.status,
-               r.void_reason, r.voided_at, r.voided_by, r.created_at,
+               r.void_reason, r.voided_at, r.voided_by, r.receipt_date, r.date_string, r.created_at,
                COALESCE(r.customer_name, c.full_name) as customer_name, 
                COALESCE(r.customer_phone, c.phone) as customer_phone,
                COALESCE(r.customer_email, c.email) as customer_email,
@@ -507,7 +513,7 @@ export class ReceiptsService {
                  WHERE ri.receipt_id = r.id
                ), '[]'::json) as items
         ${queryStr}
-        ORDER BY r.created_at DESC
+        ORDER BY r.receipt_date DESC, r.created_at DESC
         LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
       `;
       const rows = await this.dataSource.query(selectQuery, [...params, limit, offset]);

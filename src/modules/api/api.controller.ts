@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Response as ExpressResponse } from 'express';
 import { signJwt, verifyJwt, validateFileSignature, parseCookies } from './api.helpers.js';
+import { ACCESS_TOKEN_TTL_SECONDS, REFRESH_TOKEN_TTL_SECONDS, authCookieOptions, getJwtSecret } from '../../config/security.config.js';
 
 const cognitoClient = new CognitoIdentityProviderClient({
   region: process.env.COGNITO_AWS_REGION || 'ap-south-1'
@@ -33,7 +34,11 @@ export class ApiController {
   }
 
   @Post('setup/owner')
-  async setupOwner(@Body() dto: any) {
+  async setupOwner(@Body() dto: any, @Headers('x-owner-setup-token') setupToken?: string) {
+    const expected = process.env.OWNER_SETUP_TOKEN;
+    if (!expected || !setupToken || expected.length !== setupToken.length || !crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(setupToken))) {
+      throw new UnauthorizedException('Owner setup is not authorized.');
+    }
     return this.apiService.setupOwner(dto);
   }
 
@@ -49,25 +54,15 @@ export class ApiController {
       throw new BadRequestException('User registration failed.');
     }
 
-    const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
-    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 30 * 24 * 60 * 60); // 30 days
-    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 90 * 24 * 60 * 60); // 90 days
+    const secret = getJwtSecret();
+    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, ACCESS_TOKEN_TTL_SECONDS);
+    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
 
     await this.apiService.updateRefreshToken(user.id, refreshToken);
 
-    res.cookie('gk_access_token', accessToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000
-    });
+    res.cookie('gk_access_token', accessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
 
-    res.cookie('gk_refresh_token', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 90 * 24 * 60 * 60 * 1000
-    });
+    res.cookie('gk_refresh_token', refreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
 
     return { success: true, user: { id: user.id, email: user.email, role: user.role } };
   }
@@ -88,25 +83,15 @@ export class ApiController {
       throw new UnauthorizedException('Email or password is incorrect.');
     }
 
-    const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
-    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 30 * 24 * 60 * 60); // 30 days
-    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 90 * 24 * 60 * 60); // 90 days
+    const secret = getJwtSecret();
+    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, ACCESS_TOKEN_TTL_SECONDS);
+    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
 
     await this.apiService.updateRefreshToken(user.id, refreshToken);
 
-    res.cookie('gk_access_token', accessToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000
-    });
+    res.cookie('gk_access_token', accessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
 
-    res.cookie('gk_refresh_token', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 90 * 24 * 60 * 60 * 1000
-    });
+    res.cookie('gk_refresh_token', refreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
 
     return { success: true, user: { id: user.id, email: user.email, role: user.role } };
   }
@@ -115,14 +100,14 @@ export class ApiController {
   async logout(@Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
     const accessToken = req.headers.cookie ? parseCookies(req.headers.cookie)['gk_access_token'] : null;
     if (accessToken) {
-      const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+      const secret = getJwtSecret();
       const payload = verifyJwt(accessToken, secret);
       if (payload && payload.userId) {
         await this.apiService.updateRefreshToken(payload.userId, null);
       }
     }
-    res.clearCookie('gk_access_token');
-    res.clearCookie('gk_refresh_token');
+    res.clearCookie('gk_access_token', { path: '/' });
+    res.clearCookie('gk_refresh_token', { path: '/' });
     return { success: true };
   }
 
@@ -133,7 +118,7 @@ export class ApiController {
       throw new UnauthorizedException('No refresh token provided.');
     }
 
-    const secret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+    const secret = getJwtSecret();
     const payload = verifyJwt(refreshToken, secret);
     if (!payload || !payload.userId) {
       throw new UnauthorizedException('Invalid or expired refresh token.');
@@ -149,24 +134,14 @@ export class ApiController {
       throw new UnauthorizedException('User no longer exists.');
     }
 
-    const newAccessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 30 * 24 * 60 * 60);
-    const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, 90 * 24 * 60 * 60);
+    const newAccessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, ACCESS_TOKEN_TTL_SECONDS);
+    const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
 
     await this.apiService.updateRefreshToken(user.id, newRefreshToken);
 
-    res.cookie('gk_access_token', newAccessToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000
-    });
+    res.cookie('gk_access_token', newAccessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
 
-    res.cookie('gk_refresh_token', newRefreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: 90 * 24 * 60 * 60 * 1000
-    });
+    res.cookie('gk_refresh_token', newRefreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
 
     return { success: true };
   }
@@ -236,8 +211,7 @@ export class ApiController {
         
         const googleRes = await fetch(verifyUrl);
         if (!googleRes.ok) {
-          const errText = await googleRes.text();
-          console.error(`[GoogleLogin] Tokeninfo check failed. Status: ${googleRes.status}, Body: ${errText}, URL: ${verifyUrl}`);
+          console.error(`[GoogleLogin] Token verification failed. Status: ${googleRes.status}`);
           throw new UnauthorizedException('Google OAuth Token signature verification failed.');
         }
         
@@ -267,7 +241,7 @@ export class ApiController {
       }
       
       // 2. Generate a secure, user-specific database password
-      const jwtSecret = process.env.JWT_SECRET || 'gk_development_secure_fallback_jwt_signing_key_2026';
+      const jwtSecret = getJwtSecret();
       const securePassword = crypto.createHmac('sha256', jwtSecret)
         .update(cleanEmail)
         .digest('hex') + 'aA1!'; 
@@ -277,24 +251,14 @@ export class ApiController {
       const user = await this.apiService.syncGoogleUser(cleanEmail, securePassword);
 
       // 4. Issue local cookie tokens
-      const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 30 * 24 * 60 * 60); // 30 days
-      const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, 90 * 24 * 60 * 60); // 90 days
+      const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, ACCESS_TOKEN_TTL_SECONDS);
+      const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, jwtSecret, REFRESH_TOKEN_TTL_SECONDS);
 
       await this.apiService.updateRefreshToken(user.id, refreshToken);
 
-      res.cookie('gk_access_token', accessToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 30 * 24 * 60 * 60 * 1000
-      });
+      res.cookie('gk_access_token', accessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
 
-      res.cookie('gk_refresh_token', refreshToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: 90 * 24 * 60 * 60 * 1000
-      });
+      res.cookie('gk_refresh_token', refreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
 
       return { 
         success: true, 
@@ -303,7 +267,7 @@ export class ApiController {
       };
     } catch (error: any) {
       console.error(`[GoogleLogin] Failed to sync Google login:`, error);
-      throw new UnauthorizedException(`Google login sync failed: ${error.message}`);
+      throw new UnauthorizedException('Google login could not be completed.');
     }
   }
 
@@ -348,6 +312,17 @@ export class ApiController {
       return;
     }
     return data;
+  }
+
+  private checkOwner(req: any) {
+    if (req.user?.role !== 'Owner') throw new UnauthorizedException('Owner privileges required.');
+  }
+
+  @Patch('admin/users/role')
+  @UseGuards(AuthGuard('jwt'))
+  async setUserRole(@Body() dto: any, @Request() req: any) {
+    this.checkOwner(req);
+    return this.apiService.setUserRole(dto.email, dto.role, req.user.email, req.ip || 'unknown');
   }
 
   @Get('products/homepage')

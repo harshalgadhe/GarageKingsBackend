@@ -1,5 +1,21 @@
 import { VariantResponseDto } from './public-product-response.dto.js';
 
+class AdminVariantResponseDto extends VariantResponseDto {
+  totalStock: number;
+  availableStock: number;
+  lockedStock: number;
+  soldStock: number;
+
+  static fromEntity(v: any): AdminVariantResponseDto {
+    const dto = Object.assign(new AdminVariantResponseDto(), VariantResponseDto.fromEntity(v));
+    dto.totalStock = Number(v.totalStock || 0);
+    dto.availableStock = Number(v.availableStock || 0);
+    dto.lockedStock = Number(v.lockedStock || 0);
+    dto.soldStock = Number(v.soldStock || 0);
+    return dto;
+  }
+}
+
 export class AdminProductResponseDto {
   id: string;
   sku: string;
@@ -28,7 +44,7 @@ export class AdminProductResponseDto {
   image?: string;
   manufacturer?: string;
   isFeatured?: boolean;
-  variants: VariantResponseDto[];
+  variants: AdminVariantResponseDto[];
 
   static fromEntity(p: any): AdminProductResponseDto {
     const dto = new AdminProductResponseDto();
@@ -46,7 +62,7 @@ export class AdminProductResponseDto {
     dto.updatedAt = p.updatedAt || p.updated_at;
     dto.image = p.image;
     dto.isFeatured = p.isFeatured !== undefined ? Boolean(p.isFeatured) : Boolean(p.is_featured);
-    dto.variants = (p.variants || []).map((v: any) => VariantResponseDto.fromEntity(v));
+    dto.variants = (p.variants || []).map((v: any) => AdminVariantResponseDto.fromEntity(v));
 
     // Fallbacks and aggregated metrics
     const primaryVar = dto.variants[0];

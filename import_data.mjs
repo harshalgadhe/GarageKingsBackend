@@ -2,7 +2,8 @@ import pkg from 'pg';
 const { Client } = pkg;
 import dotenv from 'dotenv';
 import path from 'path';
-import XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { worksheetToObjects } from './src/bin/excel-rows.js';
 import https from 'https';
 import fs from 'fs';
 
@@ -65,7 +66,7 @@ async function main() {
 
   const client = new Client({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false
+    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : false
   });
   await client.connect();
   console.log("Connected to PostgreSQL database.");
@@ -131,7 +132,8 @@ async function main() {
     ON CONFLICT (email) DO UPDATE SET role = 'Admin';
   `, ['sanchitjain0801@gmail.com', 'Admin', 'admin-sanchit']);
 
-  const workbook = XLSX.readFile(excelPath);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(excelPath);
 
   // Initialize Report Variables
   let productsImported = 0;
@@ -147,8 +149,7 @@ async function main() {
   // 1. IMPORT PRODUCTS & BATCHES (Inventory)
   // ==========================================
   console.log("\n--- Importing Inventory Sheet ---");
-  const invSheet = workbook.Sheets['Inventory'];
-  const rawInventory = XLSX.utils.sheet_to_json(invSheet);
+  const rawInventory = worksheetToObjects(workbook.getWorksheet('Inventory'));
 
   const skuMap = new Set();
 
@@ -273,8 +274,7 @@ async function main() {
   // 2. IMPORT CUSTOMERS & ORDERS (Orders)
   // ==========================================
   console.log("\n--- Importing Orders Sheet ---");
-  const ordersSheet = workbook.Sheets['Orders'];
-  const rawOrders = XLSX.utils.sheet_to_json(ordersSheet);
+  const rawOrders = worksheetToObjects(workbook.getWorksheet('Orders'));
 
   const orderIdMap = new Set();
 
@@ -395,8 +395,7 @@ async function main() {
   // 3. IMPORT EXPENSES (Expense)
   // ==========================================
   console.log("\n--- Importing Expense Sheet ---");
-  const expenseSheet = workbook.Sheets['Expense'];
-  const rawExpenses = XLSX.utils.sheet_to_json(expenseSheet);
+  const rawExpenses = worksheetToObjects(workbook.getWorksheet('Expense'));
 
   for (const row of rawExpenses) {
     const desc = row['Description'];

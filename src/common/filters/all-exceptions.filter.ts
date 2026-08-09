@@ -17,14 +17,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
         ? exception.getStatus()
         : HttpStatus.INTERNAL_SERVER_ERROR;
 
-    const message = exception instanceof Error ? exception.message : 'An unexpected error occurred';
+    const internalMessage = exception instanceof Error ? exception.message : 'An unexpected error occurred';
+    const message = status >= 500 ? 'An internal server error occurred.' : internalMessage;
     const stack = exception instanceof Error ? exception.stack : '';
     const correlationId = getCorrelationId();
 
     // Log the full exception details in TelemetryService
     this.telemetryService.logError({
       errorType: 'Backend',
-      message: message,
+      message: internalMessage,
       stackTrace: stack,
       exceptionType: exception.name || 'Error',
       severity: status >= 500 ? 'Fatal' : 'Error',
@@ -33,7 +34,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       userId: request.user?.id,
       userEmail: request.user?.email,
       correlationId: correlationId,
-      payload: request.body,
+      payload: this.redact(request.body),
       browser: request.headers['user-agent']
     }).catch(err => console.error('Failed to log telemetry exception:', err));
 
@@ -48,6 +49,15 @@ export class AllExceptionsFilter implements ExceptionFilter {
       correlationId: correlationId
     });
   }
+
+  private redact(value: any): any {
+    if (!value || typeof value !== 'object') return undefined;
+    const sensitive = /password|passcode|token|authorization|cookie|secret|upi|card|cvv|account|screenshot|payment/i;
+    if (Array.isArray(value)) return value.slice(0, 20).map((item) => this.redact(item));
+    return Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, item]) => [
+      key,
+      sensitive.test(key) ? '[REDACTED]' : (item && typeof item === 'object' ? this.redact(item) : item)
+    ]));
+  }
 }
 export default AllExceptionsFilter;
-
