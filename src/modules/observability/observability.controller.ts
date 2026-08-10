@@ -67,6 +67,13 @@ export class ObservabilityController {
     return this.diagnosticsService.getRecentErrors({ page, limit, search, acknowledged: ackValue });
   }
 
+  @Get('admin/telemetry/summary')
+  @UseGuards(AuthGuard('jwt'))
+  async getTelemetrySummary(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.diagnosticsService.getSummary();
+  }
+
   @Patch('admin/telemetry/errors/:fingerprint/acknowledge')
   @UseGuards(AuthGuard('jwt'))
   async acknowledgeError(

@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, UnauthorizedException, BadRequestException, HttpException, HttpStatus, ForbiddenException } from '@nestjs/common';
+import { Injectable, OnModuleInit, UnauthorizedException, BadRequestException, ConflictException, HttpException, HttpStatus, ForbiddenException } from '@nestjs/common';
 import { DataSource, QueryRunner } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -941,7 +941,7 @@ export class ApiService implements OnModuleInit {
   }
 
   async addProduct(car: any, creatorEmail: string, ipAddress: string) {
-    const sku = car.sku || `SKU-${Date.now()}`;
+    const sku = String(car.sku || `SKU-${Date.now()}`).trim().toUpperCase();
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -1121,8 +1121,20 @@ export class ApiService implements OnModuleInit {
       localCache.del('products_list_false');
 
       return { id: productId, sku };
-    } catch (err) {
+    } catch (err: any) {
       await queryRunner.rollbackTransaction();
+
+      const dbCode = err?.code || err?.driverError?.code;
+      const constraint = err?.constraint || err?.driverError?.constraint;
+      if (dbCode === '23505') {
+        if (constraint === 'products_sku_key') {
+          throw new ConflictException(`A product with SKU "${sku}" already exists. Open that product to update it, or use a different SKU.`);
+        }
+        if (constraint?.includes('product_variants') || constraint?.includes('sku')) {
+          throw new ConflictException('One of the variant SKUs is already assigned to another product. Each variant SKU must be unique.');
+        }
+        throw new ConflictException('A product with the same unique details already exists.');
+      }
       throw err;
     } finally {
       await queryRunner.release();

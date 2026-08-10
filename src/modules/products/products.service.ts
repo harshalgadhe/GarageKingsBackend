@@ -6,6 +6,29 @@ import { localCache } from '../api/api.helpers.js';
 export class ProductsService {
   constructor(private readonly dataSource: DataSource) {}
 
+  async checkSkuAvailability(sku: string, excludeId?: string) {
+    const normalizedSku = String(sku || '').trim().toUpperCase();
+    if (!normalizedSku) return { available: false, sku: normalizedSku };
+
+    const params: any[] = [normalizedSku];
+    let exclusion = '';
+    if (excludeId) {
+      params.push(excludeId);
+      exclusion = 'AND id <> $2';
+    }
+
+    const rows = await this.dataSource.query(`
+      SELECT id
+      FROM products
+      WHERE UPPER(TRIM(sku)) = $1
+        AND deleted_at IS NULL
+        ${exclusion}
+      LIMIT 1;
+    `, params);
+
+    return { available: rows.length === 0, sku: normalizedSku };
+  }
+
   async getProducts(adminMode = false) {
     const cacheKey = `products_list_${adminMode}`;
     const cached = localCache.get(cacheKey);

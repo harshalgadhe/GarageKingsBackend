@@ -12,42 +12,107 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const response = ctx.getResponse<Response>();
     const request = ctx.getRequest<any>();
 
-    const status =
-      exception instanceof HttpException
-        ? exception.getStatus()
-        : HttpStatus.INTERNAL_SERVER_ERROR;
+    const normalized = this.normalizeException(exception);
+    const status = normalized.status;
 
-    const internalMessage = exception instanceof Error ? exception.message : 'An unexpected error occurred';
-    const message = status >= 500 ? 'An internal server error occurred.' : internalMessage;
+    const internalMessage = normalized.internalMessage;
+    const message = normalized.publicMessage;
     const stack = exception instanceof Error ? exception.stack : '';
     const correlationId = getCorrelationId();
 
-    // Log the full exception details in TelemetryService
-    this.telemetryService.logError({
-      errorType: 'Backend',
-      message: internalMessage,
-      stackTrace: stack,
-      exceptionType: exception.name || 'Error',
-      severity: status >= 500 ? 'Fatal' : 'Error',
-      endpoint: `${request.method} ${request.url.split('?')[0]}`,
-      route: request.route?.path || request.url,
-      userId: request.user?.id,
-      userEmail: request.user?.email,
-      correlationId: correlationId,
-      payload: this.redact(request.body),
-      browser: request.headers['user-agent']
-    }).catch(err => console.error('Failed to log telemetry exception:', err));
+    // Expected validation and business conflicts are returned to the caller but
+    // do not pollute the operational error queue. Auth/rate-limit failures remain
+    // observable for security alerts, and all server failures are retained.
+    if (status >= 500 || status === 401 || status === 403 || status === 429) {
+      this.telemetryService.logError({
+        errorType: 'Backend',
+        message: internalMessage,
+        stackTrace: stack,
+        exceptionType: exception.name || 'Error',
+        severity: status >= 500 ? 'Fatal' : 'Warning',
+        endpoint: `${request.method} ${request.url.split('?')[0]}`,
+        route: request.route?.path || request.url,
+        userId: request.user?.id,
+        userEmail: request.user?.email,
+        correlationId: correlationId,
+        payload: this.redact(request.body),
+        browser: request.headers['user-agent']
+      }).catch(err => console.error('Failed to log telemetry exception:', err));
+    }
 
-    // Log the full exception details on the server console for CloudWatch/local debugging
-    console.error('[Global Exception Handler caught error]:', exception);
+    if (status >= 500) {
+      // Never dump QueryFailedError parameters: they may contain customer data,
+      // uploaded asset URLs, or other request fields.
+      console.error('[Unhandled API error]', {
+        name: exception?.name || 'Error',
+        message: internalMessage,
+        code: exception?.code || exception?.driverError?.code,
+        constraint: exception?.constraint || exception?.driverError?.constraint,
+        endpoint: `${request.method} ${request.url.split('?')[0]}`,
+        correlationId,
+        stack
+      });
+    }
 
     response.status(status).json({
       statusCode: status,
       message: message,
-      error: exception.name || 'Error',
+      error: normalized.errorName,
       timestamp: new Date().toISOString(),
       correlationId: correlationId
     });
+  }
+
+  private normalizeException(exception: any): {
+    status: number;
+    internalMessage: string;
+    publicMessage: string;
+    errorName: string;
+  } {
+    if (exception instanceof HttpException) {
+      const status = exception.getStatus();
+      const response = exception.getResponse() as any;
+      const responseMessage = typeof response === 'string' ? response : response?.message;
+      return {
+        status,
+        internalMessage: exception.message || 'Request failed',
+        publicMessage: Array.isArray(responseMessage) ? responseMessage.join(' ') : (responseMessage || exception.message),
+        errorName: exception.name || 'HttpException'
+      };
+    }
+
+    const code = exception?.code || exception?.driverError?.code;
+    if (code === '23505') {
+      return {
+        status: HttpStatus.CONFLICT,
+        internalMessage: exception?.message || 'Unique constraint violation',
+        publicMessage: 'A record with the same unique value already exists.',
+        errorName: 'ConflictException'
+      };
+    }
+    if (code === '23503') {
+      return {
+        status: HttpStatus.CONFLICT,
+        internalMessage: exception?.message || 'Foreign key constraint violation',
+        publicMessage: 'This record is still linked to other data and cannot be changed that way.',
+        errorName: 'ConflictException'
+      };
+    }
+    if (code === '22P02' || code === '23502') {
+      return {
+        status: HttpStatus.BAD_REQUEST,
+        internalMessage: exception?.message || 'Invalid database value',
+        publicMessage: 'One or more submitted values are missing or invalid.',
+        errorName: 'BadRequestException'
+      };
+    }
+
+    return {
+      status: HttpStatus.INTERNAL_SERVER_ERROR,
+      internalMessage: exception instanceof Error ? exception.message : 'An unexpected error occurred',
+      publicMessage: 'An internal server error occurred.',
+      errorName: exception?.name || 'Error'
+    };
   }
 
   private redact(value: any): any {

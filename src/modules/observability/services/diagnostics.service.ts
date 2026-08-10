@@ -69,6 +69,43 @@ export class DiagnosticsService {
     return { success: true };
   }
 
+  async getSummary() {
+    const [errorSummary, slowSummary, recentErrors] = await Promise.all([
+      this.dataSource.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE acknowledged = FALSE)::int AS "unresolvedGroups",
+          COALESCE(SUM(occurrence_count) FILTER (WHERE acknowledged = FALSE), 0)::int AS "unresolvedOccurrences",
+          COALESCE(SUM(occurrence_count) FILTER (WHERE last_occurrence >= NOW() - INTERVAL '24 HOURS'), 0)::int AS "occurrences24h",
+          COUNT(*) FILTER (WHERE severity = 'Fatal' AND acknowledged = FALSE)::int AS "unresolvedFatal",
+          COUNT(DISTINCT COALESCE(endpoint, route)) FILTER (WHERE acknowledged = FALSE)::int AS "affectedEndpoints",
+          MAX(last_occurrence) AS "lastOccurrence"
+        FROM telemetry_errors;
+      `),
+      this.dataSource.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE duration_ms > 2000)::int AS "slowRequests24h",
+          COALESCE(ROUND(AVG(duration_ms)), 0)::int AS "averageLatency24h"
+        FROM performance_metrics
+        WHERE timestamp >= NOW() - INTERVAL '24 HOURS';
+      `),
+      this.dataSource.query(`
+        SELECT fingerprint, error_type AS "errorType", category, message, severity,
+               endpoint, route, occurrence_count AS "occurrenceCount",
+               last_occurrence AS "lastOccurrence", latest_correlation_id AS "latestCorrelationId"
+        FROM telemetry_errors
+        WHERE acknowledged = FALSE
+        ORDER BY last_occurrence DESC
+        LIMIT 5;
+      `)
+    ]);
+
+    return {
+      ...(errorSummary[0] || {}),
+      ...(slowSummary[0] || {}),
+      recentErrors
+    };
+  }
+
   async clearAllErrors() {
     await this.dataSource.query('DELETE FROM telemetry_errors');
     return { success: true };

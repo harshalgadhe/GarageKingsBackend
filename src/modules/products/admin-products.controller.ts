@@ -65,6 +65,16 @@ export class AdminProductsController {
     return this.apiService.addProduct(body, req.user.email, req.ip);
   }
 
+  @Get('sku-availability/check')
+  async checkSkuAvailability(
+    @Query('sku') sku: string,
+    @Query('excludeId') excludeId: string,
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    return this.productsService.checkSkuAvailability(sku, excludeId?.trim() || undefined);
+  }
+
   @Patch(':id')
   async updateProduct(@Param('id') id: string, @Body() body: any, @Request() req: any) {
     this.checkAdmin(req);
