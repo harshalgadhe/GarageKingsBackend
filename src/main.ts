@@ -5,6 +5,7 @@ import { ApiService } from './modules/api/api.service.js';
 import { configure as serverlessExpress } from '@vendia/serverless-express';
 import { Handler, Context, Callback } from 'aws-lambda';
 import { getJwtSecret, isAllowedOrigin } from './config/security.config.js';
+import { applyRefreshTokenGraceMigration } from './database/refresh-token-grace.migration.js';
 
 getJwtSecret();
 
@@ -55,6 +56,13 @@ async function bootstrap() {
 let nestApp: any;
 
 export const handler: Handler = async (event: any, context: Context, callback: Callback) => {
+  if (event && event.task === 'apply-refresh-token-grace-migration') {
+    console.log('[Lambda] Applying the refresh-token rotation grace migration.');
+    const result = await applyRefreshTokenGraceMigration();
+    console.log('[Lambda] Refresh-token rotation grace migration completed.', result);
+    return { success: true, ...result };
+  }
+
   if (event && event.task === 'cleanup-expired-orders') {
     console.log('[Lambda] Intercepted direct EventBridge cleanup task invocation.');
     if (!nestApp) {
