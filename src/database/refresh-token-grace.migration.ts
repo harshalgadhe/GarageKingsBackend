@@ -9,9 +9,6 @@ const MIGRATION_SECRET_ARN = 'arn:aws:secretsmanager:ap-south-1:818913587248:sec
 type RdsSecret = {
   username: string;
   password: string;
-  host: string;
-  port: number;
-  dbname?: string;
 };
 
 export async function applyRefreshTokenGraceMigration() {
@@ -21,9 +18,9 @@ export async function applyRefreshTokenGraceMigration() {
   const migrationSecret = JSON.parse(secretResponse.SecretString) as RdsSecret;
 
   const client = new Client({
-    host: migrationSecret.host,
-    port: Number(migrationSecret.port),
-    database: migrationSecret.dbname || 'garagekings_prod',
+    host: 'gk-production-postgres.cdos6ocg28qm.ap-south-1.rds.amazonaws.com',
+    port: 25432,
+    database: 'garagekings_prod',
     user: migrationSecret.username,
     password: migrationSecret.password,
     ssl: process.env.DATABASE_SSL === 'true'
