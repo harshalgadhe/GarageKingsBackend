@@ -563,16 +563,55 @@ export class ApiService implements OnModuleInit {
 
   async updateRefreshToken(userId: string, token: string | null) {
     const hash = token ? crypto.createHash('sha256').update(token).digest('hex') : null;
-    await this.dataSource.query("UPDATE users SET refresh_token_hash = $1 WHERE id = $2", [hash, userId]);
+    await this.dataSource.query(`
+      UPDATE users
+      SET refresh_token_hash = $1,
+          refresh_token_previous_hash = NULL,
+          refresh_token_rotated_at = NULL
+      WHERE id = $2
+    `, [hash, userId]);
   }
 
-  async verifyRefreshToken(userId: string, token: string) {
-    const rows = await this.dataSource.query("SELECT refresh_token_hash FROM users WHERE id = $1 AND deleted_at IS NULL", [userId]);
-    if (rows.length === 0 || !rows[0].refresh_token_hash) return false;
+  async verifyRefreshToken(userId: string, token: string): Promise<'current' | 'previous' | null> {
+    const rows = await this.dataSource.query(`
+      SELECT refresh_token_hash, refresh_token_previous_hash, refresh_token_rotated_at
+      FROM users
+      WHERE id = $1 AND deleted_at IS NULL
+    `, [userId]);
+    if (rows.length === 0 || !rows[0].refresh_token_hash) return null;
     const expectedHash = crypto.createHash('sha256').update(token).digest('hex');
-    const storedHash = String(rows[0].refresh_token_hash);
-    return expectedHash.length === storedHash.length
-      && crypto.timingSafeEqual(Buffer.from(expectedHash), Buffer.from(storedHash));
+    const matches = (storedValue: unknown) => {
+      if (!storedValue) return false;
+      const storedHash = String(storedValue);
+      return expectedHash.length === storedHash.length
+        && crypto.timingSafeEqual(Buffer.from(expectedHash), Buffer.from(storedHash));
+    };
+
+    if (matches(rows[0].refresh_token_hash)) return 'current';
+
+    const rotatedAt = rows[0].refresh_token_rotated_at
+      ? new Date(rows[0].refresh_token_rotated_at).getTime()
+      : 0;
+    if (Date.now() - rotatedAt <= 60_000 && matches(rows[0].refresh_token_previous_hash)) {
+      return 'previous';
+    }
+    return null;
+  }
+
+  async rotateRefreshToken(userId: string, currentToken: string, newToken: string): Promise<boolean> {
+    const currentHash = crypto.createHash('sha256').update(currentToken).digest('hex');
+    const newHash = crypto.createHash('sha256').update(newToken).digest('hex');
+    const result = await this.dataSource.query(`
+      UPDATE users
+      SET refresh_token_previous_hash = refresh_token_hash,
+          refresh_token_hash = $1,
+          refresh_token_rotated_at = NOW()
+      WHERE id = $2
+        AND refresh_token_hash = $3
+        AND deleted_at IS NULL
+      RETURNING id
+    `, [newHash, userId, currentHash]);
+    return result.length > 0;
   }
 
   // ── INVENTORY MODULE ───────────────────────────────────────────────

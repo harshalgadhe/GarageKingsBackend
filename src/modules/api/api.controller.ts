@@ -113,35 +113,45 @@ export class ApiController {
 
   @Post('auth/refresh')
   async refresh(@Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
+    const clearSessionCookies = () => {
+      res.clearCookie('gk_access_token', { path: '/' });
+      res.clearCookie('gk_refresh_token', { path: '/' });
+    };
     const refreshToken = req.headers.cookie ? parseCookies(req.headers.cookie)['gk_refresh_token'] : null;
     if (!refreshToken) {
+      clearSessionCookies();
       throw new UnauthorizedException('No refresh token provided.');
     }
 
     const secret = getJwtSecret();
     const payload = verifyJwt(refreshToken, secret);
     if (!payload || !payload.userId) {
+      clearSessionCookies();
       throw new UnauthorizedException('Invalid or expired refresh token.');
     }
 
-    const isValid = await this.apiService.verifyRefreshToken(payload.userId, refreshToken);
-    if (!isValid) {
+    const tokenMatch = await this.apiService.verifyRefreshToken(payload.userId, refreshToken);
+    if (!tokenMatch) {
+      clearSessionCookies();
       throw new UnauthorizedException('Refresh token is revoked.');
     }
 
     const user = await this.apiService.getUserById(payload.userId);
     if (!user) {
+      clearSessionCookies();
       throw new UnauthorizedException('User no longer exists.');
     }
 
     const newAccessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, ACCESS_TOKEN_TTL_SECONDS);
-    const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
-
-    await this.apiService.updateRefreshToken(user.id, newRefreshToken);
-
     res.cookie('gk_access_token', newAccessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
 
-    res.cookie('gk_refresh_token', newRefreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
+    if (tokenMatch === 'current') {
+      const newRefreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
+      const rotated = await this.apiService.rotateRefreshToken(user.id, refreshToken, newRefreshToken);
+      if (rotated) {
+        res.cookie('gk_refresh_token', newRefreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
+      }
+    }
 
     return { success: true };
   }
