@@ -1,16 +1,31 @@
 import pg from 'pg';
+import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 
 const { Client } = pg;
 const MIGRATION_NAME = '20260811_001_refresh_token_rotation_grace.sql';
 const MIGRATION_LOCK_KEY = 746_251_911;
+const MIGRATION_SECRET_ARN = 'arn:aws:secretsmanager:ap-south-1:818913587248:secret:rds!db-41ed0eed-2e85-4fa7-933f-3cf926bee1e3-9eg0Ha';
+
+type RdsSecret = {
+  username: string;
+  password: string;
+  host: string;
+  port: number;
+  dbname?: string;
+};
 
 export async function applyRefreshTokenGraceMigration() {
-  if (!process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL is required to apply the refresh-token migration.');
-  }
+  const secrets = new SecretsManagerClient({ region: 'ap-south-1' });
+  const secretResponse = await secrets.send(new GetSecretValueCommand({ SecretId: MIGRATION_SECRET_ARN }));
+  if (!secretResponse.SecretString) throw new Error('The managed RDS migration secret is empty.');
+  const migrationSecret = JSON.parse(secretResponse.SecretString) as RdsSecret;
 
   const client = new Client({
-    connectionString: process.env.DATABASE_URL,
+    host: migrationSecret.host,
+    port: Number(migrationSecret.port),
+    database: migrationSecret.dbname || 'garagekings_prod',
+    user: migrationSecret.username,
+    password: migrationSecret.password,
     ssl: process.env.DATABASE_SSL === 'true'
       ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' }
       : false,
