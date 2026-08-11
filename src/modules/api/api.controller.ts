@@ -1,5 +1,6 @@
 import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, ForbiddenException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
+import { Throttle, SkipThrottle } from '@nestjs/throttler';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
 import crypto from 'crypto';
@@ -43,6 +44,7 @@ export class ApiController {
   }
 
   // ── LOCAL AUTH COOKIE-BASED SESSION ENDPOINTS ───────────────────────
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Post('auth/signup')
   async signup(@Body() dto: any, @Res({ passthrough: true }) res: ExpressResponse) {
     const { email, password, fullName } = dto;
@@ -67,6 +69,7 @@ export class ApiController {
     return { success: true, user: { id: user.id, email: user.email, role: user.role } };
   }
 
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Post('auth/login')
   async login(@Body() dto: any, @Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
     const { email, password } = dto;
