@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Param, Body, Query, Request, UseGuards, UseInterceptors, UploadedFile, Res, BadRequestException, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Body, Query, Request, UseGuards, UseInterceptors, UploadedFile, Res, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Response as ExpressResponse } from 'express';
@@ -13,7 +13,7 @@ export class AdminOrdersController {
   private checkAdmin(req: any, allowedRoles: string[] = ['Owner', 'Admin']) {
     const role = req.user?.role;
     if (!allowedRoles.includes(role)) {
-      throw new UnauthorizedException('Insufficient privileges for this action.');
+      throw new ForbiddenException('Access denied.');
     }
   }
 

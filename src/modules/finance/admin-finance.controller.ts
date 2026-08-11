@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Delete, Param, Body, Query, Request, UseGuards, UnauthorizedException } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Param, Body, Query, Request, UseGuards, ForbiddenException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from '../api/api.service.js';
 
@@ -10,7 +10,7 @@ export class AdminFinanceController {
   private checkAdmin(req: any) {
     const role = req.user?.role;
     if (role !== 'Owner' && role !== 'Admin') {
-      throw new UnauthorizedException('Administrative privileges required.');
+      throw new ForbiddenException('Access denied.');
     }
   }
 

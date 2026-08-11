@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, ForbiddenException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
@@ -23,7 +23,7 @@ export class ApiController {
   private checkAdmin(req: any) {
     const role = req.user?.role;
     if (role !== 'Owner' && role !== 'Admin') {
-      throw new UnauthorizedException('Administrative privileges required.');
+      throw new ForbiddenException('Access denied.');
     }
   }
 
@@ -325,7 +325,7 @@ export class ApiController {
   }
 
   private checkOwner(req: any) {
-    if (req.user?.role !== 'Owner') throw new UnauthorizedException('Owner privileges required.');
+    if (req.user?.role !== 'Owner') throw new ForbiddenException('Access denied.');
   }
 
   @Patch('admin/users/role')

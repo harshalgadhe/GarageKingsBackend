@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Param, Body, Query, Request, UseGuards, UseInterceptors, UploadedFile, Res, BadRequestException, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Body, Query, Request, UseGuards, UseInterceptors, UploadedFile, Res, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Response as ExpressResponse } from 'express';
@@ -13,7 +13,7 @@ export class AdminSuppliersController {
   private checkAdmin(req: any) {
     const role = req.user?.role;
     if (role !== 'Owner' && role !== 'Admin') {
-      throw new UnauthorizedException('Administrative privileges required.');
+      throw new ForbiddenException('Access denied.');
     }
   }
 
