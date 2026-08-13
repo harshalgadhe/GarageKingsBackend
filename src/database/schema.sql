@@ -226,6 +226,21 @@ CREATE TABLE IF NOT EXISTS supplier_purchase_items (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Cash accounts are referenced by supplier payments below, so they must be
+-- created before the finance tables that carry the foreign key.
+CREATE TABLE IF NOT EXISTS cash_accounts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) UNIQUE NOT NULL,
+    type VARCHAR(100) DEFAULT 'Bank',
+    opening_balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    currency VARCHAR(10) DEFAULT 'INR',
+    display_order INT DEFAULT 0,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+
 -- 5.5 Supplier Payments Table (Immutable Payment History)
 CREATE TABLE IF NOT EXISTS supplier_payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -373,12 +388,14 @@ CREATE INDEX IF NOT EXISTS idx_order_allocations_item ON order_inventory_allocat
 -- 6. Inventory Ledger Table (Immutable Movement Trail)
 CREATE TABLE IF NOT EXISTS inventory_ledger (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    product_id UUID REFERENCES products(id) ON DELETE RESTRICT,
     variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE RESTRICT,
-    batch_id UUID NOT NULL REFERENCES inventory_batches(id) ON DELETE RESTRICT,
+    batch_id UUID REFERENCES inventory_batches(id) ON DELETE RESTRICT,
     order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
     type VARCHAR(50) NOT NULL,
     quantity_changed INT NOT NULL,
     purchase_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    selling_price NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
     reason TEXT NOT NULL,
     performed_by VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP

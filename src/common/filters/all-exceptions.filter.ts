@@ -20,10 +20,12 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const stack = exception instanceof Error ? exception.stack : '';
     const correlationId = getCorrelationId();
 
-    // Expected validation and business conflicts are returned to the caller but
-    // do not pollute the operational error queue. Auth/rate-limit failures remain
-    // observable for security alerts, and all server failures are retained.
-    if (status >= 500 || status === 401 || status === 403 || status === 429) {
+    // A 401 is a normal part of cookie-session recovery: an expired access token
+    // is rejected and the browser retries after refreshing it. Recording that
+    // first rejection creates false incidents in the admin diagnostics queue.
+    // Authorization failures (403), abuse signals (429), and server faults remain
+    // observable. Authentication attempts are still visible in request/audit logs.
+    if (status >= 500 || status === 403 || status === 429) {
       this.telemetryService.logError({
         errorType: 'Backend',
         message: internalMessage,

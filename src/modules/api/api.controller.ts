@@ -1,6 +1,6 @@
-import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, ForbiddenException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Body, Param, Query, UseGuards, Request, Res, Headers, UnauthorizedException, ForbiddenException, UseInterceptors, UploadedFile, StreamableFile, BadRequestException, NotFoundException } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
-import { Throttle, SkipThrottle } from '@nestjs/throttler';
+import { SkipThrottle } from '@nestjs/throttler';
 import { ApiService } from './api.service.js';
 import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminUpdateUserAttributesCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } from '@aws-sdk/client-cognito-identity-provider';
 import crypto from 'crypto';
@@ -44,61 +44,8 @@ export class ApiController {
   }
 
   // ── LOCAL AUTH COOKIE-BASED SESSION ENDPOINTS ───────────────────────
-  @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @Post('auth/signup')
-  async signup(@Body() dto: any, @Res({ passthrough: true }) res: ExpressResponse) {
-    const { email, password, fullName } = dto;
-    if (!email || !password) {
-      throw new BadRequestException('Email and password are required.');
-    }
-    const user = await this.apiService.registerUser(email, password, fullName);
-    if (!user) {
-      throw new BadRequestException('User registration failed.');
-    }
-
-    const secret = getJwtSecret();
-    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, ACCESS_TOKEN_TTL_SECONDS);
-    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
-
-    await this.apiService.updateRefreshToken(user.id, refreshToken);
-
-    res.cookie('gk_access_token', accessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
-
-    res.cookie('gk_refresh_token', refreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
-
-    return { success: true, user: { id: user.id, email: user.email, role: user.role } };
-  }
-
-  @Throttle({ default: { ttl: 60000, limit: 10 } })
-  @Post('auth/login')
-  async login(@Body() dto: any, @Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
-    const { email, password } = dto;
-    if (!email || !password) {
-      throw new BadRequestException('Email and password are required.');
-    }
-    const failedAttempts = await this.apiService.getRecentFailedLoginCount(email);
-    if (failedAttempts >= 5) {
-      throw new HttpException('Too many sign-in attempts. Please wait 15 minutes before trying again.', HttpStatus.TOO_MANY_REQUESTS);
-    }
-    const user = await this.apiService.validateUserCredentials(email, password);
-    if (!user) {
-      await this.apiService.recordFailedLogin(email, req.ip || req.headers?.['x-forwarded-for'] || 'unknown');
-      throw new UnauthorizedException('Email or password is incorrect.');
-    }
-
-    const secret = getJwtSecret();
-    const accessToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, ACCESS_TOKEN_TTL_SECONDS);
-    const refreshToken = signJwt({ userId: user.id, email: user.email, role: user.role }, secret, REFRESH_TOKEN_TTL_SECONDS);
-
-    await this.apiService.updateRefreshToken(user.id, refreshToken);
-
-    res.cookie('gk_access_token', accessToken, authCookieOptions(ACCESS_TOKEN_TTL_SECONDS * 1000));
-
-    res.cookie('gk_refresh_token', refreshToken, authCookieOptions(REFRESH_TOKEN_TTL_SECONDS * 1000));
-
-    return { success: true, user: { id: user.id, email: user.email, role: user.role } };
-  }
-
+  // Google OAuth is the only public sign-in method. Session refresh and logout
+  // remain cookie-based after the Google identity has been verified.
   @Post('auth/logout')
   async logout(@Request() req: any, @Res({ passthrough: true }) res: ExpressResponse) {
     const accessToken = req.headers.cookie ? parseCookies(req.headers.cookie)['gk_access_token'] : null;
@@ -205,7 +152,7 @@ export class ApiController {
   async googleLogin(@Body() dto: { idToken: string }, @Res({ passthrough: true }) res: ExpressResponse) {
     const { idToken } = dto;
     if (!idToken) {
-      throw new UnauthorizedException('Google OAuth identity token is required.');
+      throw new BadRequestException('Google OAuth identity token is required.');
     }
 
     try {

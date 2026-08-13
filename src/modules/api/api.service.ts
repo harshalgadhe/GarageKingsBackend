@@ -981,11 +981,27 @@ export class ApiService implements OnModuleInit {
 
   async addProduct(car: any, creatorEmail: string, ipAddress: string) {
     const sku = String(car.sku || `SKU-${Date.now()}`).trim().toUpperCase();
+    const brandName = String(car.brand || 'Mini GT').trim();
+    const brandSlug = brandName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
+      // Keep the brand index synchronized with catalogue writes. A newly
+      // introduced brand receives the neutral GarageKings presentation until
+      // an admin customizes its theme, logo, and editorial content.
+      await queryRunner.query(`
+        INSERT INTO brands (name, slug, is_visible, status)
+        VALUES ($1, $2, TRUE, 'Active')
+        ON CONFLICT (name) DO UPDATE SET
+          slug = EXCLUDED.slug,
+          is_visible = TRUE,
+          status = 'Active',
+          deleted_at = NULL,
+          updated_at = NOW();
+      `, [brandName, brandSlug]);
+
       const imageList = Array.isArray(car.images) && car.images.length > 0
         ? car.images.filter(Boolean)
         : (car.image ? [car.image] : []);
@@ -1014,7 +1030,7 @@ export class ApiService implements OnModuleInit {
         RETURNING id;
       `, [
         sku,
-        car.brand || 'Mini GT',
+        brandName,
         car.name || 'Unknown Casting',
         car.series || 'Collector Series',
         car.scale || '1:64',
@@ -4626,6 +4642,11 @@ async calculateCheckoutPricing(dto: any) {
   async updateCustomerProfile(email: string, dto: any) {
     const emailClean = email.trim().toLowerCase();
     const { fullName, phone, instagram, address, city } = dto;
+    const cleanInstagram = String(instagram || '').trim().replace(/^@/, '');
+    const cleanAddress = String(address || '').trim();
+    if (!cleanInstagram || !cleanAddress) {
+      throw new BadRequestException('Instagram handle and shipping address are required.');
+    }
     const cleanPhone = phone ? phone.trim() : `unknown_${crypto.randomUUID()}`;
     const custRes = await this.dataSource.query(`
       INSERT INTO customers (full_name, phone, instagram, address, email, city)
@@ -4637,7 +4658,7 @@ async calculateCheckoutPricing(dto: any) {
           address = EXCLUDED.address,
           city = EXCLUDED.city
       RETURNING full_name as "fullName", phone, instagram, address, email, city;
-    `, [fullName || '', cleanPhone, instagram || '', address || '', emailClean, city || 'Unknown']);
+    `, [fullName || '', cleanPhone, cleanInstagram, cleanAddress, emailClean, city || 'Unknown']);
     return custRes[0];
   }
 
