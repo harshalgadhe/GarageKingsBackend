@@ -1209,11 +1209,19 @@ export class ApiService implements OnModuleInit {
     await queryRunner.startTransaction();
 
     try {
-      const imageList = Array.isArray(car.images) && car.images.length > 0
+      const hasImagesUpdate = Object.prototype.hasOwnProperty.call(car, 'images') && Array.isArray(car.images);
+      const hasPrimaryImageUpdate = Object.prototype.hasOwnProperty.call(car, 'image');
+      const imageList = hasImagesUpdate
         ? car.images.filter(Boolean)
-        : (car.image ? [car.image] : (oldData.images || []));
+        : (hasPrimaryImageUpdate
+          ? (car.image ? [car.image] : [])
+          : (Array.isArray(oldData.images) ? oldData.images.filter(Boolean) : []));
 
-      const primaryImg = car.image || imageList[0] || oldData.image || null;
+      // Empty image fields are an explicit request to clear the product gallery.
+      // Only omitted image fields preserve the existing primary image.
+      const primaryImg = hasPrimaryImageUpdate
+        ? (car.image || imageList[0] || null)
+        : (hasImagesUpdate ? (imageList[0] || null) : (oldData.image || imageList[0] || null));
       const finalStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock !== undefined ? car.totalStock : (oldData.stock || 0))));
       const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount !== undefined ? car.prebookDepositAmount : (oldData.po_amount || 0)));
       const priceVal = Number(car.price !== undefined ? car.price : (car.sellingPrice !== undefined ? car.sellingPrice : (oldData.price || 0)));
@@ -1267,7 +1275,7 @@ export class ApiService implements OnModuleInit {
       ]);
 
       // Sync product_images table
-      if (Array.isArray(car.images) || car.image) {
+      if (hasImagesUpdate || hasPrimaryImageUpdate) {
         await queryRunner.query("DELETE FROM product_images WHERE product_id = $1;", [id]);
         for (let idx = 0; idx < imageList.length; idx++) {
           const imgUrl = imageList[idx];
@@ -4644,9 +4652,6 @@ async calculateCheckoutPricing(dto: any) {
     const { fullName, phone, instagram, address, city } = dto;
     const cleanInstagram = String(instagram || '').trim().replace(/^@/, '');
     const cleanAddress = String(address || '').trim();
-    if (!cleanInstagram || !cleanAddress) {
-      throw new BadRequestException('Instagram handle and shipping address are required.');
-    }
     const cleanPhone = phone ? phone.trim() : `unknown_${crypto.randomUUID()}`;
     const custRes = await this.dataSource.query(`
       INSERT INTO customers (full_name, phone, instagram, address, email, city)
