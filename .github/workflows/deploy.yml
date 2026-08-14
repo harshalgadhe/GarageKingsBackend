@@ -49,3 +49,12 @@ jobs:
       - name: Update Lambda Function Code
         run: |
           aws lambda update-function-code --function-name gk-production-api-prod --s3-bucket gk-production-public-assets-2026 --s3-key lambda-deploy.zip --region ap-south-1
+
+      - name: Wait for Lambda Update
+        run: aws lambda wait function-updated --function-name gk-production-api-prod --region ap-south-1
+
+      - name: Run Database Migrations in VPC
+        run: |
+          aws lambda invoke --function-name gk-production-api-prod --cli-binary-format raw-in-base64-out --payload '{"task":"run-migrations"}' --region ap-south-1 migration-response.json
+          cat migration-response.json
+          test "$(jq -r '.success // false' migration-response.json)" = "true"

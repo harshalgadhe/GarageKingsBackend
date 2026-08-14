@@ -11,22 +11,31 @@ export class ProductsService {
     if (!normalizedSku) return { available: false, sku: normalizedSku };
 
     const params: any[] = [normalizedSku];
-    let exclusion = '';
+    let productExclusion = '';
     if (excludeId) {
       params.push(excludeId);
-      exclusion = 'AND id <> $2';
+      productExclusion = 'AND p.id <> $2';
     }
 
     const rows = await this.dataSource.query(`
-      SELECT id
-      FROM products
-      WHERE UPPER(TRIM(sku)) = $1
-        AND deleted_at IS NULL
-        ${exclusion}
+      SELECT p.id, p.sku, p.model_name AS name
+      FROM products p
+      WHERE UPPER(TRIM(p.sku)) = $1
+        AND p.deleted_at IS NULL
+        ${productExclusion}
+
       LIMIT 1;
     `, params);
 
-    return { available: rows.length === 0, sku: normalizedSku };
+    const conflict = rows[0];
+    return {
+      available: !conflict,
+      sku: normalizedSku,
+      conflict: conflict ? {
+        productId: conflict.id,
+        productName: conflict.name
+      } : null
+    };
   }
 
   async getProducts(adminMode = false) {

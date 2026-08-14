@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS products (
     model_name VARCHAR(255) NOT NULL,
     series VARCHAR(255),
     scale VARCHAR(20) DEFAULT '1:64',
-    sku VARCHAR(100) UNIQUE NOT NULL,
+    sku VARCHAR(100) NOT NULL,
     rarity_level VARCHAR(100) DEFAULT 'Standard Edition',
     base_price NUMERIC(12, 2) NOT NULL CONSTRAINT chk_base_price CHECK (base_price >= 0),
     description TEXT,
@@ -133,7 +133,6 @@ CREATE TABLE IF NOT EXISTS product_variants (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 CREATE INDEX IF NOT EXISTS idx_variants_product ON product_variants(product_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_variants_sku_active ON product_variants(sku) WHERE deleted_at IS NULL;
 
 -- 3.4 Product Price History Table (Auditing Pricing Changes)
 CREATE TABLE IF NOT EXISTS product_price_history (

@@ -5,6 +5,9 @@ import { ApiService } from './modules/api/api.service.js';
 import { configure as serverlessExpress } from '@vendia/serverless-express';
 import { Handler, Context, Callback } from 'aws-lambda';
 import { getJwtSecret, isAllowedOrigin } from './config/security.config.js';
+import { DataSource } from 'typeorm';
+import { join } from 'node:path';
+import { runPendingMigrations } from './database/migration-runner.js';
 
 getJwtSecret();
 
@@ -55,6 +58,17 @@ async function bootstrap() {
 let nestApp: any;
 
 export const handler: Handler = async (event: any, context: Context, callback: Callback) => {
+  if (event && event.task === 'run-migrations') {
+    console.log('[Lambda] Running pending database migrations.');
+    if (!nestApp) {
+      nestApp = await NestFactory.createApplicationContext(AppModule);
+    }
+    const dataSource = nestApp.get(DataSource);
+    const applied = await runPendingMigrations(dataSource, join(process.cwd(), 'migrations'));
+    console.log(`[Lambda] Applied ${applied.length} migration(s).`);
+    return { success: true, applied };
+  }
+
   if (event && event.task === 'cleanup-expired-orders') {
     console.log('[Lambda] Intercepted direct EventBridge cleanup task invocation.');
     if (!nestApp) {

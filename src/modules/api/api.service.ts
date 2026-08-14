@@ -665,7 +665,7 @@ export class ApiService implements OnModuleInit {
     let filterStr = "WHERE pv.deleted_at IS NULL";
     const params = [];
     if (options.search) {
-      filterStr += ` AND (pv.name ILIKE $1 OR pv.sku ILIKE $1 OR p.model_name ILIKE $1)`;
+      filterStr += ` AND (pv.name ILIKE $1 OR p.sku ILIKE $1 OR p.model_name ILIKE $1)`;
       params.push(`%${options.search}%`);
     }
 
@@ -686,7 +686,7 @@ export class ApiService implements OnModuleInit {
     const variants = await this.dataSource.query(`
       SELECT 
         pv.id,
-        pv.sku,
+        p.sku,
         pv.barcode,
         pv.name,
         pv.selling_price as "selling_price",
@@ -951,13 +951,14 @@ export class ApiService implements OnModuleInit {
     product.availableCasings = casings;
 
     const variants = await this.dataSource.query(`
-      SELECT pv.id, pv.sku, pv.barcode, pv.name, pv.selling_price as "sellingPrice",
+      SELECT pv.id, p.sku, pv.barcode, pv.name, pv.selling_price as "sellingPrice",
              pv.customer_eta as "customerEta", pv.visibility, pv.status, pv.sales_status as "salesStatus",
              pv.dimensions, pv.weight, pv.variant_attributes as "variantAttributes",
              pv.total_stock as "totalStock", pv.sold_stock as "soldStock", pv.locked_stock as "lockedStock",
              (pv.total_stock - pv.locked_stock - pv.sold_stock) as "availableStock",
              ct.name as casing, ct.display_name as "casingDisplay"
       FROM product_variants pv
+      JOIN products p ON p.id = pv.product_id
       JOIN casing_types ct ON ct.id = pv.casing_type_id
       WHERE pv.product_id = $1 AND pv.deleted_at IS NULL
     `, [id]);
@@ -1100,7 +1101,7 @@ export class ApiService implements OnModuleInit {
           `, [
             productId,
             casingTypeId,
-            v.sku.trim(),
+            sku,
             v.barcode || null,
             v.name || `${car.name || 'Unknown Casting'} (${v.casing})`,
             Number(v.price || 0),
@@ -1182,11 +1183,8 @@ export class ApiService implements OnModuleInit {
       const dbCode = err?.code || err?.driverError?.code;
       const constraint = err?.constraint || err?.driverError?.constraint;
       if (dbCode === '23505') {
-        if (constraint === 'products_sku_key') {
+        if (constraint === 'products_sku_key' || constraint === 'idx_products_sku_active_normalized') {
           throw new ConflictException(`A product with SKU "${sku}" already exists. Open that product to update it, or use a different SKU.`);
-        }
-        if (constraint?.includes('product_variants') || constraint?.includes('sku')) {
-          throw new ConflictException('One of the variant SKUs is already assigned to another product. Each variant SKU must be unique.');
         }
         throw new ConflictException('A product with the same unique details already exists.');
       }
@@ -1312,7 +1310,7 @@ export class ApiService implements OnModuleInit {
         for (const v of car.variants) {
           const vCasing = v.casing || 'Blister';
           const casingTypeId = await getOrInsertCasingTypeId(vCasing);
-          const vSku = v.sku || `${car.sku || oldData.sku}-${vCasing.toUpperCase()}`;
+          const vSku = String(car.sku || oldData.sku).trim().toUpperCase();
           const vName = v.name || `${car.name || oldData.model_name || 'Unknown Casting'} (${vCasing})`;
           const vPrice = Number(v.price || v.sellingPrice || priceVal);
 
@@ -1394,7 +1392,7 @@ async calculateCheckoutPricing(dto: any) {
       const rows = await this.dataSource.query(`
         SELECT pv.id as "variantId", 
                pv.selling_price as "sellingPrice", 
-               pv.sku, 
+               p.sku,
                pv.name as "variantName", 
                pv.version as "version",
                p.id as "productId",
@@ -3785,7 +3783,7 @@ async calculateCheckoutPricing(dto: any) {
     `);
     const preorderCount = preorderRes[0].total;
 
-    const noSkuRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (sku IS NULL OR sku = \'\');');
+    const noSkuRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM products WHERE deleted_at IS NULL AND (sku IS NULL OR sku = \'\');');
     const productsWithoutSKU = noSkuRes[0].total;
 
     const noPriceRes = await this.dataSource.query('SELECT COUNT(*)::int as total FROM product_variants WHERE deleted_at IS NULL AND (selling_price IS NULL OR selling_price <= 0);');
@@ -3951,7 +3949,7 @@ async calculateCheckoutPricing(dto: any) {
     const summaryRes = await this.dataSource.query(`
       SELECT 
         pv.id,
-        pv.sku,
+        p.sku,
         ct.display_name as "casing",
         pv.selling_price as "sellingPrice",
         p.model_name as "productName",
@@ -4810,8 +4808,13 @@ async calculateCheckoutPricing(dto: any) {
       }
     }
 
-    // Get variant SKU and parent product ID
-    const varRows = await queryRunner.query("SELECT sku, product_id FROM product_variants WHERE id = $1;", [variantId]);
+    // Product SKU is the catalogue identifier; variants only identify casing/inventory choices.
+    const varRows = await queryRunner.query(`
+      SELECT p.sku, pv.product_id
+      FROM product_variants pv
+      JOIN products p ON p.id = pv.product_id
+      WHERE pv.id = $1;
+    `, [variantId]);
     const sku = varRows[0]?.sku || `SKU-MIG-${Date.now()}`;
     const parentProductId = varRows[0]?.product_id;
 
