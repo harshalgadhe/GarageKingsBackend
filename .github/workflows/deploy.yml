@@ -57,6 +57,7 @@ jobs:
           aws lambda wait function-updated --function-name gk-production-database-migrator --region ap-south-1
 
       - name: Run Database Migrations in VPC
+        if: ${{ false }} # Temporarily disabled: migrations are run only after separate validation.
         run: |
           VPC_ID=$(aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query 'VpcConfig.VpcId' --output text)
           SG_ID=$(aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query 'VpcConfig.SecurityGroupIds[0]' --output text)

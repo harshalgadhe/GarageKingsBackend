@@ -751,7 +751,7 @@ export class ApiService implements OnModuleInit {
     const stockVisibility = settings.showSoldOutProducts === false
       ? ` AND (COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR COALESCE(available_stock, stock, total_stock, 0) > 0)`
       : '';
-    const visibility = `deleted_at IS NULL AND COALESCE(is_public, TRUE) = TRUE AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)${stockVisibility}`;
+    const visibility = `deleted_at IS NULL AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)${stockVisibility}`;
 
     const [featured, recent] = await Promise.all([
       this.dataSource.query(`SELECT ${fields} FROM products WHERE ${visibility} AND is_featured = true ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 1;`),
@@ -814,7 +814,7 @@ export class ApiService implements OnModuleInit {
     const offset = options.offset !== undefined ? Number(options.offset) : (page - 1) * limit;
 
     const selectFields = options.adminMode
-      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status, is_public as "isPublic",
+      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
@@ -838,8 +838,7 @@ export class ApiService implements OnModuleInit {
     `;
 
     if (!options.adminMode) {
-      queryStr += ` AND COALESCE(is_public, TRUE) = TRUE
-                    AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
+      queryStr += ` AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
       if (settings.showSoldOutProducts === false) {
         queryStr += ` AND (
           COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR
@@ -931,7 +930,7 @@ export class ApiService implements OnModuleInit {
              ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
              p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage", p.is_featured as "isFeatured", p.is_public as "isPublic",
+             p.status, p.show_on_homepage as "showOnHomepage", p.is_featured as "isFeatured",
              p.casing, p.casing_types as "casingTypes",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
@@ -948,7 +947,6 @@ export class ApiService implements OnModuleInit {
     const product = rows[0];
 
     if (!adminMode) {
-      if (product.isPublic === false) return null;
       const settings = await this.getGlobalSettings();
       const soldOut = Number(product.availableStock || 0) <= 0 && !product.isPrebook && product.status !== 'Pre-Order';
       if (settings.showSoldOutProducts === false && soldOut) return null;
@@ -1256,9 +1254,8 @@ export class ApiService implements OnModuleInit {
             base_price = $8, selling_price = $9, price = $10, po_amount = $11, prebook_deposit_amount = $12,
             stock = $13, total_stock = $14, is_prebook = $15, is_featured = $16, status = $17, customer_eta = $18,
             arrival_date = $19, release_date = $20, tag = $21, subtags = $22, tags = $23,
-            description = $24, image = $25, images = $26, supplier = $27, updated_by = $28,
-            is_public = $29, updated_at = NOW()
-        WHERE id = $30;
+            description = $24, image = $25, images = $26, supplier = $27, updated_by = $28, updated_at = NOW()
+        WHERE id = $29;
       `, [
         car.sku || oldData.sku,
         car.brand || oldData.brand,
@@ -1288,7 +1285,6 @@ export class ApiService implements OnModuleInit {
         imageList,
         car.supplier || oldData.supplier,
         updaterEmail,
-        car.isPublic !== undefined ? Boolean(car.isPublic) : oldData.is_public !== false,
         id
       ]);
 

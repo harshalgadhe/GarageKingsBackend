@@ -44,7 +44,6 @@ export class AdminProductResponseDto {
   image?: string;
   manufacturer?: string;
   isFeatured?: boolean;
-  isPublic: boolean;
   variants: AdminVariantResponseDto[];
 
   static fromEntity(p: any): AdminProductResponseDto {
@@ -63,7 +62,6 @@ export class AdminProductResponseDto {
     dto.updatedAt = p.updatedAt || p.updated_at;
     dto.image = p.image;
     dto.isFeatured = p.isFeatured !== undefined ? Boolean(p.isFeatured) : Boolean(p.is_featured);
-    dto.isPublic = p.isPublic !== undefined ? Boolean(p.isPublic) : p.is_public !== false;
     dto.variants = (p.variants || []).map((v: any) => AdminVariantResponseDto.fromEntity(v));
 
     // Fallbacks and aggregated metrics

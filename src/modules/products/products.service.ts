@@ -44,7 +44,7 @@ export class ProductsService {
     if (cached) return cached;
 
     const selectFields = adminMode
-      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status, is_public as "isPublic",
+      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
@@ -65,8 +65,7 @@ export class ProductsService {
       SELECT ${selectFields}
       FROM products
       WHERE deleted_at IS NULL
-      ${adminMode ? '' : `AND COALESCE(is_public, TRUE) = TRUE
-        AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)
+      ${adminMode ? '' : `AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)
         ${showSoldOutProducts ? '' : "AND (COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR COALESCE(available_stock, stock, total_stock, 0) > 0)"}`}
       ORDER BY created_at DESC;
     `;
@@ -134,8 +133,7 @@ export class ProductsService {
     `;
 
     if (!options.adminMode) {
-      queryStr += ` AND COALESCE(is_public, TRUE) = TRUE
-                    AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
+      queryStr += ` AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
       if (settings.showSoldOutProducts === false) {
         queryStr += ` AND (
           COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR
@@ -218,7 +216,7 @@ export class ProductsService {
     const queryStr = `
       SELECT id, sku, brand, model_name as name, series, scale, casing,
              casing as "casingType", description, tag, subtags, tags, category,
-             status, show_on_homepage as "showOnHomepage", is_featured as "isFeatured", is_public as "isPublic",
+             status, show_on_homepage as "showOnHomepage", is_featured as "isFeatured",
              max_qty_per_customer as "maxQtyPerCustomer",
              COALESCE(selling_price, base_price, 0.00) as "sellingPrice",
              COALESCE(selling_price, base_price, 0.00) as price,
@@ -240,7 +238,6 @@ export class ProductsService {
     const product = rows[0];
 
     if (!adminMode) {
-      if (product.isPublic === false) return null;
       const settingsRows = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
       const settings = settingsRows[0]?.value || {};
       const soldOut = Number(product.availableStock || 0) <= 0 && !product.isPrebook && product.status !== 'Pre-Order';
