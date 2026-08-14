@@ -10,6 +10,7 @@ export class PublicSettingsController {
     const raw = await this.apiService.getGlobalSettings();
     return {
       showPrices: raw.showPrices,
+      showSoldOutProducts: raw.showSoldOutProducts,
       instagramUrl: raw.instagramUrl,
       companyUpiId: raw.companyUpiId,
       upiQrImage: raw.upiQrImage,

@@ -366,6 +366,19 @@ resource "aws_iam_role_policy_attachment" "migration_lambda_basic" {
   role       = aws_iam_role.migration_lambda_role.name
 }
 
+# Secrets Manager is reached through a short-lived interface endpoint created
+# by CI only while migrations run. This self-rule permits that private TLS path
+# without introducing a NAT Gateway or a permanently billed endpoint.
+resource "aws_security_group_rule" "lambda_secrets_manager_endpoint" {
+  type                     = "ingress"
+  description              = "Private TLS from migration Lambda to temporary Secrets Manager endpoint"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.lambda_sg.id
+  source_security_group_id = aws_security_group.lambda_sg.id
+}
+
 resource "aws_iam_role_policy" "migration_rds_secret" {
   name = "gk-${var.environment}-migration-rds-secret"
   role = aws_iam_role.migration_lambda_role.id

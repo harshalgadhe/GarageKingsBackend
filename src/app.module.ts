@@ -1,6 +1,6 @@
 import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD, APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { databaseConfig } from './config/database.config.js';
 import { ReceiptsModule } from './modules/receipts/receipts.module.js';
@@ -20,6 +20,8 @@ import { FinanceModule } from './modules/finance/finance.module.js';
 import { AnalyticsModule } from './modules/analytics/analytics.module.js';
 import { SettingsModule } from './modules/settings/settings.module.js';
 import { NotificationsModule } from './modules/notifications/notifications.module.js';
+import { ProxyAwareThrottlerGuard } from './common/guards/proxy-aware-throttler.guard.js';
+import { getClientIp, getRequestRateLimit } from './config/rate-limit.config.js';
 
 @Module({
   imports: [
@@ -27,10 +29,13 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
     TypeOrmModule.forRoot(databaseConfig()),
 
     // 2. Application-Level Rate Limiter (NestJS Throttler)
-    ThrottlerModule.forRoot([{
-      ttl: 60000, // Time-to-Live window of 1 minute (60 seconds)
-      limit: 60,  // Max 60 requests per IP address in this window
-    }]),
+    ThrottlerModule.forRoot({
+      throttlers: [{
+        ttl: 60000,
+        limit: getRequestRateLimit,
+      }],
+      getTracker: async (req) => getClientIp(req),
+    }),
     MulterModule.register({
       limits: {
         fileSize: 10 * 1024 * 1024,
@@ -58,7 +63,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
     // Bind ThrottlerGuard globally across all REST API controllers
     {
       provide: APP_GUARD,
-      useClass: ThrottlerGuard
+      useClass: ProxyAwareThrottlerGuard
     },
     // Bind AllExceptionsFilter globally to handle all uncaught errors
     {

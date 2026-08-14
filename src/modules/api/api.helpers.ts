@@ -121,6 +121,12 @@ class InMemoryCache {
     this.cache.delete(key);
   }
 
+  delByPrefix(prefix: string): void {
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(prefix)) this.cache.delete(key);
+    }
+  }
+
   incr(key: string, ttlSeconds?: number): number {
     const current = this.get(key);
     const newVal = (Number(current) || 0) + 1;

@@ -743,11 +743,15 @@ export class ApiService implements OnModuleInit {
     const fields = `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
       COALESCE(selling_price, base_price, 0.00) as price,
       COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
-      (COALESCE(stock, total_stock, 0) <= 0) as "isSoldOut",
+      (COALESCE(available_stock, stock, total_stock, 0) <= 0) as "isSoldOut",
       is_prebook as "isPrebook", COALESCE(customer_eta, arrival_date) as "customerEta",
       COALESCE(image, (SELECT thumbnail_url FROM product_images WHERE product_id = products.id ORDER BY is_primary DESC, created_at ASC LIMIT 1)) as image,
       created_at`;
-    const visibility = `deleted_at IS NULL AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
+    const settings = await this.getGlobalSettings();
+    const stockVisibility = settings.showSoldOutProducts === false
+      ? ` AND (COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR COALESCE(available_stock, stock, total_stock, 0) > 0)`
+      : '';
+    const visibility = `deleted_at IS NULL AND COALESCE(is_public, TRUE) = TRUE AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)${stockVisibility}`;
 
     const [featured, recent] = await Promise.all([
       this.dataSource.query(`SELECT ${fields} FROM products WHERE ${visibility} AND is_featured = true ORDER BY updated_at DESC NULLS LAST, created_at DESC LIMIT 1;`),
@@ -810,7 +814,7 @@ export class ApiService implements OnModuleInit {
     const offset = options.offset !== undefined ? Number(options.offset) : (page - 1) * limit;
 
     const selectFields = options.adminMode
-      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
+      ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status, is_public as "isPublic",
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
@@ -821,7 +825,7 @@ export class ApiService implements OnModuleInit {
       : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
-         (COALESCE(stock, total_stock, 0) <= 0) as "isSoldOut",
+         (COALESCE(available_stock, stock, total_stock, 0) <= 0) as "isSoldOut",
          is_prebook as "isPrebook",
          COALESCE(customer_eta, arrival_date) as "customerEta",
          COALESCE(image, (SELECT thumbnail_url FROM product_images WHERE product_id = products.id LIMIT 1)) as image,
@@ -834,7 +838,14 @@ export class ApiService implements OnModuleInit {
     `;
 
     if (!options.adminMode) {
-      queryStr += ` AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
+      queryStr += ` AND COALESCE(is_public, TRUE) = TRUE
+                    AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
+      if (settings.showSoldOutProducts === false) {
+        queryStr += ` AND (
+          COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR
+          COALESCE(available_stock, stock, total_stock, 0) > 0
+        )`;
+      }
     }
 
     const params: any[] = [];
@@ -920,7 +931,7 @@ export class ApiService implements OnModuleInit {
              ${adminFields}
              (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
              p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
-             p.status, p.show_on_homepage as "showOnHomepage", p.is_featured as "isFeatured",
+             p.status, p.show_on_homepage as "showOnHomepage", p.is_featured as "isFeatured", p.is_public as "isPublic",
              p.casing, p.casing_types as "casingTypes",
              p.max_qty_per_customer as "maxQtyPerCustomer",
              p.is_prebook as "isPrebook", p.prebook_deposit_amount as "prebookDepositAmount",
@@ -935,6 +946,13 @@ export class ApiService implements OnModuleInit {
     const rows = await this.dataSource.query(queryStr, [id]);
     if (rows.length === 0) return null;
     const product = rows[0];
+
+    if (!adminMode) {
+      if (product.isPublic === false) return null;
+      const settings = await this.getGlobalSettings();
+      const soldOut = Number(product.availableStock || 0) <= 0 && !product.isPrebook && product.status !== 'Pre-Order';
+      if (settings.showSoldOutProducts === false && soldOut) return null;
+    }
 
     const casings = await this.dataSource.query(`
       SELECT ct.name as "casingType", 
@@ -1238,8 +1256,9 @@ export class ApiService implements OnModuleInit {
             base_price = $8, selling_price = $9, price = $10, po_amount = $11, prebook_deposit_amount = $12,
             stock = $13, total_stock = $14, is_prebook = $15, is_featured = $16, status = $17, customer_eta = $18,
             arrival_date = $19, release_date = $20, tag = $21, subtags = $22, tags = $23,
-            description = $24, image = $25, images = $26, supplier = $27, updated_by = $28, updated_at = NOW()
-        WHERE id = $29;
+            description = $24, image = $25, images = $26, supplier = $27, updated_by = $28,
+            is_public = $29, updated_at = NOW()
+        WHERE id = $30;
       `, [
         car.sku || oldData.sku,
         car.brand || oldData.brand,
@@ -1269,6 +1288,7 @@ export class ApiService implements OnModuleInit {
         imageList,
         car.supplier || oldData.supplier,
         updaterEmail,
+        car.isPublic !== undefined ? Boolean(car.isPublic) : oldData.is_public !== false,
         id
       ]);
 
@@ -4670,6 +4690,7 @@ async calculateCheckoutPricing(dto: any) {
     const rows = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
     const defaultSettings = { 
       showPrices: true,
+      showSoldOutProducts: true,
       instagramUrl: 'https://www.instagram.com/garagekingsindia/',
       companyUpiId: 'garagekings@upi',
       upiQrImage: '/upi-qr.png',
@@ -4698,6 +4719,9 @@ async calculateCheckoutPricing(dto: any) {
       VALUES ('app_settings', $1, NOW())
       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW();
     `, [merged]);
+    localCache.del('public_product_page_settings');
+    localCache.del('public_homepage_products');
+    localCache.delByPrefix('product_');
     
     await this.writeAuditLog(
       'UPDATE_SETTINGS',

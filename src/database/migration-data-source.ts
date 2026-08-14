@@ -13,7 +13,10 @@ export async function createMigrationDataSource(): Promise<DataSource> {
   const secretArn = process.env.RDS_MASTER_SECRET_ARN?.trim();
   if (!secretArn) throw new Error('RDS_MASTER_SECRET_ARN is required for migrations.');
 
-  const client = new SecretsManagerClient({ region: process.env.AWS_REGION || 'ap-south-1' });
+  const client = new SecretsManagerClient({
+    region: process.env.AWS_REGION || 'ap-south-1',
+    endpoint: process.env.SECRETS_MANAGER_ENDPOINT?.trim() || undefined,
+  });
   const response = await client.send(new GetSecretValueCommand({ SecretId: secretArn }));
   if (!response.SecretString) throw new Error('The RDS migration secret has no string value.');
 
