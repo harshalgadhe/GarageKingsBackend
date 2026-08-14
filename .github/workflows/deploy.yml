@@ -62,10 +62,10 @@ jobs:
           SG_ID=$(aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query 'VpcConfig.SecurityGroupIds[0]' --output text)
           SUBNET_IDS=$(aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query 'VpcConfig.SubnetIds' --output json | jq -r 'join(" ")')
           ENDPOINT_ID=$(aws ec2 create-vpc-endpoint --vpc-id "$VPC_ID" --vpc-endpoint-type Interface --service-name com.amazonaws.ap-south-1.secretsmanager --subnet-ids $SUBNET_IDS --security-group-ids "$SG_ID" --region ap-south-1 --query 'VpcEndpoint.VpcEndpointId' --output text)
-          ORIGINAL_ENV=""
+          ORIGINAL_ENV_FILE=""
           cleanup() {
-            if [ -n "$ORIGINAL_ENV" ]; then
-              aws lambda update-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --environment "Variables=$ORIGINAL_ENV" >/dev/null || true
+            if [ -n "$ORIGINAL_ENV_FILE" ] && [ -f "$ORIGINAL_ENV_FILE" ]; then
+              aws lambda update-function-configuration --cli-input-json "file://$ORIGINAL_ENV_FILE" --region ap-south-1 >/dev/null || true
             fi
             aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "$ENDPOINT_ID" --region ap-south-1 >/dev/null || true
           }
@@ -78,9 +78,11 @@ jobs:
           done
           [ "$ENDPOINT_STATE" = "available" ]
           ENDPOINT_DNS=$(aws ec2 describe-vpc-endpoints --vpc-endpoint-ids "$ENDPOINT_ID" --region ap-south-1 --query 'VpcEndpoints[0].DnsEntries[0].DnsName' --output text)
-          ORIGINAL_ENV=$(aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query 'Environment.Variables' --output json)
-          UPDATED_ENV=$(echo "$ORIGINAL_ENV" | jq --arg endpoint "https://$ENDPOINT_DNS" '. + {SECRETS_MANAGER_ENDPOINT: $endpoint}')
-          aws lambda update-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --environment "Variables=$UPDATED_ENV" >/dev/null
+          ORIGINAL_ENV_FILE="/tmp/migrator-original-environment.json"
+          UPDATED_ENV_FILE="/tmp/migrator-updated-environment.json"
+          aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query '{FunctionName:FunctionName,Environment:Environment}' --output json > "$ORIGINAL_ENV_FILE"
+          jq --arg endpoint "https://$ENDPOINT_DNS" '.Environment.Variables += {SECRETS_MANAGER_ENDPOINT: $endpoint}' "$ORIGINAL_ENV_FILE" > "$UPDATED_ENV_FILE"
+          aws lambda update-function-configuration --cli-input-json "file://$UPDATED_ENV_FILE" --region ap-south-1 >/dev/null
           aws lambda wait function-updated --function-name gk-production-database-migrator --region ap-south-1
           aws lambda invoke --function-name gk-production-database-migrator --cli-binary-format raw-in-base64-out --payload '{"task":"run-migrations"}' --region ap-south-1 migration-response.json
           cat migration-response.json
