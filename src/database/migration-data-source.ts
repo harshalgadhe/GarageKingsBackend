@@ -4,7 +4,7 @@ import { DataSource } from 'typeorm';
 type RdsMasterSecret = {
   username: string;
   password: string;
-  host: string;
+  host?: string;
   port?: number;
   dbname?: string;
 };
@@ -21,10 +21,12 @@ export async function createMigrationDataSource(): Promise<DataSource> {
   if (!response.SecretString) throw new Error('The RDS migration secret has no string value.');
 
   const secret = JSON.parse(response.SecretString) as RdsMasterSecret;
+  const host = secret.host || process.env.MIGRATION_DATABASE_HOST?.trim();
+  if (!host) throw new Error('MIGRATION_DATABASE_HOST is required when the RDS secret has no host.');
   const dataSource = new DataSource({
     type: 'postgres',
-    host: secret.host,
-    port: Number(secret.port || 5432),
+    host,
+    port: Number(secret.port || process.env.MIGRATION_DATABASE_PORT || 5432),
     username: secret.username,
     password: secret.password,
     database: secret.dbname || process.env.MIGRATION_DATABASE_NAME || 'garagekings_prod',

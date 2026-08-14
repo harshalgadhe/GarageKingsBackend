@@ -78,10 +78,12 @@ jobs:
           done
           [ "$ENDPOINT_STATE" = "available" ]
           ENDPOINT_DNS=$(aws ec2 describe-vpc-endpoints --vpc-endpoint-ids "$ENDPOINT_ID" --region ap-south-1 --query 'VpcEndpoints[0].DnsEntries[0].DnsName' --output text)
+          DATABASE_HOST=$(aws rds describe-db-instances --db-instance-identifier gk-production-postgres --region ap-south-1 --query 'DBInstances[0].Endpoint.Address' --output text)
+          DATABASE_PORT=$(aws rds describe-db-instances --db-instance-identifier gk-production-postgres --region ap-south-1 --query 'DBInstances[0].Endpoint.Port' --output text)
           ORIGINAL_ENV_FILE="/tmp/migrator-original-environment.json"
           UPDATED_ENV_FILE="/tmp/migrator-updated-environment.json"
           aws lambda get-function-configuration --function-name gk-production-database-migrator --region ap-south-1 --query '{FunctionName:FunctionName,Environment:Environment}' --output json > "$ORIGINAL_ENV_FILE"
-          jq --arg endpoint "https://$ENDPOINT_DNS" '.Environment.Variables += {SECRETS_MANAGER_ENDPOINT: $endpoint}' "$ORIGINAL_ENV_FILE" > "$UPDATED_ENV_FILE"
+          jq --arg endpoint "https://$ENDPOINT_DNS" --arg host "$DATABASE_HOST" --arg port "$DATABASE_PORT" '.Environment.Variables += {SECRETS_MANAGER_ENDPOINT: $endpoint, MIGRATION_DATABASE_HOST: $host, MIGRATION_DATABASE_PORT: $port}' "$ORIGINAL_ENV_FILE" > "$UPDATED_ENV_FILE"
           aws lambda update-function-configuration --cli-input-json "file://$UPDATED_ENV_FILE" --region ap-south-1 >/dev/null
           aws lambda wait function-updated --function-name gk-production-database-migrator --region ap-south-1
           aws lambda invoke --function-name gk-production-database-migrator --cli-binary-format raw-in-base64-out --payload '{"task":"run-migrations"}' --region ap-south-1 migration-response.json

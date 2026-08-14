@@ -498,6 +498,8 @@ resource "aws_lambda_function" "database_migrator" {
       NODE_OPTIONS                     = "--dns-result-order=ipv6first"
       NODE_EXTRA_CA_CERTS              = "/var/task/certs/ap-south-1-bundle.pem"
       RDS_MASTER_SECRET_ARN            = aws_db_instance.postgres.master_user_secret[0].secret_arn
+      MIGRATION_DATABASE_HOST          = aws_db_instance.postgres.address
+      MIGRATION_DATABASE_PORT          = tostring(aws_db_instance.postgres.port)
       MIGRATION_DATABASE_NAME          = aws_db_instance.postgres.db_name
       DATABASE_SSL                     = "true"
       DATABASE_SSL_REJECT_UNAUTHORIZED = "true"
