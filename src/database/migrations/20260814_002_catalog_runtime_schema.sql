@@ -69,13 +69,9 @@ ALTER TABLE product_images
   ADD COLUMN IF NOT EXISTS full_url TEXT;
 
 UPDATE product_images
-SET full_url = COALESCE(full_url, url, thumbnail_url),
-    medium_url = COALESCE(medium_url, thumbnail_url, url),
-    thumbnail_url = COALESCE(thumbnail_url, url, full_url);
-
--- Legacy catalog writers populate the resolution-specific fields. The generic
--- URL remains supported but is no longer required for new rows.
-ALTER TABLE product_images ALTER COLUMN url DROP NOT NULL;
+SET full_url = COALESCE(full_url, thumbnail_url),
+    medium_url = COALESCE(medium_url, thumbnail_url, full_url),
+    thumbnail_url = COALESCE(thumbnail_url, full_url, medium_url);
 
 WITH catalog_brands AS (
   SELECT DISTINCT TRIM(brand) AS name
