@@ -749,7 +749,7 @@ export class ApiService implements OnModuleInit {
       created_at`;
     const settings = await this.getGlobalSettings();
     const stockVisibility = settings.showSoldOutProducts === false
-      ? ` AND (COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR COALESCE(available_stock, stock, total_stock, 0) > 0)`
+      ? ` AND COALESCE(available_stock, stock, total_stock, 0) > 0`
       : '';
     const visibility = `deleted_at IS NULL AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)${stockVisibility}`;
 
@@ -840,10 +840,7 @@ export class ApiService implements OnModuleInit {
     if (!options.adminMode) {
       queryStr += ` AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
       if (settings.showSoldOutProducts === false) {
-        queryStr += ` AND (
-          COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR
-          COALESCE(available_stock, stock, total_stock, 0) > 0
-        )`;
+        queryStr += ` AND COALESCE(available_stock, stock, total_stock, 0) > 0`;
       }
     }
 
@@ -948,7 +945,7 @@ export class ApiService implements OnModuleInit {
 
     if (!adminMode) {
       const settings = await this.getGlobalSettings();
-      const soldOut = Number(product.availableStock || 0) <= 0 && !product.isPrebook && product.status !== 'Pre-Order';
+      const soldOut = Number(product.availableStock || 0) <= 0;
       if (settings.showSoldOutProducts === false && soldOut) return null;
     }
 

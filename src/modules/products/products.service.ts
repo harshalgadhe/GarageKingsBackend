@@ -66,7 +66,7 @@ export class ProductsService {
       FROM products
       WHERE deleted_at IS NULL
       ${adminMode ? '' : `AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)
-        ${showSoldOutProducts ? '' : "AND (COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR COALESCE(available_stock, stock, total_stock, 0) > 0)"}`}
+        ${showSoldOutProducts ? '' : 'AND COALESCE(available_stock, stock, total_stock, 0) > 0'}`}
       ORDER BY created_at DESC;
     `;
 
@@ -135,10 +135,7 @@ export class ProductsService {
     if (!options.adminMode) {
       queryStr += ` AND (status IN ('Published', 'Pre-Order', 'Active') OR status IS NULL)`;
       if (settings.showSoldOutProducts === false) {
-        queryStr += ` AND (
-          COALESCE(is_prebook, FALSE) = TRUE OR status = 'Pre-Order' OR
-          COALESCE(available_stock, stock, total_stock, 0) > 0
-        )`;
+        queryStr += ` AND COALESCE(available_stock, stock, total_stock, 0) > 0`;
       }
     }
 
@@ -240,7 +237,7 @@ export class ProductsService {
     if (!adminMode) {
       const settingsRows = await this.dataSource.query("SELECT value FROM global_settings WHERE key = 'app_settings';");
       const settings = settingsRows[0]?.value || {};
-      const soldOut = Number(product.availableStock || 0) <= 0 && !product.isPrebook && product.status !== 'Pre-Order';
+      const soldOut = Number(product.availableStock || 0) <= 0;
       if (settings.showSoldOutProducts === false && soldOut) return null;
     }
 
