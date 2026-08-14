@@ -346,6 +346,40 @@ resource "aws_iam_role_policy_attachment" "lambda_basic" {
   role       = aws_iam_role.lambda_role.name
 }
 
+# Database migrations run in a separate, non-public Lambda. The API runtime
+# role never receives access to the RDS master credential.
+resource "aws_iam_role" "migration_lambda_role" {
+  name = "gk-${var.environment}-migration-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "migration_lambda_basic" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  role       = aws_iam_role.migration_lambda_role.name
+}
+
+resource "aws_iam_role_policy" "migration_rds_secret" {
+  name = "gk-${var.environment}-migration-rds-secret"
+  role = aws_iam_role.migration_lambda_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = aws_db_instance.postgres.master_user_secret[0].secret_arn
+    }]
+  })
+}
+
 # Allow the API Lambda to store and retrieve only application-managed assets.
 # Lambda supplies short-lived execution-role credentials automatically, so no
 # long-lived AWS access keys are required in the function environment.
@@ -419,6 +453,41 @@ resource "aws_lambda_function" "api_monolith" {
       OWNER_SETUP_TOKEN                = var.owner_setup_token
       CORS_ALLOWED_ORIGINS             = "https://garagekingsindia.com,https://www.garagekingsindia.com"
       S3_PRIVATE_BUCKET                = aws_s3_bucket.private_documents_bucket.id
+    }
+  }
+}
+
+resource "aws_lambda_function" "database_migrator" {
+  function_name = "gk-${var.environment}-database-migrator"
+  role          = aws_iam_role.migration_lambda_role.arn
+  handler       = "dist/migration-handler.handler"
+  runtime       = "nodejs20.x"
+  architectures = ["arm64"]
+  timeout       = 60
+  memory_size   = 512
+
+  filename         = "${path.module}/dummy_payload.zip"
+  source_code_hash = filebase64sha256("${path.module}/dummy_payload.zip")
+
+  lifecycle {
+    ignore_changes = [filename, source_code_hash]
+  }
+
+  vpc_config {
+    subnet_ids                  = [aws_subnet.public_1.id, aws_subnet.public_2.id]
+    security_group_ids          = [aws_security_group.lambda_sg.id]
+    ipv6_allowed_for_dual_stack = true
+  }
+
+  environment {
+    variables = {
+      NODE_ENV                         = "production"
+      NODE_OPTIONS                     = "--dns-result-order=ipv6first"
+      NODE_EXTRA_CA_CERTS              = "/var/task/certs/ap-south-1-bundle.pem"
+      RDS_MASTER_SECRET_ARN            = aws_db_instance.postgres.master_user_secret[0].secret_arn
+      MIGRATION_DATABASE_NAME          = aws_db_instance.postgres.db_name
+      DATABASE_SSL                     = "true"
+      DATABASE_SSL_REJECT_UNAUTHORIZED = "true"
     }
   }
 }

@@ -17,8 +17,10 @@
     "cleanup:duplicate-images": "node scripts/cleanup-duplicate-images.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudfront": "^3.1068.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1063.0",
     "@aws-sdk/client-s3": "^3.1068.0",
+    "@aws-sdk/client-secrets-manager": "^3.1068.0",
     "@nestjs/common": "^11.1.28",
     "@nestjs/core": "^11.1.28",
     "@nestjs/jwt": "^11.0.2",
