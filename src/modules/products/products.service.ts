@@ -219,8 +219,20 @@ export class ProductsService {
              COALESCE(selling_price, base_price, 0.00) as price,
              COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
              COALESCE(po_amount, prebook_deposit_amount, 0.00) as "prebookDepositAmount",
-             COALESCE(stock, total_stock, 0)::int as "availableStock",
-             COALESCE(stock, total_stock, 0)::int as stock,
+             COALESCE(
+               available_stock,
+               stock,
+               total_stock - COALESCE(locked_stock, 0) - COALESCE(sold_stock, 0),
+               total_stock,
+               0
+             )::int as "availableStock",
+             COALESCE(
+               available_stock,
+               stock,
+               total_stock - COALESCE(locked_stock, 0) - COALESCE(sold_stock, 0),
+               total_stock,
+               0
+             )::int as stock,
              is_prebook as "isPrebook", customer_eta as "customerEta",
              arrival_date as "arrivalDate", release_date as "releaseDate",
              image, images, created_at

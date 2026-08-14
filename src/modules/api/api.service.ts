@@ -635,7 +635,13 @@ export class ApiService implements OnModuleInit {
              p.rarity_level as lane, p.rarity_level as grade, p.base_price as price, p.description,
              p.tags, p.category, p.selling_price as "sellingPrice",
              ${adminFields}
-             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
+             COALESCE(
+               p.available_stock,
+               p.stock,
+               p.total_stock - COALESCE(p.locked_stock, 0) - COALESCE(p.sold_stock, 0),
+               p.total_stock,
+               0
+             )::int as "availableStock",
              p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
              p.status, p.show_on_homepage as "showOnHomepage",
              p.max_qty_per_customer as "maxQtyPerCustomer",
@@ -925,7 +931,13 @@ export class ApiService implements OnModuleInit {
              p.rarity_level as lane, p.rarity_level as grade, p.rarity_level as manufacturer, p.base_price as price, p.description,
              p.tags, p.category, p.selling_price as "sellingPrice",
              ${adminFields}
-             (p.total_stock - p.locked_stock - p.sold_stock) as "availableStock",
+             COALESCE(
+               p.available_stock,
+               p.stock,
+               p.total_stock - COALESCE(p.locked_stock, 0) - COALESCE(p.sold_stock, 0),
+               p.total_stock,
+               0
+             )::int as "availableStock",
              p.arrival_date as "arrivalDate", p.release_date as "releaseDate",
              p.status, p.show_on_homepage as "showOnHomepage", p.is_featured as "isFeatured",
              p.casing, p.casing_types as "casingTypes",
