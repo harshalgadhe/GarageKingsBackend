@@ -62,7 +62,6 @@ SET price = COALESCE(price, selling_price, base_price),
     po_amount = COALESCE(po_amount, prebook_deposit_amount),
     stock = COALESCE(stock, total_stock, 0),
     available_stock = COALESCE(available_stock, total_stock - locked_stock - sold_stock, 0),
-    customer_eta = COALESCE(customer_eta, arrival_date::date),
     subtags = CASE WHEN cardinality(subtags) = 0 THEN COALESCE(tags, '{}'::VARCHAR[]) ELSE subtags END;
 
 ALTER TABLE product_images
