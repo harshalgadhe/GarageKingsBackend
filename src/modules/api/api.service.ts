@@ -6050,7 +6050,7 @@ async calculateCheckoutPricing(dto: any) {
              b.name,
              b.slug,
              b.logo_url,
-             b.cover_image_url,
+             (to_jsonb(b) ->> 'cover_image_url') AS cover_image_url,
              b.website,
              b.display_order,
              b.is_visible,
