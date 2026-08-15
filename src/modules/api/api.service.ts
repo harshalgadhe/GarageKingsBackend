@@ -6041,11 +6041,16 @@ async calculateCheckoutPricing(dto: any) {
     if (adminMode) {
       return this.dataSource.query("SELECT * FROM brands ORDER BY display_order ASC, name ASC;");
     }
+    const settings = await this.getGlobalSettings();
+    const stockVisibility = settings.showSoldOutProducts === false
+      ? `AND COALESCE(p.available_stock, p.stock, p.total_stock, 0) > 0`
+      : '';
     return this.dataSource.query(`
       SELECT b.id,
              b.name,
              b.slug,
              b.logo_url,
+             b.cover_image_url,
              b.website,
              b.display_order,
              b.is_visible,
@@ -6066,6 +6071,7 @@ async calculateCheckoutPricing(dto: any) {
         ON LOWER(TRIM(p.brand)) = LOWER(TRIM(b.name))
        AND p.deleted_at IS NULL
        AND (p.status IN ('Published', 'Pre-Order', 'Active') OR p.status IS NULL)
+       ${stockVisibility}
       WHERE b.deleted_at IS NULL
         AND b.is_visible = true
         AND b.status = 'Active'
@@ -6075,18 +6081,18 @@ async calculateCheckoutPricing(dto: any) {
   }
 
   async createBrand(body: any) {
-    const { name, logoUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
+    const { name, logoUrl, coverImageUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
     const slug = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
     const result = await this.dataSource.query(`
-      INSERT INTO brands (name, slug, logo_url, website, display_order, is_visible, status, accent_color, secondary_color, background_color, theme_variant, logo_treatment, kicker, headline, description, origin_label, style_label)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      INSERT INTO brands (name, slug, logo_url, cover_image_url, website, display_order, is_visible, status, accent_color, secondary_color, background_color, theme_variant, logo_treatment, kicker, headline, description, origin_label, style_label)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING *;
-    `, [name, slug, logoUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active', accentColor || '#C8AE7D', secondaryColor || '#F4F1EC', backgroundColor || '#080706', themeVariant || 'archive', logoTreatment || 'natural', kicker || null, headline || null, description || null, originLabel || null, styleLabel || null]);
+    `, [name, slug, logoUrl || null, coverImageUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active', accentColor || '#C8AE7D', secondaryColor || '#F4F1EC', backgroundColor || '#080706', themeVariant || 'archive', logoTreatment || 'natural', kicker || null, headline || null, description || null, originLabel || null, styleLabel || null]);
     return result[0];
   }
 
   async updateBrand(id: string, body: any) {
-    const { name, logoUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
+    const { name, logoUrl, coverImageUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
     const slug = name ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '') : undefined;
     
     const fields: string[] = [];
@@ -6095,6 +6101,7 @@ async calculateCheckoutPricing(dto: any) {
 
     if (name !== undefined) { fields.push(`name = $${paramIndex++}`, `slug = $${paramIndex++}`); params.push(name, slug); }
     if (logoUrl !== undefined) { fields.push(`logo_url = $${paramIndex++}`); params.push(logoUrl); }
+    if (coverImageUrl !== undefined) { fields.push(`cover_image_url = $${paramIndex++}`); params.push(coverImageUrl); }
     if (website !== undefined) { fields.push(`website = $${paramIndex++}`); params.push(website); }
     if (displayOrder !== undefined) { fields.push(`display_order = $${paramIndex++}`); params.push(displayOrder); }
     if (isVisible !== undefined) { fields.push(`is_visible = $${paramIndex++}`); params.push(isVisible); }

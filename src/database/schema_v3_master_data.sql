@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS brands (
     name VARCHAR(100) UNIQUE NOT NULL,
     slug VARCHAR(100) UNIQUE NOT NULL,
     logo_url TEXT,
+    cover_image_url TEXT,
     website TEXT,
     display_order INT DEFAULT 0,
     is_visible BOOLEAN DEFAULT TRUE,
