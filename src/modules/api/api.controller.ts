@@ -883,6 +883,13 @@ export class ApiController {
   // ==========================================
 
   // Brands
+  @Get('admin/catalog/lookups')
+  @UseGuards(AuthGuard('jwt'))
+  async getCatalogLookups(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getCatalogLookups();
+  }
+
   @Get('brands')
   async getBrands() {
     return this.apiService.getBrands(false);

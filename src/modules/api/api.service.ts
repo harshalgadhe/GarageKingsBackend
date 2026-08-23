@@ -6037,6 +6037,46 @@ async calculateCheckoutPricing(dto: any) {
   // ==========================================
 
   // Brands
+  async getCatalogLookups() {
+    const [brands, scales, series, casingTypes, categories, tags] = await Promise.all([
+      this.dataSource.query("SELECT name FROM brands WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;"),
+      this.dataSource.query("SELECT name FROM scales WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;"),
+      this.dataSource.query("SELECT name FROM series WHERE deleted_at IS NULL AND status = 'Active' ORDER BY display_order ASC, name ASC;"),
+      this.dataSource.query("SELECT name FROM casing_types ORDER BY name ASC;"),
+      this.dataSource.query("SELECT name FROM categories ORDER BY display_order ASC, name ASC;"),
+      this.dataSource.query("SELECT name FROM tags ORDER BY name ASC;"),
+    ]);
+    const names = (rows: any[]) => rows.map(row => String(row.name || '').trim()).filter(Boolean);
+    return {
+      brands: names(brands),
+      scales: names(scales),
+      series: names(series),
+      casingTypes: names(casingTypes),
+      categories: names(categories),
+      tags: names(tags),
+    };
+  }
+
+  private async validateCatalogReferences(car: any) {
+    const lookups = await this.getCatalogLookups();
+    const assertValue = (label: string, value: any, options: string[]) => {
+      if (value === undefined || value === null || String(value).trim() === '') return;
+      const normalized = String(value).trim().toLocaleLowerCase();
+      if (!options.some(option => option.toLocaleLowerCase() === normalized)) {
+        throw new BadRequestException(`${label} "${String(value).trim()}" is not configured in Catalog Lookup Settings.`);
+      }
+    };
+    assertValue('Brand', car.brand, lookups.brands);
+    assertValue('Scale', car.scale, lookups.scales);
+    assertValue('Series', car.series, lookups.series);
+    assertValue('Packaging', car.casing ?? car.casingType, lookups.casingTypes);
+    assertValue('Category', car.category, lookups.categories);
+    const mainTag = car.tag ?? car.grade ?? car.lane;
+    if (mainTag && String(mainTag).toLocaleLowerCase() !== 'none') assertValue('Rarity', mainTag, lookups.tags);
+    const submittedTags = Array.isArray(car.tags) ? car.tags : (Array.isArray(car.subtags) ? car.subtags : []);
+    submittedTags.forEach((tag: any) => assertValue('Tag', tag, lookups.tags));
+  }
+
   async getBrands(adminMode = false) {
     if (adminMode) {
       return this.dataSource.query("SELECT * FROM brands ORDER BY display_order ASC, name ASC;");

@@ -45,11 +45,13 @@ export class ProductsService {
 
     const selectFields = adminMode
       ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
+         category, description, tags, supplier, max_qty_per_customer as "maxQtyPerCustomer",
          COALESCE(selling_price, base_price, 0.00) as price,
+         COALESCE(purchase_price, 0.00) as "purchasePrice",
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
-         is_prebook as "isPrebook", is_featured as "isFeatured",
-         COALESCE(customer_eta, arrival_date) as "customerEta",
+         is_prebook as "isPrebook", is_featured as "isFeatured", show_on_homepage as "showOnHomepage",
+         COALESCE(customer_eta, arrival_date) as "customerEta", arrival_date as "arrivalDate", release_date as "releaseDate",
          image, created_at`
       : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
          COALESCE(selling_price, base_price, 0.00) as price,
@@ -112,11 +114,13 @@ export class ProductsService {
 
     const selectFields = options.adminMode
       ? `id, sku, brand, model_name as name, series, scale, casing, tag, subtags, status,
+         category, description, tags, supplier, max_qty_per_customer as "maxQtyPerCustomer",
          COALESCE(selling_price, base_price, 0.00) as price,
+         COALESCE(purchase_price, 0.00) as "purchasePrice",
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",
          COALESCE(stock, total_stock, 0)::int as "availableStock",
-         is_prebook as "isPrebook", is_featured as "isFeatured",
-         COALESCE(customer_eta, arrival_date) as "customerEta",
+         is_prebook as "isPrebook", is_featured as "isFeatured", show_on_homepage as "showOnHomepage",
+         COALESCE(customer_eta, arrival_date) as "customerEta", arrival_date as "arrivalDate", release_date as "releaseDate",
          image, created_at`
       : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
          COALESCE(selling_price, base_price, 0.00) as price,
