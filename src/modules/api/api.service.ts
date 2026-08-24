@@ -980,7 +980,7 @@ export class ApiService implements OnModuleInit {
              pv.customer_eta as "customerEta", pv.visibility, pv.status, pv.sales_status as "salesStatus",
              pv.dimensions, pv.weight, pv.variant_attributes as "variantAttributes",
              pv.total_stock as "totalStock", pv.sold_stock as "soldStock", pv.locked_stock as "lockedStock",
-             (pv.total_stock - pv.locked_stock - pv.sold_stock) as "availableStock",
+             GREATEST(0, (pv.total_stock - pv.locked_stock - pv.sold_stock)) as "availableStock",
              ct.name as casing, ct.display_name as "casingDisplay"
       FROM product_variants pv
       JOIN products p ON p.id = pv.product_id
@@ -1008,26 +1008,12 @@ export class ApiService implements OnModuleInit {
   async addProduct(car: any, creatorEmail: string, ipAddress: string) {
     const sku = String(car.sku || `SKU-${Date.now()}`).trim().toUpperCase();
     const brandName = String(car.brand || 'Mini GT').trim();
-    const brandSlug = brandName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    await this.validateCatalogReferences(car);
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      // Keep the brand index synchronized with catalogue writes. A newly
-      // introduced brand receives the neutral GarageKings presentation until
-      // an admin customizes its theme, logo, and editorial content.
-      await queryRunner.query(`
-        INSERT INTO brands (name, slug, is_visible, status)
-        VALUES ($1, $2, TRUE, 'Active')
-        ON CONFLICT (name) DO UPDATE SET
-          slug = EXCLUDED.slug,
-          is_visible = TRUE,
-          status = 'Active',
-          deleted_at = NULL,
-          updated_at = NOW();
-      `, [brandName, brandSlug]);
-
       const imageList = Array.isArray(car.images) && car.images.length > 0
         ? car.images.filter(Boolean)
         : (car.image ? [car.image] : []);
@@ -1092,9 +1078,9 @@ export class ApiService implements OnModuleInit {
         const imgUrl = imageList[idx];
         const isPrimary = idx === 0;
         await queryRunner.query(`
-          INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
-          VALUES ($1, $2, $3, $4, $5);
-        `, [productId, imgUrl, imgUrl, imgUrl, isPrimary]);
+          INSERT INTO product_images (product_id, url, thumbnail_url, medium_url, full_url, is_primary)
+          VALUES ($1, $2, $3, $4, $5, $6);
+        `, [productId, imgUrl, imgUrl, imgUrl, imgUrl, isPrimary]);
       }
 
       await queryRunner.query(`
@@ -1220,6 +1206,7 @@ export class ApiService implements OnModuleInit {
   }
 
   async updateProduct(id: string, car: any, updaterEmail: string, ipAddress: string) {
+    await this.validateCatalogReferences(car);
     const oldRes = await this.dataSource.query("SELECT * FROM products WHERE id = $1", [id]);
     const oldData = oldRes[0];
 
@@ -1228,6 +1215,24 @@ export class ApiService implements OnModuleInit {
     }
 
     const queryRunner = this.dataSource.createQueryRunner();
+    const v0 = Array.isArray(car.variants) && car.variants[0];
+    const hasExplicitStockUpdate = car.totalStock !== undefined || car.stock !== undefined || car.availableStock !== undefined || v0?.totalStock !== undefined || v0?.stock !== undefined || v0?.availableStock !== undefined;
+    const requestedAvailableStock = hasExplicitStockUpdate
+      ? Math.max(0, Number(
+          car.totalStock !== undefined 
+            ? car.totalStock 
+            : (car.stock !== undefined 
+                ? car.stock 
+                : (car.availableStock !== undefined 
+                    ? car.availableStock 
+                    : (v0?.totalStock !== undefined 
+                        ? v0.totalStock 
+                        : (v0?.stock !== undefined 
+                            ? v0.stock 
+                            : (v0?.availableStock !== undefined ? v0.availableStock : 0)))))
+        ))
+      : null;
+    let stockReconciliationVariantId: string | null = null;
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
@@ -1245,7 +1250,19 @@ export class ApiService implements OnModuleInit {
       const primaryImg = hasPrimaryImageUpdate
         ? (car.image || imageList[0] || null)
         : (hasImagesUpdate ? (imageList[0] || null) : (oldData.image || imageList[0] || null));
-      const finalStock = Number(car.stock !== undefined ? car.stock : (car.availableStock !== undefined ? car.availableStock : (car.totalStock !== undefined ? car.totalStock : (oldData.stock || 0))));
+      const finalStock = Number(
+        car.totalStock !== undefined 
+          ? car.totalStock 
+          : (car.stock !== undefined 
+              ? car.stock 
+              : (car.availableStock !== undefined 
+                  ? car.availableStock 
+                  : (v0?.totalStock !== undefined 
+                      ? v0.totalStock 
+                      : (v0?.stock !== undefined 
+                          ? v0.stock 
+                          : (v0?.availableStock !== undefined ? v0.availableStock : (oldData.stock || 0))))))
+      );
       const poDeposit = Number(car.poAmount !== undefined ? car.poAmount : (car.prebookDepositAmount !== undefined ? car.prebookDepositAmount : (oldData.po_amount || 0)));
       const priceVal = Number(car.price !== undefined ? car.price : (car.sellingPrice !== undefined ? car.sellingPrice : (oldData.price || 0)));
 
@@ -1261,7 +1278,8 @@ export class ApiService implements OnModuleInit {
         UPDATE products 
         SET sku = $1, brand = $2, model_name = $3, series = $4, scale = $5, casing = $6, casing_types = $7,
             base_price = $8, selling_price = $9, price = $10, po_amount = $11, prebook_deposit_amount = $12,
-            stock = $13, total_stock = $14, is_prebook = $15, is_featured = $16, status = $17, customer_eta = $18,
+            stock = $13, total_stock = $14, available_stock = $14,
+            is_prebook = $15, is_featured = $16, status = $17, customer_eta = $18,
             arrival_date = $19, release_date = $20, tag = $21, subtags = $22, tags = $23,
             description = $24, image = $25, images = $26, supplier = $27, updated_by = $28, updated_at = NOW()
         WHERE id = $29;
@@ -1304,9 +1322,9 @@ export class ApiService implements OnModuleInit {
           const imgUrl = imageList[idx];
           const isPrimary = idx === 0;
           await queryRunner.query(`
-            INSERT INTO product_images (product_id, thumbnail_url, medium_url, full_url, is_primary)
-            VALUES ($1, $2, $3, $4, $5);
-          `, [id, imgUrl, imgUrl, imgUrl, isPrimary]);
+            INSERT INTO product_images (product_id, url, thumbnail_url, medium_url, full_url, is_primary)
+            VALUES ($1, $2, $3, $4, $5, $6);
+          `, [id, imgUrl, imgUrl, imgUrl, imgUrl, isPrimary]);
         }
       }
 
@@ -1347,16 +1365,16 @@ export class ApiService implements OnModuleInit {
           if (existingVar.length > 0) {
             await queryRunner.query(`
               UPDATE product_variants 
-              SET selling_price = $1, name = $2, sku = $3, updated_at = NOW()
+              SET selling_price = $1, name = $2, sku = $3, total_stock = $5, updated_at = NOW()
               WHERE id = $4;
-            `, [vPrice, vName, vSku, existingVar[0].id]);
+            `, [vPrice, vName, vSku, existingVar[0].id, finalStock]);
           } else {
             await queryRunner.query(`
               INSERT INTO product_variants (
-                product_id, casing_type_id, sku, name, selling_price, visibility, status, sales_status, created_by
+                product_id, casing_type_id, sku, name, selling_price, total_stock, visibility, status, sales_status, created_by
               )
-              VALUES ($1, $2, $3, $4, $5, 'Visible', 'Active', 'Available', $6);
-            `, [id, casingTypeId, vSku, vName, vPrice, updaterEmail]);
+              VALUES ($1, $2, $3, $4, $5, $6, 'Visible', 'Active', 'Available', $7);
+            `, [id, casingTypeId, vSku, vName, vPrice, finalStock, updaterEmail]);
           }
         }
       } else {
@@ -1367,13 +1385,26 @@ export class ApiService implements OnModuleInit {
             SET casing_type_id = $1, 
                 name = $2,
                 selling_price = $3,
+                total_stock = $5,
                 updated_at = NOW()
             WHERE id = (
               SELECT id FROM product_variants WHERE product_id = $4 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1
             );
-          `, [casingTypeId, `${car.name || oldData.model_name || 'Unknown Casting'} (${reqCasing})`, priceVal, id]);
+          `, [casingTypeId, `${car.name || oldData.model_name || 'Unknown Casting'} (${reqCasing})`, priceVal, id, finalStock]);
         }
       }
+
+      if (hasExplicitStockUpdate) {
+        const primaryVariant = await queryRunner.query(`
+          SELECT id
+          FROM product_variants
+          WHERE product_id = $1 AND deleted_at IS NULL
+          ORDER BY created_at ASC
+          LIMIT 1;
+        `, [id]);
+        stockReconciliationVariantId = primaryVariant[0]?.id || null;
+      }
+
       await this.writeAuditLog('UPDATE_PRODUCT', 'products', id, updaterEmail, ipAddress, oldData, car, queryRunner);
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
@@ -1387,6 +1418,16 @@ export class ApiService implements OnModuleInit {
       throw err;
     } finally {
       await queryRunner.release();
+    }
+
+    if (stockReconciliationVariantId && requestedAvailableStock !== null) {
+      await this.reconcileVariantInventory(
+        stockReconciliationVariantId,
+        requestedAvailableStock,
+        'Stock quantity updated from product catalogue',
+        updaterEmail,
+        ipAddress
+      );
     }
 
     return this.getProduct(id, true);
@@ -1714,7 +1755,6 @@ async calculateCheckoutPricing(dto: any) {
       await queryRunner.query(`
         UPDATE product_variants 
         SET locked_stock = COALESCE(locked_stock, 0) + $1,
-            version = version + 1,
             updated_at = NOW() 
         WHERE id = $2;
       `, [requestedQty, variantId]);
@@ -1930,7 +1970,6 @@ async calculateCheckoutPricing(dto: any) {
           await queryRunner.query(`
             UPDATE product_variants 
             SET locked_stock = COALESCE(locked_stock, 0) + $1,
-                version = version + 1,
                 updated_at = NOW() 
             WHERE id = $2;
           `, [qtyNeeded, variantId]);
@@ -2266,7 +2305,6 @@ async calculateCheckoutPricing(dto: any) {
           await queryRunner.query(`
             UPDATE product_variants
             SET locked_stock = GREATEST(0, locked_stock - $1),
-                version = version + 1,
                 updated_at = NOW()
             WHERE id = $2;
           `, [item.qty, item.variant_id]);
@@ -5364,7 +5402,7 @@ async calculateCheckoutPricing(dto: any) {
     try {
       // 1. Lock the variant FOR UPDATE
       const varRows = await queryRunner.query(`
-        SELECT id, product_id, total_stock, version 
+        SELECT id, product_id, total_stock 
         FROM product_variants 
         WHERE id = $1 AND deleted_at IS NULL 
         FOR UPDATE;
@@ -5420,11 +5458,10 @@ async calculateCheckoutPricing(dto: any) {
           targetBatchId = newBatchRes[0].id;
         }
 
-        // Increment variant total_stock and increment version
+        // Increment variant total_stock
         await queryRunner.query(`
           UPDATE product_variants 
           SET total_stock = total_stock + $1, 
-              version = version + 1, 
               updated_at = NOW() 
           WHERE id = $2;
         `, [variance, variantId]);
@@ -5467,33 +5504,40 @@ async calculateCheckoutPricing(dto: any) {
           remainingToReduce -= reduceQty;
         }
 
-        // Decrement variant total_stock and increment version
+        // Decrement variant total_stock
         await queryRunner.query(`
           UPDATE product_variants 
           SET total_stock = GREATEST(0, total_stock - $1), 
-              version = version + 1, 
               updated_at = NOW() 
           WHERE id = $2;
         `, [Math.abs(variance), variantId]);
       }
 
-      // Sync parent products aggregate cache
+      // Explicitly set variant total_stock to match reconciled count
+      await queryRunner.query(`
+        UPDATE product_variants 
+        SET total_stock = $1, 
+            updated_at = NOW() 
+        WHERE id = $2;
+      `, [actualCount, variantId]);
+
+      // Stock is owned by the product in GarageKings. Variants and batches are
+      // retained for inventory history, but legacy sibling variants must not
+      // overwrite the quantity explicitly submitted for the product.
       await queryRunner.query(`
         UPDATE products p
-        SET total_stock = (SELECT COALESCE(SUM(total_stock), 0) FROM product_variants WHERE product_id = p.id AND deleted_at IS NULL),
+        SET total_stock = $2,
+            stock = $2,
+            available_stock = $2,
             updated_at = NOW()
         WHERE p.id = $1;
-      `, [productId]);
-
-      // Record in reconciliations audit table
-      await queryRunner.query(`
-        INSERT INTO reconciliations (variant_id, system_count, actual_count, variance, reason, performed_by)
-        VALUES ($1, $2, $3, $4, $5, $6);
-      `, [variantId, systemCount, actualCount, variance, reason || 'Cycle Count', adminEmail]);
+      `, [productId, actualCount]);
 
       await queryRunner.commitTransaction();
       localCache.del('products_list_true');
       localCache.del('products_list_false');
+      localCache.del(`product_${productId}_true`);
+      localCache.del(`product_${productId}_false`);
 
       await this.writeAuditLog(
         'RECONCILE_CYCLE_COUNT',

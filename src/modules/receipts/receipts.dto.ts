@@ -56,7 +56,8 @@ export function validateCreateReceipt(dto: CreateReceiptDto) {
     if (!Number.isInteger(qty) || qty < 1 || qty > 1000) {
       throw new BadRequestException(`Invalid quantity for "${desc}".`);
     }
-    if (!Number.isFinite(amount) || amount < 0 || amount > 100000000) {
+    const isAdjustment = /\b(refund|adjustment|credit)\b/i.test(desc);
+    if (!Number.isFinite(amount) || (amount < 0 && !isAdjustment) || amount > 100000000) {
       throw new BadRequestException(`Invalid amount for "${desc}".`);
     }
   }

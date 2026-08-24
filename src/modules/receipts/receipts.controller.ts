@@ -41,6 +41,51 @@ export class ReceiptsController {
     return this.receiptsService.getReceipts();
   }
 
+  @Get('backup/all')
+  async backupReceipts(@Query('search') search: string, @Request() req: any) {
+    this.checkAdmin(req);
+    const query = String(search || '').trim().toLowerCase();
+    const receipts = await this.receiptsService.getReceipts();
+    return { receipts: query ? receipts.filter((receipt: any) => JSON.stringify(receipt).toLowerCase().includes(query)) : receipts };
+  }
+
+  @Post('bulk')
+  async restoreReceipts(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    const receipts = Array.isArray(body?.receipts) ? body.receipts.slice(0, 50) : [];
+    const updateExisting = body?.updateExisting === true;
+    if (!receipts.length) return { created: 0, updated: 0, skipped: [], failures: [] };
+    const existing = await this.receiptsService.getReceipts();
+    const existingByNumber = new Map<string, any>(existing
+      .map((receipt: any): [string, any] => [String(receipt.receiptNumber || receipt.receipt_number || '').trim().toLowerCase(), receipt])
+      .filter(([number]) => Boolean(number)));
+    const skipped: any[] = [];
+    const failures: any[] = [];
+    let created = 0;
+    let updated = 0;
+    for (let index = 0; index < receipts.length; index += 1) {
+      const source = receipts[index] || {};
+      const receiptNumber = String(source.receiptNumber || '').trim();
+      if (!receiptNumber) { failures.push({ index, receiptNumber, message: 'Receipt Number is required.' }); continue; }
+      const current = existingByNumber.get(receiptNumber.toLowerCase());
+      if (current && !updateExisting) { skipped.push({ index, receiptNumber, reason: 'Receipt Number already exists.' }); continue; }
+      const receipt = { ...source, customerPhone: String(source.customerPhone || '').trim() || 'Not provided' };
+      try {
+        if (current) {
+          await this.receiptsService.updateReceipt(current.id, receipt, req.user.email);
+          updated += 1;
+        } else {
+          const saved: any = await this.receiptsService.generateBillingReceipt(receipt);
+          existingByNumber.set(receiptNumber.toLowerCase(), saved);
+          created += 1;
+        }
+      } catch (error: any) {
+        failures.push({ index, receiptNumber, message: error?.message || 'Receipt could not be saved.' });
+      }
+    }
+    return { created, updated, skipped, failures };
+  }
+
   @Get(':id')
   async getReceiptById(@Param('id') id: string, @Request() req: any) {
     this.checkAdmin(req);

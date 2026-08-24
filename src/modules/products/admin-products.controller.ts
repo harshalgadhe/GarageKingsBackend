@@ -65,6 +65,45 @@ export class AdminProductsController {
     return this.apiService.addProduct(body, req.user.email, req.ip);
   }
 
+  @Get('backup')
+  async backupProducts(@Request() req: any) {
+    this.checkAdmin(req);
+    const products: any[] = [];
+    let page = 1;
+    let totalPages = 1;
+    do {
+      const result = await this.productsService.getPaginatedProducts({ page, limit: 100, adminMode: true });
+      products.push(...result.products.map(product => AdminProductResponseDto.fromEntity(product)));
+      totalPages = result.totalPages;
+      page += 1;
+    } while (page <= totalPages);
+    return { products };
+  }
+
+  @Post('bulk')
+  async restoreProducts(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    const operations = Array.isArray(body?.operations) ? body.operations.slice(0, 10) : [];
+    const failures: any[] = [];
+    let created = 0;
+    let updated = 0;
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = operations[index] || {};
+      try {
+        if (operation.action === 'update' && operation.id) {
+          await this.apiService.updateProduct(operation.id, operation.product || {}, req.user.email, req.ip);
+          updated += 1;
+        } else {
+          await this.apiService.addProduct(operation.product || {}, req.user.email, req.ip);
+          created += 1;
+        }
+      } catch (error: any) {
+        failures.push({ index, rowNumber: operation.rowNumber, sku: operation.sku, message: error?.message || 'Product could not be saved.' });
+      }
+    }
+    return { created, updated, failures };
+  }
+
   @Get('sku-availability/check')
   async checkSkuAvailability(
     @Query('sku') sku: string,
