@@ -77,6 +77,19 @@ export class AdminProductsController {
       totalPages = result.totalPages;
       page += 1;
     } while (page <= totalPages);
+    const storedImages = await this.productsService.getBackupImageReferences(products.map(product => product.id));
+    products.forEach(product => {
+      const references = [
+        ...(Array.isArray(product.images) ? product.images : []),
+        ...(storedImages[product.id] || []),
+        product.image,
+      ].map(image => {
+        if (typeof image === 'string') return image.trim();
+        return String(image?.fullUrl || image?.url || image?.mediumUrl || image?.thumbnailUrl || '').trim();
+      }).filter(Boolean);
+      product.images = Array.from(new Set(references));
+      if (!product.image && product.images.length > 0) product.image = product.images[0];
+    });
     return { products };
   }
 

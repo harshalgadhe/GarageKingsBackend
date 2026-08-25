@@ -260,4 +260,23 @@ export class ProductsService {
     localCache.set(cacheKey, product, 10);
     return product;
   }
+
+  async getBackupImageReferences(productIds: string[]): Promise<Record<string, string[]>> {
+    if (!Array.isArray(productIds) || productIds.length === 0) return {};
+    const rows = await this.dataSource.query(`
+      SELECT product_id AS "productId",
+             COALESCE(full_url, medium_url, thumbnail_url, url) AS url
+      FROM product_images
+      WHERE product_id = ANY($1::uuid[])
+      ORDER BY product_id, is_primary DESC, display_order ASC, created_at ASC;
+    `, [productIds]);
+    return rows.reduce((grouped: Record<string, string[]>, row: any) => {
+      const productId = String(row.productId || '');
+      const url = String(row.url || '').trim();
+      if (!productId || !url) return grouped;
+      if (!grouped[productId]) grouped[productId] = [];
+      if (!grouped[productId].includes(url)) grouped[productId].push(url);
+      return grouped;
+    }, {});
+  }
 }
