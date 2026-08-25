@@ -268,7 +268,7 @@ export class ProductsService {
              COALESCE(full_url, medium_url, thumbnail_url) AS url
       FROM product_images
       WHERE product_id = ANY($1::uuid[])
-      ORDER BY product_id, is_primary DESC, display_order ASC, created_at ASC;
+      ORDER BY product_id, is_primary DESC, created_at ASC;
     `, [productIds]);
     return rows.reduce((grouped: Record<string, string[]>, row: any) => {
       const productId = String(row.productId || '');
