@@ -52,6 +52,7 @@ export class AdminProductResponseDto {
   createdAt: string;
   updatedAt: string;
   image?: string;
+  images?: any[];
   manufacturer?: string;
   isFeatured?: boolean;
   variants: AdminVariantResponseDto[];
@@ -77,6 +78,7 @@ export class AdminProductResponseDto {
     dto.createdAt = p.createdAt || p.created_at;
     dto.updatedAt = p.updatedAt || p.updated_at;
     dto.image = p.image;
+    dto.images = Array.isArray(p.images) ? p.images : (p.image ? [p.image] : []);
     dto.isFeatured = p.isFeatured !== undefined ? Boolean(p.isFeatured) : Boolean(p.is_featured);
     dto.showOnHomepage = p.showOnHomepage !== undefined ? Boolean(p.showOnHomepage) : Boolean(p.show_on_homepage);
     dto.variants = (p.variants || []).map((v: any) => AdminVariantResponseDto.fromEntity(v));

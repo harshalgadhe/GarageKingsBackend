@@ -890,6 +890,20 @@ export class ApiController {
     return this.apiService.getCatalogLookups();
   }
 
+  @Get('admin/catalog/master-data/backup')
+  @UseGuards(AuthGuard('jwt'))
+  async getMasterDataBackup(@Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.getMasterDataBackup();
+  }
+
+  @Post('admin/catalog/master-data/bulk')
+  @UseGuards(AuthGuard('jwt'))
+  async bulkSaveMasterData(@Body() body: any, @Request() req: any) {
+    this.checkAdmin(req);
+    return this.apiService.bulkSaveMasterData(body?.operations);
+  }
+
   @Get('brands')
   async getBrands() {
     return this.apiService.getBrands(false);

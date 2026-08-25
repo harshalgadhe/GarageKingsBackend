@@ -52,7 +52,7 @@ export class ProductsService {
          COALESCE(stock, total_stock, 0)::int as "availableStock",
          is_prebook as "isPrebook", is_featured as "isFeatured", show_on_homepage as "showOnHomepage",
          COALESCE(customer_eta, arrival_date) as "customerEta", arrival_date as "arrivalDate", release_date as "releaseDate",
-         image, created_at`
+         image, images, created_at`
       : `id, sku, brand, model_name as name, series, scale, casing, tag, subtags,
          COALESCE(selling_price, base_price, 0.00) as price,
          COALESCE(po_amount, prebook_deposit_amount, 0.00) as "poAmount",

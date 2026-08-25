@@ -6101,6 +6101,57 @@ async calculateCheckoutPricing(dto: any) {
     };
   }
 
+  async getMasterDataBackup() {
+    const [brands, scales, series] = await Promise.all([
+      this.getBrands(true),
+      this.getScales(true),
+      this.getSeries(true),
+    ]);
+    return { brands, scales, series };
+  }
+
+  async bulkSaveMasterData(submittedOperations: any) {
+    const operations = Array.isArray(submittedOperations) ? submittedOperations.slice(0, 50) : [];
+    const supportedTypes = new Set(['brands', 'scales', 'series']);
+    const failures: any[] = [];
+    let created = 0;
+    let updated = 0;
+
+    for (let index = 0; index < operations.length; index += 1) {
+      const operation = operations[index] || {};
+      const type = String(operation.type || '');
+      const action = String(operation.action || '');
+      const data = operation.data && typeof operation.data === 'object' ? operation.data : {};
+      if (!supportedTypes.has(type) || !['create', 'update'].includes(action)) {
+        failures.push({ index, rowNumber: operation.rowNumber, name: data.name, message: 'Unsupported lookup operation.' });
+        continue;
+      }
+      try {
+        if (action === 'update') {
+          if (!operation.id) throw new BadRequestException('The record ID is required for an update.');
+          if (type === 'brands') await this.updateBrand(operation.id, data);
+          if (type === 'scales') await this.updateScale(operation.id, data);
+          if (type === 'series') await this.updateSeries(operation.id, data);
+          updated += 1;
+        } else {
+          const createData = { ...data, id: data.id || operation.id };
+          if (type === 'brands') await this.createBrand(createData);
+          if (type === 'scales') await this.createScale(createData);
+          if (type === 'series') await this.createSeries(createData);
+          created += 1;
+        }
+      } catch (error: any) {
+        failures.push({
+          index,
+          rowNumber: operation.rowNumber,
+          name: data.name,
+          message: error?.message || 'Lookup record could not be saved.',
+        });
+      }
+    }
+    return { created, updated, failures };
+  }
+
   private async validateCatalogReferences(car: any) {
     const lookups = await this.getCatalogLookups();
     const assertValue = (label: string, value: any, options: string[]) => {
@@ -6165,13 +6216,13 @@ async calculateCheckoutPricing(dto: any) {
   }
 
   async createBrand(body: any) {
-    const { name, logoUrl, coverImageUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
+    const { id, name, logoUrl, coverImageUrl, website, displayOrder, isVisible, status, accentColor, secondaryColor, backgroundColor, themeVariant, logoTreatment, kicker, headline, description, originLabel, styleLabel } = body;
     const slug = (name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
     const result = await this.dataSource.query(`
-      INSERT INTO brands (name, slug, logo_url, cover_image_url, website, display_order, is_visible, status, accent_color, secondary_color, background_color, theme_variant, logo_treatment, kicker, headline, description, origin_label, style_label)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+      INSERT INTO brands (id, name, slug, logo_url, cover_image_url, website, display_order, is_visible, status, accent_color, secondary_color, background_color, theme_variant, logo_treatment, kicker, headline, description, origin_label, style_label)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
       RETURNING *;
-    `, [name, slug, logoUrl || null, coverImageUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active', accentColor || '#C8AE7D', secondaryColor || '#F4F1EC', backgroundColor || '#080706', themeVariant || 'archive', logoTreatment || 'natural', kicker || null, headline || null, description || null, originLabel || null, styleLabel || null]);
+    `, [id || null, name, slug, logoUrl || null, coverImageUrl || null, website || null, displayOrder || 0, isVisible !== false, status || 'Active', accentColor || '#C8AE7D', secondaryColor || '#F4F1EC', backgroundColor || '#080706', themeVariant || 'archive', logoTreatment || 'natural', kicker || null, headline || null, description || null, originLabel || null, styleLabel || null]);
     return result[0];
   }
 
@@ -6270,12 +6321,12 @@ async calculateCheckoutPricing(dto: any) {
   }
 
   async createScale(body: any) {
-    const { name, displayOrder, status } = body;
+    const { id, name, displayOrder, status } = body;
     const result = await this.dataSource.query(`
-      INSERT INTO scales (name, display_order, status)
-      VALUES ($1, $2, $3)
+      INSERT INTO scales (id, name, display_order, status)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4)
       RETURNING *;
-    `, [name, displayOrder || 0, status || 'Active']);
+    `, [id || null, name, displayOrder || 0, status || 'Active']);
     return result[0];
   }
 
@@ -6311,12 +6362,12 @@ async calculateCheckoutPricing(dto: any) {
   }
 
   async createSeries(body: any) {
-    const { name, displayOrder, status } = body;
+    const { id, name, displayOrder, status } = body;
     const result = await this.dataSource.query(`
-      INSERT INTO series (name, display_order, status)
-      VALUES ($1, $2, $3)
+      INSERT INTO series (id, name, display_order, status)
+      VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4)
       RETURNING *;
-    `, [name, displayOrder || 0, status || 'Active']);
+    `, [id || null, name, displayOrder || 0, status || 'Active']);
     return result[0];
   }
 
