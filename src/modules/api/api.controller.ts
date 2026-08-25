@@ -285,6 +285,18 @@ export class ApiController {
     return this.apiService.setUserRole(dto.email, dto.role, req.user.email, req.ip || 'unknown');
   }
 
+  @Get('admin/customers')
+  @UseGuards(AuthGuard('jwt'))
+  async getAdminCustomers(
+    @Query('page') page: number,
+    @Query('limit') limit: number,
+    @Query('search') search: string,
+    @Request() req: any
+  ) {
+    this.checkAdmin(req);
+    return this.apiService.getAdminCustomers({ page, limit, search });
+  }
+
   @Get('products/homepage')
   async getHomepageProducts(@Res({ passthrough: true }) res: ExpressResponse) {
     res.setHeader('Cache-Control', 'public, max-age=30, stale-while-revalidate=120');

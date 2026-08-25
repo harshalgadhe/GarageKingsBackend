@@ -789,6 +789,72 @@ export class ApiService implements OnModuleInit {
     return result[0];
   }
 
+  async getAdminCustomers(options: { page?: number; limit?: number; search?: string }) {
+    const page = Math.max(1, Number(options.page || 1));
+    const limit = Math.max(1, Math.min(50, Number(options.limit || 12)));
+    const offset = (page - 1) * limit;
+    const search = String(options.search || '').trim();
+    const params: any[] = [];
+    let filter = `WHERE u.deleted_at IS NULL`;
+    if (search) {
+      params.push(`%${search}%`);
+      filter += ` AND (
+        LOWER(u.email) LIKE LOWER($1) OR
+        LOWER(COALESCE(c.full_name, '')) LIKE LOWER($1) OR
+        LOWER(COALESCE(c.phone, '')) LIKE LOWER($1) OR
+        LOWER(COALESCE(c.instagram_username, c.instagram, '')) LIKE LOWER($1)
+      )`;
+    }
+
+    const from = `
+      FROM users u
+      LEFT JOIN customers c ON LOWER(c.email) = LOWER(u.email) AND c.deleted_at IS NULL
+      ${filter}
+    `;
+    const [countRows, customers, summaryRows, recentCustomers] = await Promise.all([
+      this.dataSource.query(`SELECT COUNT(DISTINCT u.id)::int AS total ${from}`, params),
+      this.dataSource.query(`
+        SELECT DISTINCT ON (u.id)
+          u.id, u.email, COALESCE(u.role, 'Collector') AS role,
+          u.created_at AS "createdAt", u.updated_at AS "updatedAt",
+          COALESCE(c.full_name, split_part(u.email, '@', 1)) AS name,
+          c.phone, c.city, COALESCE(c.instagram_username, c.instagram) AS "instagramUsername",
+          (SELECT COUNT(*)::int FROM orders o WHERE o.user_id = u.id) AS "totalOrders",
+          (SELECT COALESCE(SUM(o.total_price), 0)::float FROM orders o WHERE o.user_id = u.id AND o.status IN ('Confirmed', 'Shipped', 'Delivered')) AS "totalSpend",
+          (SELECT MAX(o.created_at) FROM orders o WHERE o.user_id = u.id) AS "lastOrderDate"
+        ${from}
+        ORDER BY u.id, u.created_at DESC
+        LIMIT $${params.length + 1} OFFSET $${params.length + 2};
+      `, [...params, limit, offset]),
+      this.dataSource.query(`
+        SELECT COUNT(*)::int AS "totalCustomers",
+          COUNT(*) FILTER (WHERE COALESCE(role, 'Collector') = 'Collector')::int AS "collectors",
+          COUNT(*) FILTER (WHERE role IN ('Admin', 'Owner'))::int AS "administrators",
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS "joinedLast7Days",
+          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS "joinedLast30Days"
+        FROM users WHERE deleted_at IS NULL;
+      `),
+      this.dataSource.query(`
+        SELECT u.id, u.email, COALESCE(u.role, 'Collector') AS role,
+          u.created_at AS "createdAt", COALESCE(c.full_name, split_part(u.email, '@', 1)) AS name
+        FROM users u
+        LEFT JOIN customers c ON LOWER(c.email) = LOWER(u.email) AND c.deleted_at IS NULL
+        WHERE u.deleted_at IS NULL
+        ORDER BY u.created_at DESC
+        LIMIT 6;
+      `),
+    ]);
+    const total = Number(countRows[0]?.total || 0);
+    return {
+      customers,
+      total,
+      page,
+      limit,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      summary: { ...(summaryRows[0] || {}), recentCustomers },
+    };
+  }
+
   async getPaginatedProducts(options: {
     page?: number;
     limit?: number;
