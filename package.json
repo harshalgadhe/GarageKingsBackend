@@ -7,7 +7,14 @@
   "scripts": {
     "build": "nest build",
     "start": "nest start",
-    "start:dev": "npm run migrate:up && nest start --watch",
+    "start:dev": "cross-env DYNAMODB_ENDPOINT=http://localhost:8000 DYNAMODB_TABLE_NAME=garagekings-local DYNAMODB_AUTO_CREATE=true nest start --watch",
+    "start:ddb": "cross-env STORAGE_DRIVER_OVERRIDE=dynamodb DYNAMODB_ENDPOINT=http://localhost:8000 DYNAMODB_TABLE_NAME=garagekings-local DYNAMODB_AUTO_CREATE=true nest start --watch",
+    "start:selected": "cross-env DYNAMODB_ENDPOINT=http://localhost:8000 DYNAMODB_TABLE_NAME=garagekings-local DYNAMODB_AUTO_CREATE=true nest start --watch",
+    "ddb:up": "docker compose up -d dynamodb",
+    "ddb:down": "docker compose stop dynamodb",
+    "ddb:import:postgres": "node scripts/import-postgres-to-dynamodb.mjs",
+    "ddb:smoke": "node scripts/smoke-dynamodb-api.mjs",
+    "storage:select": "node scripts/select-storage-driver.mjs",
     "start:prod": "node dist/main",
     "migrate": "node src/bin/migrate.js",
     "migrate:up": "node src/bin/migrate-incremental.js",
@@ -19,8 +26,10 @@
   "dependencies": {
     "@aws-sdk/client-cloudfront": "^3.1068.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1063.0",
+    "@aws-sdk/client-dynamodb": "^3.1116.0",
     "@aws-sdk/client-s3": "^3.1068.0",
     "@aws-sdk/client-secrets-manager": "^3.1068.0",
+    "@aws-sdk/lib-dynamodb": "^3.1116.0",
     "@nestjs/common": "^11.1.28",
     "@nestjs/core": "^11.1.28",
     "@nestjs/jwt": "^11.0.2",
@@ -63,6 +72,7 @@
     "@types/aws-lambda": "^8.10.161",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.2",
+    "cross-env": "^7.0.3",
     "typescript": "^5.7.2"
   }
 }

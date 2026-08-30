@@ -1,6 +1,18 @@
 version: '3.8'
 
 services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.6.1
+    container_name: gk-dynamodb-dev
+    command: "-jar DynamoDBLocal.jar -sharedDb -dbPath /home/dynamodblocal/data"
+    user: root
+    ports:
+      - "8000:8000"
+    volumes:
+      - gk_dynamodb:/home/dynamodblocal/data
+    networks:
+      - gk-network
+
   postgres:
     image: postgres:16-alpine
     container_name: gk-postgres-dev
@@ -19,6 +31,7 @@ services:
       retries: 5
     networks:
       - gk-network
+    profiles: ["legacy-postgres"]
 
   pgadmin:
     image: dpage/pgadmin4:8
@@ -33,9 +46,11 @@ services:
         condition: service_healthy
     networks:
       - gk-network
+    profiles: ["legacy-postgres"]
 
 volumes:
   gk_pgdata:
+  gk_dynamodb:
 
 networks:
   gk-network:

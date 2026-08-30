@@ -1,10 +1,9 @@
 import * as Sentry from '@sentry/nestjs';
 import { NestFactory } from '@nestjs/core';
-import { AppModule } from './app.module.js';
-import { ApiService } from './modules/api/api.service.js';
 import { configure as serverlessExpress } from '@vendia/serverless-express';
 import { Handler, Context, Callback } from 'aws-lambda';
 import { getJwtSecret, isAllowedOrigin } from './config/security.config.js';
+import { AppModule } from './app.module.js';
 
 getJwtSecret();
 
@@ -42,7 +41,6 @@ if (process.env.SENTRY_DSN) {
 }
 
 let server: any;
-
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   applySecurityHeaders(app);
@@ -52,18 +50,9 @@ async function bootstrap() {
   return serverlessExpress({ app: expressApp });
 }
 
-let nestApp: any;
-
 export const handler: Handler = async (event: any, context: Context, callback: Callback) => {
   if (event && event.task === 'cleanup-expired-orders') {
-    console.log('[Lambda] Intercepted direct EventBridge cleanup task invocation.');
-    if (!nestApp) {
-      nestApp = await NestFactory.createApplicationContext(AppModule);
-    }
-    const apiService = nestApp.get(ApiService);
-    await apiService.expireActiveOrders();
-    console.log('[Lambda] Expiration cleanup execution completed.');
-    return { success: true, message: 'Expired reservations cleaned successfully.' };
+    return { success: true, skipped: true, message: 'Reservation cleanup is not used by the enquiry-only DynamoDB platform.' };
   }
 
   server = server || await bootstrap();
