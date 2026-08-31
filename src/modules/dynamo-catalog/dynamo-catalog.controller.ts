@@ -23,9 +23,15 @@ export class DynamoPublicCatalogController {
 
   @Get('products/homepage')
   async getHomepageProducts() {
-    const result = await this.catalog.listProducts({ adminMode: false, featured: true, limit: 12 });
-    if (result.products.length) return result.products;
-    return (await this.catalog.listProducts({ adminMode: false, limit: 12 })).products;
+    const [featuredResult, recentResult] = await Promise.all([
+      this.catalog.listProducts({ adminMode: false, featured: true, limit: 1 }),
+      this.catalog.listProducts({ adminMode: false, limit: 8 }),
+    ]);
+
+    return {
+      featured: featuredResult.products[0] || null,
+      recent: recentResult.products,
+    };
   }
 
   @Get('products/:id')
